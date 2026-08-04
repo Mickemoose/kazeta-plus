@@ -75,48 +75,14 @@ pub fn update(
                     sound_effects.play_select(&config);
                     log_messages.lock().unwrap().clear();
 
-                    match save::find_all_game_files() {
-                        Ok((game_paths, mut debug_log)) => {
+                    match save::collect_available_games() {
+                        Ok((mut games, mut debug_log)) => {
                             log_messages.lock().unwrap().append(&mut debug_log);
-
-                            let mut games: Vec<(save::CartInfo, PathBuf)> = Vec::new();
-                            let parse_errors: Vec<String> = Vec::new();
-
-                            for path in &game_paths {
-                                // Handle .kzp vs .kzi parsing
-                                if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                                    if ext == "kzi" {
-                                        // Standard parsing for KZI
-                                        if let Ok(info) = save::parse_kzi_file(path) {
-                                            games.push((info, path.clone()));
-                                        }
-                                    } else if ext == "kzp" {
-                                        // Logic for KZP (Compressed Package)
-                                        // Since we can't easily read inside the package without mounting,
-                                        // we construct a CartInfo based on the filename.
-                                        let filename = path.file_stem().unwrap().to_string_lossy().to_string();
-
-                                        // We assume the ID is the filename
-                                        let info = save::CartInfo {
-                                            name: Some(filename.clone()), // Use filename as Game Name
-                                            id: filename,
-                                            exec: String::from("internal"), // Placeholder
-                                            icon: String::from("icon.png"), // Placeholder
-                                            runtime: Some(String::from("erofs")),
-                                            // Add other fields as necessary for your struct
-                                            ..Default::default()
-                                        };
-                                        games.push((info, path.clone()));
-                                    }
-                                }
-                            }
 
                             match games.len() {
                                 0 => { // Case: Found files, but none were valid
                                     let mut logs = log_messages.lock().unwrap();
-                                    logs.push(format!("[Info] Found {} potential game file(s), but none could be parsed.", game_paths.len()));
-                                    logs.push("--- ERRORS ---".to_string());
-                                    logs.extend(parse_errors);
+                                    logs.push("[Info] Found potential game file(s), but none could be parsed.".to_string());
                                     *current_screen = Screen::Debug;
                                 },
                                 1 => {
@@ -160,33 +126,7 @@ pub fn update(
                                 _ => { // multiple games found
                                     println!("[Debug] Found {} games. Switching to selection screen.", games.len());
 
-                                    game_icon_queue.clear();
-                                    for (cart_info, game_path) in &games {
-                                        // Intelligent Icon Pathing
-                                        let is_package = game_path.extension().map_or(false, |e| e == "kzp");
-
-                                        let icon_path = if is_package {
-                                            // For .kzp, the icon is inside the image (inaccessible).
-                                            // 1. Try to find a "sidecar" icon (e.g. game.png next to game.kzp)
-                                            let sidecar_png = game_path.with_extension("png");
-                                            let sidecar_jpg = game_path.with_extension("jpg");
-
-                                            if sidecar_png.exists() {
-                                                sidecar_png
-                                            } else if sidecar_jpg.exists() {
-                                                sidecar_jpg
-                                            } else {
-                                                // Instead of a file path, we use a "Magic String" that main.rs will recognize.
-                                                PathBuf::from("::KZP_PLACEHOLDER::")
-                                            }
-                                        } else {
-                                            // Standard .kzi behavior
-                                            game_path.parent().unwrap().join(&cart_info.icon)
-                                        };
-
-                                        game_icon_queue.push((cart_info.id.clone(), icon_path));
-                                    }
-
+                                    *game_icon_queue = save::build_game_icon_queue(&games);
                                     *available_games = games;
                                     *game_selection = 0;
                                     *current_screen = Screen::GameSelection;

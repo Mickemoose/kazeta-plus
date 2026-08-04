@@ -474,6 +474,75 @@ pub fn parse_kzi_file(kzi_path: &Path) -> Result<CartInfo, SaveError> {
     }
 }
 
+/// Scans removable media and returns every game that could be parsed, paired with
+/// the path to its .kzi/.kzp file. Shared by the PLAY menu option and the
+/// multicart autodetect at startup so both build the exact same list.
+pub fn collect_available_games() -> Result<(Vec<(CartInfo, PathBuf)>, Vec<String>), SaveError> {
+    let (game_paths, debug_log) = find_all_game_files()?;
+
+    let mut games: Vec<(CartInfo, PathBuf)> = Vec::new();
+    for path in &game_paths {
+        if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+            if ext == "kzi" {
+                // Standard parsing for KZI
+                if let Ok(info) = parse_kzi_file(path) {
+                    games.push((info, path.clone()));
+                }
+            } else if ext == "kzp" {
+                // Logic for KZP (Compressed Package)
+                // Since we can't easily read inside the package without mounting,
+                // we construct a CartInfo based on the filename.
+                let filename = path.file_stem().unwrap().to_string_lossy().to_string();
+
+                // We assume the ID is the filename
+                let info = CartInfo {
+                    name: Some(filename.clone()), // Use filename as Game Name
+                    id: filename.clone(),
+                    exec: String::from("internal"), // Placeholder
+                    icon: String::from("icon.png"), // Placeholder
+                    runtime: Some(String::from("erofs")),
+                };
+                games.push((info, path.clone()));
+            }
+        }
+    }
+
+    Ok((games, debug_log))
+}
+
+/// Builds the icon-load queue for the game selection screen.
+pub fn build_game_icon_queue(games: &[(CartInfo, PathBuf)]) -> Vec<(String, PathBuf)> {
+    let mut queue = Vec::new();
+
+    for (cart_info, game_path) in games {
+        // Intelligent Icon Pathing
+        let is_package = game_path.extension().map_or(false, |e| e == "kzp");
+
+        let icon_path = if is_package {
+            // For .kzp, the icon is inside the image (inaccessible).
+            // 1. Try to find a "sidecar" icon (e.g. game.png next to game.kzp)
+            let sidecar_png = game_path.with_extension("png");
+            let sidecar_jpg = game_path.with_extension("jpg");
+
+            if sidecar_png.exists() {
+                sidecar_png
+            } else if sidecar_jpg.exists() {
+                sidecar_jpg
+            } else {
+                // Instead of a file path, we use a "Magic String" that main.rs will recognize.
+                PathBuf::from("::KZP_PLACEHOLDER::")
+            }
+        } else {
+            // Standard .kzi behavior
+            game_path.parent().unwrap().join(&cart_info.icon)
+        };
+
+        queue.push((cart_info.id.clone(), icon_path));
+    }
+
+    queue
+}
+
 // for debug game launch
 // [UPDATED] Added logic to handle .kzp files by invoking the wrapper script directly
 pub fn launch_game(cart_info: &CartInfo, kzi_path: &Path) -> std::io::Result<Child> {

@@ -146,6 +146,33 @@ pub fn render_background(
     config: &Config,
     state: &mut BackgroundState,
 ) {
+    render_background_with_override(background_cache, video_cache, config, state, None);
+}
+
+/// Same as render_background, but a cart-supplied wallpaper (Wallpaper= in a .kzi)
+/// takes precedence over the configured background when one is given.
+pub fn render_background_with_override(
+    background_cache: &HashMap<String, Texture2D>,
+    video_cache: &mut HashMap<String, VideoPlayer>,
+    config: &Config,
+    state: &mut BackgroundState,
+    wallpaper: Option<&Texture2D>,
+) {
+    // 0. Cart wallpaper. Drawn static and untinted regardless of the user's scroll
+    // and colour shift settings, so cart artwork looks the way it was authored.
+    if let Some(texture) = wallpaper {
+        draw_texture_ex(
+            texture, 0.0, 0.0, WHITE,
+            DrawTextureParams {
+                dest_size: Some(vec2(screen_width(), screen_height())),
+                ..Default::default()
+            },
+        );
+
+        update_color_shift(config, state);
+        return;
+    }
+
     // 1. Try to draw Video
     if config.background_selection.ends_with(".mp4") {
         if let Some(player) = video_cache.get_mut(&config.background_selection) {

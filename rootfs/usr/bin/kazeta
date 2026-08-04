@@ -69,29 +69,31 @@ if [ -n "$1" ] && [ -f "$1" ]; then
 		cart_info="$1"
 	fi
 else
+	game_count=0
 	for i in $(seq 1 20); do # If not, wait up to 2 seconds for any cart
-		# First, try to find a "default" cart.
-		# We use -exec grep -l ... {} + which is efficient.
-		# It finds all *.kzi, greps them, and lists files that match.
-		# We pipe to head -1 to just get the first match (in case multiple are set).
-		# We also add 2>/dev/null to hide "Permission denied" errors.
-		cart_info=$(find ${BASE_EXT} -maxdepth 2 -name "*.kzi" -exec grep -l "^SetAsDefaultGame=true$" {} + 2>/dev/null | head -1)
+		kzi_count=$(find ${BASE_EXT} -maxdepth 2 -name "*.kzi" 2>/dev/null | wc -l)
+		kzp_count=$(find ${BASE_EXT} -maxdepth 2 -name "*.kzp" 2>/dev/null | wc -l)
+		game_count=$((kzi_count + kzp_count))
 
-		if [ -f "$cart_info" ]; then
-			echo "DEBUG: Found default cart: $cart_info" # Found a default cart. Break the loop.
-			break
-		fi
-
-		cart_info=$(find ${BASE_EXT} -maxdepth 2 -name "*.kzi" 2>/dev/null | head -1) # If no default cart was found, try to find *any* cart (original behavior)
-		cart_pkg=$(find ${BASE_EXT} -maxdepth 2 -name "*.kzp" 2>/dev/null | head -1) # if no .kzi, find a .kzp
-
-		if [[ -f "${cart_info}" ]] || [[ -f "${cart_pkg}" ]]; then
-			echo "DEBUG: Found first available cart." # Found *a* cart (just not a default). Break the loop.
+		if [ "$game_count" -gt 0 ]; then
+			echo "DEBUG: Found ${game_count} game(s) on inserted media."
 			break
 		else
-			sleep 0.1 # No .kzi files found at all. Sleep and try again.
+			sleep 0.1 # No game files found yet. Sleep and try again.
 		fi
 	done
+
+	# MULTICART: more than one game means we never auto-boot anything.
+	# Send the user straight to the BIOS game selector to pick one.
+	if [ "$game_count" -gt 1 ]; then
+		echo "DEBUG: Multicart detected. Launching BIOS game selector."
+		gamescope --filter pixel -- kazeta-bios --game-select
+		exit 0
+	fi
+
+	# Exactly one game (or none): keep the original direct-boot behavior.
+	cart_info=$(find ${BASE_EXT} -maxdepth 2 -name "*.kzi" 2>/dev/null | head -1)
+	cart_pkg=$(find ${BASE_EXT} -maxdepth 2 -name "*.kzp" 2>/dev/null | head -1)
 fi
 
 if [[ ! -f "${cart_info}" ]] && [[ ! -f "${cart_pkg}" ]]; then

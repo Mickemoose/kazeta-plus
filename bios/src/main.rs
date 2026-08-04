@@ -868,6 +868,24 @@ async fn main() {
     let mut game_icon_cache: HashMap<String, Texture2D> = HashMap::new();
     let mut game_icon_queue: Vec<(String, PathBuf)> = Vec::new();
 
+    // MULTICART AUTODETECT
+    // The session script passes --game-select when it found more than one game on
+    // the inserted media. Skip the main menu and go straight to the selector so
+    // nothing auto-boots without the user choosing it.
+    if env::args().any(|arg| arg == "--game-select") {
+        match save::collect_available_games() {
+            Ok((games, _debug_log)) if !games.is_empty() => {
+                println!("[Info] Multicart detected ({} games). Opening game selector.", games.len());
+                game_icon_queue = save::build_game_icon_queue(&games);
+                available_games = games;
+                game_selection = 0;
+                current_screen = Screen::GameSelection;
+            }
+            Ok(_) => println!("[WARN] --game-select passed but no games were found. Falling back to main menu."),
+            Err(e) => println!("[WARN] --game-select scan failed: {:?}. Falling back to main menu.", e),
+        }
+    }
+
     // Fade state
     let mut fade_start_time: Option<f64> = None;
     const FADE_DURATION: f64 = 1.0; // 1 second fade
@@ -1189,7 +1207,7 @@ async fn main() {
                     }
                 }
                 if input_state.right {
-                    if game_selection < available_games.len() - 1 {
+                    if game_selection < available_games.len().saturating_sub(1) {
                         game_selection += 1;
                         sound_effects.play_cursor_move(&config);
                     }
@@ -1260,7 +1278,7 @@ async fn main() {
                 render_game_selection_menu(
                     &available_games, &game_icon_cache, &placeholder, game_selection, &animation_state, &logo_cache,
                     &background_cache, &mut video_cache, &font_cache, &config, &mut background_state,
-                    &battery_info, &current_time_str, &app_state.gcc_adapter_poll_rate, scale_factor
+                    &battery_info, &current_time_str, &app_state.gcc_adapter_poll_rate, scale_factor,
                 );
             },
             Screen::Debug => {

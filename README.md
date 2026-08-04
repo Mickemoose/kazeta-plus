@@ -3,6 +3,7 @@ The "overly complex" fork of the original [Kazeta](https://github.com/kazetaos/k
 
 Features:
 - [multi-cart support](https://github.com/the-outcaster/kazeta-plus/wiki/Multi%E2%80%90Cart-Logic)
+  - multi-carts are detected automatically at boot and open the game selector instead of auto-booting the first game
 - [optical disc drive support](https://github.com/the-outcaster/kazeta-plus/wiki/Creating-Optical-Disc-Media) (CDs, DVDs, etc)
   - music CD player support
 - multi-resolution and aspect ratio support, including 4:3
