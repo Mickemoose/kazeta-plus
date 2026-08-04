@@ -8,6 +8,10 @@ pub fn get_user_data_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|path| path.join(".local/share/kazeta-plus"))
 }
 
+fn default_menu_style() -> String {
+    "LIST".to_string()
+}
+
 /// Gets the full path to the kazeta.toml configuration file.
 fn get_config_path() -> Result<PathBuf, Box<dyn Error>> {
     let mut config_path = get_user_data_dir().ok_or("Could not find user's data directory.")?;
@@ -30,6 +34,8 @@ pub struct Config {
     pub audio_output: String,
     pub theme: String,
     pub menu_position: MenuPosition,
+    #[serde(default = "default_menu_style")]
+    pub menu_style: String, // "LIST" (classic) or "BLADES" (360-style)
     pub font_color: String,
     pub cursor_color: String,
     pub cursor_style: String,
@@ -59,6 +65,7 @@ impl Default for Config {
             audio_output: "Auto".to_string(),
             theme: "Default".to_string(),
             menu_position: MenuPosition::Center,
+            menu_style: default_menu_style(),
             font_color: "WHITE".to_string(),
             cursor_color: "WHITE".to_string(),
             cursor_style: "BOX".to_string(),

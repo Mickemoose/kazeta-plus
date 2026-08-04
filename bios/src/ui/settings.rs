@@ -692,6 +692,7 @@ pub fn update(
                             config.background_selection = defaults.background_selection;
                             config.font_selection = defaults.font_selection;
                             config.menu_position = defaults.menu_position;
+                            config.menu_style = defaults.menu_style;
                             config.font_color = defaults.font_color;
                             config.cursor_color = defaults.cursor_color;
                             config.cursor_style = defaults.cursor_style;
@@ -714,6 +715,9 @@ pub fn update(
                                 config.font_selection = theme.config.font_selection.clone().unwrap_or_else(|| "Default".to_string());
 
                                 if let Some(val) = &theme.config.menu_position { config.menu_position = val.parse().unwrap_or_default(); }
+                                // Menu style resets to LIST when the theme doesn't ask for one,
+                                // so leaving a blades theme actually leaves the blades.
+                                config.menu_style = theme.config.menu_style.clone().unwrap_or_else(|| "LIST".to_string());
                                 if let Some(val) = &theme.config.font_color { config.font_color = val.clone(); }
                                 if let Some(val) = &theme.config.cursor_color { config.cursor_color = val.clone(); }
                                 if let Some(val) = &theme.config.cursor_style { config.cursor_style = val.clone(); }

@@ -44,6 +44,7 @@ pub struct CartInfo {
     pub exec: String,
     pub icon: String,
     pub runtime: Option<String>, // runtime is optional
+    pub cover: Option<String>,   // optional 350x250 cover art, path relative to the .kzi
 }
 
 #[derive(Clone, Debug)]
@@ -453,6 +454,7 @@ pub fn parse_kzi_file(kzi_path: &Path) -> Result<CartInfo, SaveError> {
     let mut exec = None;
     let mut icon = None;
     let mut runtime = None;
+    let mut cover = None;
 
     for line in content.lines() {
         if let Some((key, value)) = line.split_once('=') {
@@ -462,13 +464,14 @@ pub fn parse_kzi_file(kzi_path: &Path) -> Result<CartInfo, SaveError> {
                 "Exec" => exec = Some(value.trim().to_string()),
                 "Icon" => icon = Some(value.trim().to_string()),
                 "Runtime" => runtime = Some(value.trim().to_string()),
+                "Cover" => cover = Some(value.trim().to_string()),
                 _ => {}
             }
         }
     }
 
     if let (Some(id), Some(exec), Some(icon)) = (id, exec, icon) {
-        Ok(CartInfo { name, id, exec, icon, runtime })
+        Ok(CartInfo { name, id, exec, icon, runtime, cover })
     } else {
         Err(SaveError::Message(format!("Invalid .kzi file: '{}'. Missing required fields.", kzi_path.display())))
     }
@@ -501,6 +504,7 @@ pub fn collect_available_games() -> Result<(Vec<(CartInfo, PathBuf)>, Vec<String
                     exec: String::from("internal"), // Placeholder
                     icon: String::from("icon.png"), // Placeholder
                     runtime: Some(String::from("erofs")),
+                    cover: None,
                 };
                 games.push((info, path.clone()));
             }
@@ -508,6 +512,64 @@ pub fn collect_available_games() -> Result<(Vec<(CartInfo, PathBuf)>, Vec<String
     }
 
     Ok((games, debug_log))
+}
+
+/// Cart-level display metadata for the Play tile:
+/// (display name, cover image path, hover bgm path).
+/// A `cartinfo.yaml` at the cart root wins, so a multicart can brand itself
+/// (`name:` / `cover:` / `bgm:` keys, paths relative to the yaml). Otherwise a
+/// lone game's own kzi metadata (Name= / Cover=) is used, and a plain multicart
+/// falls back to a game count.
+pub fn cart_display_info(
+    games: &[(CartInfo, PathBuf)],
+) -> (Option<String>, Option<PathBuf>, Option<PathBuf>) {
+    if let Ok(yamls) = find_files_by_extension("/run/media/", &["yaml", "yml"], 2, false) {
+        for y in yamls {
+            let is_cartinfo = y
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .map(|s| s.eq_ignore_ascii_case("cartinfo"))
+                .unwrap_or(false);
+            if !is_cartinfo {
+                continue;
+            }
+            if let Ok(content) = fs::read_to_string(&y) {
+                let mut name = None;
+                let mut cover = None;
+                let mut bgm = None;
+                for line in content.lines() {
+                    if let Some((k, v)) = line.split_once(':') {
+                        let v = v.trim().trim_matches('"').trim_matches('\'').to_string();
+                        match k.trim() {
+                            "name" if !v.is_empty() => name = Some(v),
+                            "cover" if !v.is_empty() => cover = Some(v),
+                            "bgm" if !v.is_empty() => bgm = Some(v),
+                            _ => {}
+                        }
+                    }
+                }
+                let root = y.parent().unwrap_or(Path::new("/"));
+                let cover_path = cover.map(|c| root.join(c));
+                let bgm_path = bgm.map(|b| root.join(b));
+                if name.is_some() || cover_path.is_some() || bgm_path.is_some() {
+                    return (name, cover_path, bgm_path);
+                }
+            }
+        }
+    }
+
+    if games.len() == 1 {
+        let (info, kzi_path) = &games[0];
+        let cover_path = info
+            .cover
+            .as_ref()
+            .and_then(|c| kzi_path.parent().map(|p| p.join(c)));
+        return (info.name.clone(), cover_path, None);
+    }
+    if games.len() > 1 {
+        return (Some(format!("Multi-Cart ({} games)", games.len())), None, None);
+    }
+    (None, None, None)
 }
 
 /// Builds the icon-load queue for the game selection screen.

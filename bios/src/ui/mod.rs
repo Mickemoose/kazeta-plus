@@ -10,12 +10,14 @@ use macroquad::prelude::*;
 use std::collections::HashMap;
 
 pub mod about;
+pub mod blades;
 pub mod bluetooth;
 pub mod cd_player;
 pub mod data;
 pub mod dialog;
 pub mod extras_menu;
 pub mod main_menu;
+pub mod metro;
 pub mod runtime_downloader;
 pub mod settings;
 pub mod theme_downloader;

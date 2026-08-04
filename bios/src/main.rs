@@ -280,7 +280,7 @@ fn find_all_asset_files() -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>, Vec<Path
     background_files_set.extend(utils::find_asset_files("../backgrounds", &["png", "mp4"])); // add support for mp4 videos
     logo_files_set.extend(utils::find_asset_files("../logos", &["png"]));
     font_files_set.extend(utils::find_asset_files("../fonts", &["ttf"]));
-    music_files_set.extend(utils::find_asset_files("../music", &["ogg", "wav"]));
+    music_files_set.extend(utils::find_asset_files("../music", &["ogg", "wav", "mp3"]));
 
     // 3. Gather user-installed and theme assets
     if let Some(user_dir) = get_user_data_dir() {
@@ -288,7 +288,7 @@ fn find_all_asset_files() -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>, Vec<Path
         background_files_set.extend(utils::find_asset_files(&user_dir.join("backgrounds").to_string_lossy(), &["png", "mp4"]));
         logo_files_set.extend(utils::find_asset_files(&user_dir.join("logos").to_string_lossy(), &["png"]));
         font_files_set.extend(utils::find_asset_files(&user_dir.join("fonts").to_string_lossy(), &["ttf"]));
-        music_files_set.extend(utils::find_asset_files(&user_dir.join("bgm").to_string_lossy(), &["ogg", "wav"]));
+        music_files_set.extend(utils::find_asset_files(&user_dir.join("bgm").to_string_lossy(), &["ogg", "wav", "mp3"]));
 
         // --- REVISED LOGIC for scanning theme folders ---
         let theme_dir = user_dir.join("themes");
@@ -300,7 +300,7 @@ fn find_all_asset_files() -> (Vec<PathBuf>, Vec<PathBuf>, Vec<PathBuf>, Vec<Path
                     // Find all assets within this theme folder just ONCE
                     let theme_images = utils::find_asset_files(&theme_path.to_string_lossy(), &["png", "mp4"]);
                     let theme_fonts = utils::find_asset_files(&theme_path.to_string_lossy(), &["ttf"]);
-                    let theme_music = utils::find_asset_files(&theme_path.to_string_lossy(), &["wav", "ogg"]);
+                    let theme_music = utils::find_asset_files(&theme_path.to_string_lossy(), &["wav", "ogg", "mp3"]);
 
                     // Now, intelligently sort the images into the correct sets based on filename
                     for image_path in theme_images {
@@ -868,6 +868,11 @@ async fn main() {
     let mut game_icon_cache: HashMap<String, Texture2D> = HashMap::new();
     let mut game_icon_queue: Vec<(String, PathBuf)> = Vec::new();
 
+    // 360-style blades menu state (used when config.menu_style == "BLADES")
+    let mut blades_state = ui::blades::BladesState::new();
+    // Metro tile menu state (used when config.menu_style == "METRO")
+    let mut metro_state = ui::metro::MetroState::new();
+
     // MULTICART AUTODETECT
     // The session script passes --game-select when it found more than one game on
     // the inserted media. Skip the main menu and go straight to the selector so
@@ -1042,6 +1047,7 @@ async fn main() {
             Screen::FadingOut => {
                 // During fade, only render, don't process input
                 // Render the current background and UI elements first
+                if config.menu_style != "BLADES" && config.menu_style != "METRO" {
                 ui::main_menu::update(
                     &mut current_screen,
                     &mut main_menu_selection,
@@ -1063,6 +1069,7 @@ async fn main() {
                     &mut flash_message,
                     &mut game_process,
                 );
+                }
 
                 // Calculate fade progress
                 if let Some(start_time) = fade_start_time {
@@ -1084,46 +1091,126 @@ async fn main() {
                 }
             },
             Screen::MainMenu => {
-                ui::main_menu::update(
-                    &mut current_screen,
-                    &mut main_menu_selection,
-                    &mut play_option_enabled,
-                    &mut copy_logs_option_enabled,
-                    &cart_connected,
-                    &mut input_state,
-                    &mut animation_state,
-                    &sound_effects,
-                    &config,
-                    &log_messages,
-                    &storage_state,
-                    &mut fade_start_time,
-                    &mut current_bgm,
-                    &music_cache,
-                    &mut game_icon_queue,
-                    &mut available_games,
-                    &mut game_selection,
-                    &mut flash_message,
-                    &mut game_process,
-                );
+                if config.menu_style == "BLADES" {
+                    ui::blades::update(
+                        &mut current_screen,
+                        &mut blades_state,
+                        &mut play_option_enabled,
+                        &mut copy_logs_option_enabled,
+                        &cart_connected,
+                        &mut input_state,
+                        &sound_effects,
+                        &config,
+                        &log_messages,
+                        &storage_state,
+                        &mut fade_start_time,
+                        &mut current_bgm,
+                        &music_cache,
+                        &mut game_icon_queue,
+                        &mut available_games,
+                        &mut game_selection,
+                        &mut flash_message,
+                        &mut game_process,
+                    );
 
-                ui::main_menu::draw(
-                    &MAIN_MENU_OPTIONS,
-                    main_menu_selection,
-                    play_option_enabled,
-                    copy_logs_option_enabled,
-                    &animation_state,
-                    &logo_cache,
-                    &background_cache,
-                    &font_cache,
-                    &config,
-                    &mut background_state,
-                    &mut video_cache,
-                    &battery_info,
-                    &current_time_str,
-                    &app_state.gcc_adapter_poll_rate,
-                    scale_factor,
-                    flash_message.as_ref().map(|(msg, _)| msg.as_str())
-                );
+                    ui::blades::draw(
+                        &blades_state,
+                        play_option_enabled,
+                        copy_logs_option_enabled,
+                        &animation_state,
+                        &logo_cache,
+                        &background_cache,
+                        &mut video_cache,
+                        &font_cache,
+                        &config,
+                        &mut background_state,
+                        &battery_info,
+                        &current_time_str,
+                        &app_state.gcc_adapter_poll_rate,
+                        scale_factor,
+                        flash_message.as_ref().map(|(msg, _)| msg.as_str())
+                    );
+                } else if config.menu_style == "METRO" {
+                    ui::metro::update(
+                        &mut current_screen,
+                        &mut metro_state,
+                        &mut play_option_enabled,
+                        &mut copy_logs_option_enabled,
+                        &cart_connected,
+                        &mut input_state,
+                        &sound_effects,
+                        &config,
+                        &log_messages,
+                        &storage_state,
+                        &mut fade_start_time,
+                        &mut current_bgm,
+                        &music_cache,
+                        &mut game_icon_queue,
+                        &mut available_games,
+                        &mut game_selection,
+                        &mut flash_message,
+                        &mut game_process,
+                    );
+
+                    ui::metro::draw(
+                        &metro_state,
+                        play_option_enabled,
+                        copy_logs_option_enabled,
+                        &animation_state,
+                        &logo_cache,
+                        &background_cache,
+                        &mut video_cache,
+                        &font_cache,
+                        &config,
+                        &mut background_state,
+                        &battery_info,
+                        &current_time_str,
+                        &app_state.gcc_adapter_poll_rate,
+                        scale_factor,
+                        flash_message.as_ref().map(|(msg, _)| msg.as_str())
+                    );
+                } else {
+                    ui::main_menu::update(
+                        &mut current_screen,
+                        &mut main_menu_selection,
+                        &mut play_option_enabled,
+                        &mut copy_logs_option_enabled,
+                        &cart_connected,
+                        &mut input_state,
+                        &mut animation_state,
+                        &sound_effects,
+                        &config,
+                        &log_messages,
+                        &storage_state,
+                        &mut fade_start_time,
+                        &mut current_bgm,
+                        &music_cache,
+                        &mut game_icon_queue,
+                        &mut available_games,
+                        &mut game_selection,
+                        &mut flash_message,
+                        &mut game_process,
+                    );
+
+                    ui::main_menu::draw(
+                        &MAIN_MENU_OPTIONS,
+                        main_menu_selection,
+                        play_option_enabled,
+                        copy_logs_option_enabled,
+                        &animation_state,
+                        &logo_cache,
+                        &background_cache,
+                        &font_cache,
+                        &config,
+                        &mut background_state,
+                        &mut video_cache,
+                        &battery_info,
+                        &current_time_str,
+                        &app_state.gcc_adapter_poll_rate,
+                        scale_factor,
+                        flash_message.as_ref().map(|(msg, _)| msg.as_str())
+                    );
+                }
             },
             Screen::GeneralSettings | Screen::AudioSettings | Screen::GuiSettings | Screen::AssetSettings => {
                 // --- Determine what to draw BEFORE updating state ---
@@ -1275,11 +1362,20 @@ async fn main() {
                 }
 
                 // --- Render ---
-                render_game_selection_menu(
-                    &available_games, &game_icon_cache, &placeholder, game_selection, &animation_state, &logo_cache,
-                    &background_cache, &mut video_cache, &font_cache, &config, &mut background_state,
-                    &battery_info, &current_time_str, &app_state.gcc_adapter_poll_rate, scale_factor,
-                );
+                if config.menu_style == "METRO" {
+                    ui::metro::draw_game_selection(
+                        &available_games, &game_icon_cache, &placeholder, game_selection,
+                        metro_state.cart_label.as_deref(), &animation_state,
+                        &background_cache, &mut video_cache, &font_cache, &config,
+                        &mut background_state, scale_factor,
+                    );
+                } else {
+                    render_game_selection_menu(
+                        &available_games, &game_icon_cache, &placeholder, game_selection, &animation_state, &logo_cache,
+                        &background_cache, &mut video_cache, &font_cache, &config, &mut background_state,
+                        &battery_info, &current_time_str, &app_state.gcc_adapter_poll_rate, scale_factor,
+                    );
+                }
             },
             Screen::Debug => {
                 // Stop the BGM

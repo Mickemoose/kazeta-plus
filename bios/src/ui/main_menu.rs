@@ -61,21 +61,83 @@ pub fn update(
     if input_state.select {
         match *main_menu_selection {
             0 => { // SAVE DATA
-                // Trigger a refresh the next time the data screen is entered.
-                if let Ok(mut state) = storage_state.lock() {
-                    state.needs_memory_refresh = true;
-                }
-
-                *current_screen = Screen::SaveData;
-                input_state.ui_focus = UIFocus::Grid;
-                sound_effects.play_select(&config);
+                activate_save_data(current_screen, input_state, storage_state, sound_effects, config);
             },
             1 => { // PLAY option
                 if *play_option_enabled {
-                    sound_effects.play_select(&config);
-                    log_messages.lock().unwrap().clear();
+                    activate_play(
+                        current_screen, sound_effects, config, log_messages, fade_start_time,
+                        current_bgm, music_cache, game_icon_queue, available_games,
+                        game_selection, game_process,
+                    );
+                } else {
+                    sound_effects.play_reject(&config);
+                    animation_state.trigger_play_option_shake();
+                }
+            },
+            2 => { // SESSION LOG COPY
+                if *copy_logs_option_enabled {
+                    activate_copy_logs(flash_message, sound_effects, config);
+                } else {
+                    sound_effects.play_reject(&config);
+                    animation_state.trigger_copy_log_option_shake();
+                }
+            },
+            3 => { // SETTINGS
+                *current_screen = Screen::GeneralSettings;
+                sound_effects.play_select(&config);
+            },
+            4 => { // EXTRAS
+                *current_screen = Screen::Extras;
+                sound_effects.play_select(&config);
+            },
+            5 => { // ABOUT
+                *current_screen = Screen::About;
+                sound_effects.play_select(&config);
+            },
+            _ => {}
+        }
+    }
+}
 
-                    match save::collect_available_games() {
+/// Opens the save data screen (shared by the classic menu and the blades menu).
+pub fn activate_save_data(
+    current_screen: &mut Screen,
+    input_state: &mut InputState,
+    storage_state: &Arc<Mutex<StorageMediaState>>,
+    sound_effects: &SoundEffects,
+    config: &Config,
+) {
+    // Trigger a refresh the next time the data screen is entered.
+    if let Ok(mut state) = storage_state.lock() {
+        state.needs_memory_refresh = true;
+    }
+
+    *current_screen = Screen::SaveData;
+    input_state.ui_focus = UIFocus::Grid;
+    sound_effects.play_select(&config);
+}
+
+/// Scans for carts and either launches, opens the selector, or shows the debug
+/// log (shared by the classic menu and the blades menu). The caller is
+/// responsible for checking that a cart is connected first.
+pub fn activate_play(
+    current_screen: &mut Screen,
+    sound_effects: &SoundEffects,
+    config: &Config,
+    log_messages: &std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    fade_start_time: &mut Option<f64>,
+    current_bgm: &mut Option<Sink>,
+    music_cache: &HashMap<String, SamplesBuffer>,
+    game_icon_queue: &mut Vec<(String, PathBuf)>,
+    available_games: &mut Vec<(save::CartInfo, PathBuf)>,
+    game_selection: &mut usize,
+    game_process: &mut Option<std::process::Child>,
+) {
+    sound_effects.play_select(&config);
+    log_messages.lock().unwrap().clear();
+
+    match save::collect_available_games() {
                         Ok((mut games, mut debug_log)) => {
                             log_messages.lock().unwrap().append(&mut debug_log);
 
@@ -139,49 +201,31 @@ pub fn update(
                             log_messages.lock().unwrap().push(error_msg);
                             *current_screen = Screen::Debug;
                         }
-                    }
-                } else {
-                    sound_effects.play_reject(&config);
-                    animation_state.trigger_play_option_shake();
-                }
-            },
-            2 => { // SESSION LOG COPY
-                if *copy_logs_option_enabled {
-                    sound_effects.play_select(&config);
+    }
+}
 
-                    // Call our new function and handle the result
-                    match copy_session_logs_to_sd() {
-                        Ok(path) => {
-                            *flash_message = Some((
-                                format!("SUCCESS: {}", path),
-                                FLASH_MESSAGE_DURATION
-                            ));
-                        }
-                        Err(e) => {
-                            *flash_message = Some((
-                                format!("ERROR: {}", e),
-                                FLASH_MESSAGE_DURATION
-                            ));
-                        }
-                    }
-                } else {
-                    sound_effects.play_reject(&config);
-                    animation_state.trigger_copy_log_option_shake();
-                }
-            },
-            3 => { // SETTINGS
-                *current_screen = Screen::GeneralSettings;
-                sound_effects.play_select(&config);
-            },
-            4 => { // EXTRAS
-                *current_screen = Screen::Extras;
-                sound_effects.play_select(&config);
-            },
-            5 => { // ABOUT
-                *current_screen = Screen::About;
-                sound_effects.play_select(&config);
-            },
-            _ => {}
+/// Copies session logs to the SD card and reports the result via the flash
+/// message (shared by the classic menu and the blades menu). The caller checks
+/// that a cart is connected first.
+pub fn activate_copy_logs(
+    flash_message: &mut Option<(String, f32)>,
+    sound_effects: &SoundEffects,
+    config: &Config,
+) {
+    sound_effects.play_select(&config);
+
+    match copy_session_logs_to_sd() {
+        Ok(path) => {
+            *flash_message = Some((
+                format!("SUCCESS: {}", path),
+                FLASH_MESSAGE_DURATION
+            ));
+        }
+        Err(e) => {
+            *flash_message = Some((
+                format!("ERROR: {}", e),
+                FLASH_MESSAGE_DURATION
+            ));
         }
     }
 }

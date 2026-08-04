@@ -1,0 +1,7 @@
+# Third-party assets kept out of version control (personal-use only):
+# Microsoft Segoe UI fonts, Microsoft 360 dashboard music, and sounds/video
+# derived from XBMC360 / dashx360. Regenerate or re-copy per WORKFLOW.md.
+*.ttf
+*.mp3
+*.wav
+*.mp4

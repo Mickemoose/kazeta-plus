@@ -1,0 +1,10 @@
+# Metro (2011+ Xbox 360 dashboard) theme for Kazeta+
+# Sounds from ZivvoZ/dashx360 (fan project, no license) - personal use only.
+menu_style = "METRO"
+background_selection = "metro360_background.png"
+sfx_pack = "Metro360SFX"
+cursor_style = "TEXT"
+font_selection = "segoeui.ttf"
+background_scroll_speed = "OFF"
+color_shift_speed = "OFF"
+bgm_track = "X360 Avatar Theme.mp3"

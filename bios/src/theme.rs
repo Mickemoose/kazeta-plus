@@ -10,6 +10,7 @@ use std::fs;
 #[derive(Deserialize, Debug, Clone)]
 pub struct ThemeConfigFile {
     pub menu_position: Option<String>,
+    pub menu_style: Option<String>, // "LIST" or "BLADES"
     pub font_color: Option<String>,
     pub cursor_color: Option<String>,
     pub cursor_style: Option<String>,
@@ -46,6 +47,7 @@ pub async fn load_all_themes() -> HashMap<String, Theme> {
         sounds: default_sfx.clone(), // Use the pre-loaded default sounds
         config: ThemeConfigFile { // Create an empty config, just like from an empty theme.toml
             menu_position: None,
+            menu_style: None,
             font_color: None,
             cursor_color: None,
             cursor_style: None,
