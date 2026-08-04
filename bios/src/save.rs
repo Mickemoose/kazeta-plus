@@ -45,6 +45,7 @@ pub struct CartInfo {
     pub icon: String,
     pub runtime: Option<String>, // runtime is optional
     pub cover: Option<String>,   // optional 350x250 cover art, path relative to the .kzi
+    pub bgm: Option<String>,     // optional hover theme music, path relative to the .kzi
 }
 
 #[derive(Clone, Debug)]
@@ -455,6 +456,7 @@ pub fn parse_kzi_file(kzi_path: &Path) -> Result<CartInfo, SaveError> {
     let mut icon = None;
     let mut runtime = None;
     let mut cover = None;
+    let mut bgm = None;
 
     for line in content.lines() {
         if let Some((key, value)) = line.split_once('=') {
@@ -464,14 +466,15 @@ pub fn parse_kzi_file(kzi_path: &Path) -> Result<CartInfo, SaveError> {
                 "Exec" => exec = Some(value.trim().to_string()),
                 "Icon" => icon = Some(value.trim().to_string()),
                 "Runtime" => runtime = Some(value.trim().to_string()),
-                "Cover" => cover = Some(value.trim().to_string()),
+                "Cover" | "cover" => cover = Some(value.trim().to_string()),
+                "Bgm" | "bgm" => bgm = Some(value.trim().to_string()),
                 _ => {}
             }
         }
     }
 
     if let (Some(id), Some(exec), Some(icon)) = (id, exec, icon) {
-        Ok(CartInfo { name, id, exec, icon, runtime, cover })
+        Ok(CartInfo { name, id, exec, icon, runtime, cover, bgm })
     } else {
         Err(SaveError::Message(format!("Invalid .kzi file: '{}'. Missing required fields.", kzi_path.display())))
     }
@@ -505,6 +508,7 @@ pub fn collect_available_games() -> Result<(Vec<(CartInfo, PathBuf)>, Vec<String
                     icon: String::from("icon.png"), // Placeholder
                     runtime: Some(String::from("erofs")),
                     cover: None,
+                    bgm: None,
                 };
                 games.push((info, path.clone()));
             }
@@ -520,9 +524,32 @@ pub fn collect_available_games() -> Result<(Vec<(CartInfo, PathBuf)>, Vec<String
 /// (`name:` / `cover:` / `bgm:` keys, paths relative to the yaml). Otherwise a
 /// lone game's own kzi metadata (Name= / Cover=) is used, and a plain multicart
 /// falls back to a game count.
-pub fn cart_display_info(
-    games: &[(CartInfo, PathBuf)],
-) -> (Option<String>, Option<PathBuf>, Option<PathBuf>) {
+/// Everything the Play hero needs to brand itself for the inserted cart.
+#[derive(Default)]
+pub struct CartDisplayInfo {
+    pub name: Option<String>,
+    pub cover: Option<PathBuf>,
+    pub bgm: Option<PathBuf>,
+    pub icon: Option<PathBuf>,
+    pub optical: bool, // cart lives on optical media (mounted from /dev/sr*)
+}
+
+fn is_optical_mount(path: &Path) -> bool {
+    path.to_string_lossy().starts_with("/run/media/sr")
+}
+
+pub fn cart_display_info(games: &[(CartInfo, PathBuf)]) -> CartDisplayInfo {
+    // The caller's list is only populated once the Play screen opens; at the
+    // dashboard it is empty even with a cart inserted, so scan ourselves.
+    let scanned;
+    let games = if games.is_empty() {
+        scanned = collect_available_games()
+            .map(|(g, _)| g)
+            .unwrap_or_default();
+        &scanned[..]
+    } else {
+        games
+    };
     if let Ok(yamls) = find_files_by_extension("/run/media/", &["yaml", "yml"], 2, false) {
         for y in yamls {
             let is_cartinfo = y
@@ -537,6 +564,7 @@ pub fn cart_display_info(
                 let mut name = None;
                 let mut cover = None;
                 let mut bgm = None;
+                let mut icon = None;
                 for line in content.lines() {
                     if let Some((k, v)) = line.split_once(':') {
                         let v = v.trim().trim_matches('"').trim_matches('\'').to_string();
@@ -544,6 +572,7 @@ pub fn cart_display_info(
                             "name" if !v.is_empty() => name = Some(v),
                             "cover" if !v.is_empty() => cover = Some(v),
                             "bgm" if !v.is_empty() => bgm = Some(v),
+                            "icon" if !v.is_empty() => icon = Some(v),
                             _ => {}
                         }
                     }
@@ -551,8 +580,15 @@ pub fn cart_display_info(
                 let root = y.parent().unwrap_or(Path::new("/"));
                 let cover_path = cover.map(|c| root.join(c));
                 let bgm_path = bgm.map(|b| root.join(b));
-                if name.is_some() || cover_path.is_some() || bgm_path.is_some() {
-                    return (name, cover_path, bgm_path);
+                let icon_path = icon.map(|i| root.join(i));
+                if name.is_some() || cover_path.is_some() || bgm_path.is_some() || icon_path.is_some() {
+                    return CartDisplayInfo {
+                        name,
+                        cover: cover_path,
+                        bgm: bgm_path,
+                        icon: icon_path,
+                        optical: is_optical_mount(&y),
+                    };
                 }
             }
         }
@@ -564,12 +600,27 @@ pub fn cart_display_info(
             .cover
             .as_ref()
             .and_then(|c| kzi_path.parent().map(|p| p.join(c)));
-        return (info.name.clone(), cover_path, None);
+        let bgm_path = info
+            .bgm
+            .as_ref()
+            .and_then(|b| kzi_path.parent().map(|p| p.join(b)));
+        let icon_path = kzi_path.parent().map(|p| p.join(&info.icon));
+        return CartDisplayInfo {
+            name: info.name.clone(),
+            cover: cover_path,
+            bgm: bgm_path,
+            icon: icon_path,
+            optical: is_optical_mount(kzi_path),
+        };
     }
     if games.len() > 1 {
-        return (Some(format!("Multi-Cart ({} games)", games.len())), None, None);
+        return CartDisplayInfo {
+            name: Some(format!("Multi-Cart ({} games)", games.len())),
+            optical: is_optical_mount(&games[0].1),
+            ..Default::default()
+        };
     }
-    (None, None, None)
+    CartDisplayInfo::default()
 }
 
 /// Builds the icon-load queue for the game selection screen.

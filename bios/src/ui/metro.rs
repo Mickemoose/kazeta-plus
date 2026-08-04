@@ -48,12 +48,6 @@ pub const TABS: &[MetroTab] = &[
             MetroTile { label: "Play", action: BladeAction::Play, hero: true },
             MetroTile { label: "Save Data", action: BladeAction::SaveData, hero: false },
             MetroTile { label: "Session Logs", action: BladeAction::CopyLogs, hero: false },
-        ],
-    },
-    MetroTab {
-        title: "games",
-        tiles: &[
-            MetroTile { label: "Play", action: BladeAction::Play, hero: true },
             MetroTile { label: "Runtimes", action: BladeAction::RuntimeDownloader, hero: false },
         ],
     },
@@ -102,7 +96,12 @@ pub struct MetroState {
     pub tile: usize,  // selected tile on the active tab
     // Cart branding for the Play hero (cover art + "Play: NAME" bar).
     pub cover_tex: Option<Texture2D>,
+    pub icon_tex: Option<Texture2D>,
     pub cart_label: Option<String>,
+    pub cart_optical: bool,
+    // Media badges (baked-in art) for the hero's corner.
+    badge_sd: Texture2D,
+    badge_disc: Texture2D,
     cover_key: String, // change marker so we only reload when the cart changes
     // Hover bgm (cartinfo.yaml `bgm:`): loops while the Play hero is selected,
     // fading in on hover and out on unhover.
@@ -113,11 +112,29 @@ pub struct MetroState {
 
 const BGM_FADE_TIME: f32 = 0.7; // seconds for a full fade in or out
 
+/// Load cart-supplied art defensively: macroquad panics on unsupported
+/// formats (e.g. a JPEG renamed .png), so verify the PNG signature first and
+/// skip bad files instead of taking the whole bios down.
+fn load_cart_texture(bytes: &[u8]) -> Option<Texture2D> {
+    const PNG_MAGIC: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    if bytes.len() > 8 && bytes[..8] == PNG_MAGIC {
+        Some(Texture2D::from_file_with_format(bytes, Some(ImageFormat::Png)))
+    } else {
+        println!("[WARN] Cart art is not a real PNG (wrong extension?) - skipping it.");
+        None
+    }
+}
+
 impl MetroState {
     pub fn new() -> Self {
+        let badge_sd = Texture2D::from_file_with_format(include_bytes!("../../SDCARD.png"), None);
+        badge_sd.set_filter(FilterMode::Linear);
+        let badge_disc = Texture2D::from_file_with_format(include_bytes!("../../DISC.png"), None);
+        badge_disc.set_filter(FilterMode::Linear);
         Self {
             tab: DEFAULT_TAB, prev_tab: DEFAULT_TAB, anim: 1.0, dir: 1.0, tile: 0,
-            cover_tex: None, cart_label: None, cover_key: String::new(),
+            cover_tex: None, icon_tex: None, cart_label: None, cart_optical: false,
+            badge_sd, badge_disc, cover_key: String::new(),
             bgm_path: None, bgm_sink: None, bgm_vol: 0.0,
         }
     }
@@ -147,11 +164,11 @@ fn ease_out(t: f32) -> f32 {
 /// the hero) is i/2, row is i%2.
 fn tile_rect(idx: usize, tiles: &[MetroTile], origin_x: f32, origin_y: f32, s: f32) -> Rect {
     // Sized in the app's 360p design space (scale_factor blows it up).
-    // The hero is 7:5 to match the 350x250 cover art spec.
-    let unit = 84.0 * s;
+    // The hero is a wide banner matching the 920x430 cover art spec.
+    let unit = 80.0 * s;
     let gap = 5.0 * s;
     let hero_h = unit * 2.0 + gap;
-    let hero_w = hero_h * 1.4;
+    let hero_w = hero_h * (920.0 / 430.0);
 
     let has_hero = tiles.first().map(|t| t.hero).unwrap_or(false);
     if idx == 0 && has_hero {
@@ -208,18 +225,31 @@ pub fn update(
     if cover_key != state.cover_key {
         state.cover_key = cover_key;
         state.cover_tex = None;
+        state.icon_tex = None;
         state.cart_label = None;
+        state.cart_optical = false;
         state.bgm_path = None;
         state.stop_bgm();
         if *play_option_enabled {
-            let (name, cover, bgm) = save::cart_display_info(available_games);
-            state.cart_label = name;
-            state.bgm_path = bgm;
+            let info = save::cart_display_info(available_games);
+            state.cart_label = info.name;
+            state.bgm_path = info.bgm;
+            state.cart_optical = info.optical;
+            let (cover, icon) = (info.cover, info.icon);
             if let Some(path) = cover {
                 if let Ok(bytes) = std::fs::read(&path) {
-                    let tex = Texture2D::from_file_with_format(&bytes, None);
-                    tex.set_filter(FilterMode::Linear);
-                    state.cover_tex = Some(tex);
+                    if let Some(tex) = load_cart_texture(&bytes) {
+                        tex.set_filter(FilterMode::Linear);
+                        state.cover_tex = Some(tex);
+                    }
+                }
+            }
+            if let Some(path) = icon {
+                if let Ok(bytes) = std::fs::read(&path) {
+                    if let Some(tex) = load_cart_texture(&bytes) {
+                        tex.set_filter(FilterMode::Nearest);
+                        state.icon_tex = Some(tex);
+                    }
                 }
             }
         }
@@ -370,30 +400,14 @@ pub fn update(
 // DRAW
 // ===================================
 
-/// Little white microSD glyph for the corner of a cover-art hero.
-fn draw_sd_badge(x: f32, y: f32, s: f32) {
-    let body = Color::new(0.95, 0.95, 0.95, 0.95);
-    // notched body: slim top strip (notch on the left) over the main slab
-    draw_rectangle(x + 4.0 * s, y, 10.0 * s, 4.5 * s, body);
-    draw_rectangle(x, y + 4.5 * s, 14.0 * s, 13.5 * s, body);
-    // contact pins along the top strip
-    for i in 0..3 {
-        draw_rectangle(
-            x + (5.5 + i as f32 * 3.0) * s,
-            y + 0.8 * s,
-            1.6 * s,
-            2.6 * s,
-            Color::new(0.1, 0.1, 0.1, 0.9),
-        );
-    }
-}
-
 fn draw_tab_pane(
     tab: &MetroTab,
     selected: Option<usize>,
     play_option_enabled: bool,
     copy_logs_option_enabled: bool,
     cover: Option<&Texture2D>,
+    cart_icon: Option<&Texture2D>,
+    media_badge: &Texture2D,
     cart_label: Option<&str>,
     offset_x: f32,
     origin_y: f32,
@@ -494,7 +508,33 @@ fn draw_tab_pane(
                 ry + rh - 4.5 * s,
                 font_size, WHITE,
             );
-            draw_sd_badge(rx + rw - 19.0 * s, ry + 4.0 * s, s);
+            // Media badge (SD card or disc art) top-right.
+            let badge_size = 22.0 * s;
+            draw_texture_ex(
+                media_badge,
+                rx + rw - badge_size - 5.0 * s,
+                ry + 5.0 * s,
+                WHITE,
+                DrawTextureParams {
+                    dest_size: Some(vec2(badge_size, badge_size)),
+                    ..Default::default()
+                },
+            );
+
+            // Cart icon: bottom-right, poking out over the top of the bar.
+            if let Some(icon) = cart_icon {
+                let icon_size = 26.0 * s;
+                draw_texture_ex(
+                    icon,
+                    rx + rw - icon_size - 6.0 * s,
+                    ry + rh - icon_size - 3.0 * s,
+                    WHITE,
+                    DrawTextureParams {
+                        dest_size: Some(vec2(icon_size, icon_size)),
+                        ..Default::default()
+                    },
+                );
+            }
         } else {
             // Metro labels: sentence case, bottom-left inside the tile.
             // Shrink to fit so long labels never spill past the tile edge.
@@ -666,12 +706,13 @@ pub fn draw(
     let origin_y = 112.0 * s;
 
     // --- Panes: the active pane slides in over the previous one ---
+    let media_badge = if state.cart_optical { &state.badge_disc } else { &state.badge_sd };
     if state.anim < 1.0 && state.prev_tab != state.tab {
         let prev_off = -state.dir * t * w;
         draw_tab_pane(
             &TABS[state.prev_tab], None,
             play_option_enabled, copy_logs_option_enabled,
-            state.cover_tex.as_ref(), state.cart_label.as_deref(),
+            state.cover_tex.as_ref(), state.icon_tex.as_ref(), media_badge, state.cart_label.as_deref(),
             prev_off, origin_y, animation_state, font_cache, config, s,
         );
     }
@@ -679,7 +720,7 @@ pub fn draw(
     draw_tab_pane(
         &TABS[state.tab], Some(state.tile),
         play_option_enabled, copy_logs_option_enabled,
-        state.cover_tex.as_ref(), state.cart_label.as_deref(),
+        state.cover_tex.as_ref(), state.icon_tex.as_ref(), media_badge, state.cart_label.as_deref(),
         active_off, origin_y, animation_state, font_cache, config, s,
     );
 
