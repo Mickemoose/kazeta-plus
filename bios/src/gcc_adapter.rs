@@ -8,23 +8,49 @@ use std::sync::mpsc::Sender;
 // The path where the overclocked driver exposes its poll rate
 const GCC_POLL_RATE_PATH: &str = "/sys/module/gcadapter_oc/parameters/rate";
 
+// Nintendo's GameCube controller adapter (Wii U / Switch), the device the
+// overclock driver exists for.
+const GCC_USB_VENDOR: &str = "057e";
+const GCC_USB_PRODUCT: &str = "0337";
+
+/// The module parameter file exists whenever gcadapter_oc is loaded, plugged
+/// in or not — so also require the adapter hardware itself on the USB bus.
+fn adapter_present() -> bool {
+    if let Ok(entries) = fs::read_dir("/sys/bus/usb/devices") {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let vendor = fs::read_to_string(path.join("idVendor")).unwrap_or_default();
+            if vendor.trim() == GCC_USB_VENDOR {
+                let product = fs::read_to_string(path.join("idProduct")).unwrap_or_default();
+                if product.trim() == GCC_USB_PRODUCT {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 pub fn start_gcc_adapter_polling(tx: Sender<GccMessage>) {
     thread::spawn(move || {
         let mut was_connected = false;
         loop {
-            match fs::read_to_string(GCC_POLL_RATE_PATH) {
-                Ok(rate_str) => {
-                    // The file contains the interval in milliseconds (e.g., "1")
-                    if let Ok(rate_ms) = rate_str.trim().parse::<u32>() {
-                        if rate_ms > 0 {
-                            let poll_rate_hz = 1000 / rate_ms;
-                            tx.send(GccMessage::RateUpdate(poll_rate_hz)).unwrap_or_default();
-                            was_connected = true;
-                        }
-                    }
+            // The file contains the interval in milliseconds (e.g., "1")
+            let poll_rate_hz = if adapter_present() {
+                fs::read_to_string(GCC_POLL_RATE_PATH)
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .filter(|ms| *ms > 0)
+                    .map(|ms| 1000 / ms)
+            } else {
+                None
+            };
+            match poll_rate_hz {
+                Some(hz) => {
+                    tx.send(GccMessage::RateUpdate(hz)).unwrap_or_default();
+                    was_connected = true;
                 }
-                Err(_) => {
-                    // File doesn't exist, so adapter is not connected or module not loaded
+                None => {
                     if was_connected {
                         tx.send(GccMessage::Disconnected).unwrap_or_default();
                         was_connected = false;

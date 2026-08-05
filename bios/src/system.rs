@@ -147,6 +147,18 @@ pub fn get_current_local_time_string(config: &Config) -> String {
     local_now.format("%-I:%M %p").to_string()
 }
 
+/// Today's date in the config's timezone, short form (e.g. "Tue, Aug 5").
+pub fn get_current_local_date_string(config: &Config) -> String {
+    let offset_str = config.timezone.replace("UTC", "");
+    let offset_hours: i32 = if offset_str.is_empty() {
+        0
+    } else {
+        offset_str.parse().unwrap_or(0)
+    };
+    let fixed_offset = FixedOffset::east_opt(offset_hours * 3600).unwrap_or(FixedOffset::east_opt(0).unwrap());
+    Utc::now().with_timezone(&fixed_offset).format("%a, %b %-e").to_string()
+}
+
 /// Gets the current system volume using wpctl.
 pub fn get_system_volume() -> Option<f32> {
     let output = Command::new("wpctl").arg("get-volume").arg("@DEFAULT_AUDIO_SINK@").output().ok()?;
@@ -184,6 +196,15 @@ pub fn get_battery_info() -> Option<BatteryInfo> {
         let type_path = path.join("type");
         if let Ok(device_type) = fs::read_to_string(type_path) {
             if device_type.trim() == "Battery" {
+                // Peripheral batteries (controllers, scope=Device) get their
+                // own icon row in the overlay — only a real system battery
+                // belongs on this line.
+                let is_peripheral = fs::read_to_string(path.join("scope"))
+                    .map(|s| s.trim() == "Device")
+                    .unwrap_or(false);
+                if is_peripheral {
+                    continue;
+                }
                 // This is a battery. Let's get both capacity and status.
                 let capacity_path = path.join("capacity");
                 let status_path = path.join("status");

@@ -1,6 +1,7 @@
 # Metro (2011+ Xbox 360 dashboard) theme for Kazeta+
 # Sounds from ZivvoZ/dashx360 (fan project, no license) - personal use only.
 menu_style = "METRO"
+logo_selection = "kazetax_logo.png"
 background_selection = "metro360_background.png"
 sfx_pack = "Metro360SFX"
 cursor_style = "TEXT"

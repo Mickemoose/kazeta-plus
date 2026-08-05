@@ -1,7 +1,0 @@
-# Xbox 360 "Blades" dashboard theme for Kazeta+
-# Background/sounds from Fabxx/XBMC360 (Team BlackBolt MC360 skin).
-# No upstream license - personal use only, do not redistribute in the theme repo.
-menu_style = "BLADES"
-background_selection = "blades360_background.mp4"
-sfx_pack = "Blades360SFX"
-cursor_style = "TEXT"

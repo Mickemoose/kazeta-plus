@@ -5,8 +5,8 @@
 // Enabled via `menu_style = "METRO"` in config.toml or a theme's theme.toml.
 
 use crate::{
-    Screen, InputState, render_background, render_ui_overlay, get_current_font, measure_text,
-    text_with_config_color, FONT_SIZE,
+    Screen, InputState, render_background, render_ui_overlay_alpha, get_current_font, measure_text,
+    text_with_config_color, string_to_color, FONT_SIZE,
     StorageMediaState, VideoPlayer, save,
     audio::SoundEffects,
     config::Config,
@@ -16,6 +16,7 @@ use crate::{
     ui::main_menu::{activate_copy_logs, activate_play, activate_save_data},
 };
 use crate::audio::AUDIO;
+use crate::input::InputSource;
 use macroquad::prelude::*;
 use rodio::{buffer::SamplesBuffer, Decoder, Sink, Source};
 use std::io::Cursor;
@@ -61,12 +62,6 @@ pub const TABS: &[MetroTab] = &[
         ],
     },
     MetroTab {
-        title: "apps",
-        tiles: &[
-            MetroTile { label: "Themes", action: BladeAction::ThemeDownloader, hero: false, green: true, col: 0, row: 0 },
-        ],
-    },
-    MetroTab {
         title: "settings",
         tiles: &[
             MetroTile { label: "Settings", action: BladeAction::Settings, hero: false, green: true, col: 0, row: 0 },
@@ -75,6 +70,7 @@ pub const TABS: &[MetroTab] = &[
             MetroTile { label: "About", action: BladeAction::About, hero: false, green: false, col: 1, row: 1 },
             MetroTile { label: "Session Logs", action: BladeAction::CopyLogs, hero: false, green: false, col: 2, row: 0 },
             MetroTile { label: "Updates", action: BladeAction::UpdateChecker, hero: false, green: false, col: 2, row: 1 },
+            MetroTile { label: "Themes", action: BladeAction::ThemeDownloader, hero: false, green: true, col: 3, row: 0 },
         ],
     },
 ];
@@ -133,6 +129,21 @@ pub struct MetroState {
     sel_anim: f32,
     prev_sel: Option<usize>,
     press_flash: f32,
+    // Boot intro (0..1): runs once the first time the dash is on screen —
+    // update() only ticks while Metro is the active screen, so the clock
+    // naturally starts when the splash hands over.
+    intro_t: f32,
+    // Play outro (0..1 when Some): the reverse choreography that plays after
+    // the Play tile is chosen; the launch fires when it completes.
+    outro_t: Option<f32>,
+    // Which confirm-button glyph the legend shows, tracking the last-used
+    // input device (keyboard vs pad, and pad brand).
+    legend_icon: LegendIcon,
+    // Queued player connect/disconnect toasts, shown one at a time.
+    toasts: Vec<Toast>,
+    // Save icons for the Save Data tile's marquee rows, loaded once at
+    // startup from the internal save cache.
+    save_icons: Vec<Texture2D>,
     // Ambient bokeh motes (config.background_particles == "ON"): parameters
     // are rolled once at startup, positions are pure functions of time.
     bokeh: Vec<Bokeh>,
@@ -176,6 +187,150 @@ struct Bokeh {
 const BGM_FADE_TIME: f32 = 0.7; // seconds for a full fade in or out
 const CART_ANIM_TIME: f32 = 0.4; // seconds for cart branding to fade in or out
 const BOKEH_COUNT: usize = 30;
+const INTRO_TIME: f32 = 1.0; // boot choreography after the splash video
+const OUTRO_TIME: f32 = 0.7; // reverse choreography when Play is chosen
+const TOAST_TIME: f32 = 2.8; // player connect/disconnect pill lifetime
+
+/// One "Player N Connected" pill queued for the bottom of the screen.
+struct Toast {
+    text: String,
+    color: Color, // the player slot's LED color
+    t: f32,
+}
+
+/// Confirm-button glyph shown in the legend, by last-used device.
+#[derive(Clone, Copy, PartialEq)]
+pub enum LegendIcon {
+    Keyboard = 0,
+    Xbox = 1,
+    PlayStation = 2,
+    Switch = 3,
+    Switch2 = 4,
+    Steam = 5,
+    N64 = 6,
+}
+
+thread_local! {
+    // Button glyphs baked into the binary; index matches LegendIcon.
+    static LEGEND_ICONS: [Texture2D; 7] = [
+        legend_tex(include_bytes!("../../buttons/keyboard_enter.png")),
+        legend_tex(include_bytes!("../../buttons/xbox_button_color_a.png")),
+        legend_tex(include_bytes!("../../buttons/playstation_button_color_cross.png")),
+        legend_tex(include_bytes!("../../buttons/switch1_button_a.png")),
+        legend_tex(include_bytes!("../../buttons/switch2_button_a.png")),
+        legend_tex(include_bytes!("../../buttons/steam_button_color_a.png")),
+        legend_tex(include_bytes!("../../buttons/n64_button_a.png")),
+    ];
+    // Matching back-button glyphs (B / circle / backspace), same indexing.
+    static LEGEND_ICONS_BACK: [Texture2D; 7] = [
+        legend_tex(include_bytes!("../../buttons/keyboard_backspace.png")),
+        legend_tex(include_bytes!("../../buttons/xbox_button_color_b.png")),
+        legend_tex(include_bytes!("../../buttons/playstation_button_color_circle.png")),
+        legend_tex(include_bytes!("../../buttons/switch1_button_b.png")),
+        legend_tex(include_bytes!("../../buttons/switch2_button_b.png")),
+        legend_tex(include_bytes!("../../buttons/steam_button_color_b.png")),
+        legend_tex(include_bytes!("../../buttons/n64_button_b.png")),
+    ];
+    // Top-face glyphs (Y / Triangle / X / C-Up / E) for the Eject action.
+    static LEGEND_ICONS_EJECT: [Texture2D; 7] = [
+        legend_tex(include_bytes!("../../buttons/keyboard_e.png")),
+        legend_tex(include_bytes!("../../buttons/xbox_button_color_y.png")),
+        legend_tex(include_bytes!("../../buttons/playstation_button_color_triangle.png")),
+        legend_tex(include_bytes!("../../buttons/switch1_button_x.png")),
+        legend_tex(include_bytes!("../../buttons/switch2_button_x.png")),
+        legend_tex(include_bytes!("../../buttons/steam_button_color_y.png")),
+        legend_tex(include_bytes!("../../buttons/n64_button_cup.png")),
+    ];
+}
+
+fn legend_tex(bytes: &[u8]) -> Texture2D {
+    let tex = Texture2D::from_file_with_format(bytes, Some(ImageFormat::Png));
+    tex.set_filter(FilterMode::Linear);
+    tex
+}
+
+thread_local! {
+    // Toast furniture: neutral controller silhouette + a smooth tintable dot
+    // (draw_circle's small polygons look pixelated at dot sizes).
+    static TOAST_PAD_ICON: Texture2D = legend_tex(include_bytes!("../../CONTROLLER.png"));
+    static TOAST_DOT: Texture2D = make_dot_texture();
+}
+
+/// Anti-aliased white disc, tinted at draw time with the player color.
+fn make_dot_texture() -> Texture2D {
+    const SIZE: u16 = 64;
+    let mut img = Image::gen_image_color(SIZE, SIZE, Color::new(1.0, 1.0, 1.0, 0.0));
+    let c = (SIZE as f32 - 1.0) / 2.0;
+    for py in 0..SIZE as u32 {
+        for px in 0..SIZE as u32 {
+            let dx = px as f32 - c;
+            let dy = py as f32 - c;
+            let d = (dx * dx + dy * dy).sqrt() / c;
+            // Solid core, ~2px smooth rim.
+            let a = ((0.95 - d) * 16.0).clamp(0.0, 1.0);
+            img.set_pixel(px, py, Color::new(1.0, 1.0, 1.0, a));
+        }
+    }
+    let tex = Texture2D::from_image(&img);
+    tex.set_filter(FilterMode::Linear);
+    tex
+}
+
+/// Map a pad's identity to a glyph set by name (physical device names from
+/// InputPlumber, or gilrs names when unmanaged), falling back to vendor id.
+fn legend_icon_for(vendor: Option<u16>, name: &str) -> LegendIcon {
+    let n = name.to_lowercase();
+    if n.contains("dualsense") || n.contains("sony") || n.contains("playstation") {
+        return LegendIcon::PlayStation;
+    }
+    if n.contains("n64") || (n.contains("8bitdo") && n.contains("64")) {
+        return LegendIcon::N64;
+    }
+    if n.contains("switch 2") {
+        return LegendIcon::Switch2;
+    }
+    if n.contains("nintendo") || n.contains("switch") || n.contains("joy-con") || n.contains("pro controller") {
+        return LegendIcon::Switch;
+    }
+    if n.contains("steam") {
+        return LegendIcon::Steam;
+    }
+    match vendor {
+        Some(0x054c) => LegendIcon::PlayStation,
+        Some(0x057e) => LegendIcon::Switch,
+        Some(0x28de) => LegendIcon::Steam,
+        // 8BitDo's dongles present as XInput pads with 8BitDo's USB id.
+        Some(0x2dc8) => LegendIcon::N64,
+        _ => LegendIcon::Xbox,
+    }
+}
+
+/// The glyph for the last-used pad. gilrs only sees InputPlumber's virtual
+/// devices, so a "Microsoft X-Box 360 pad" (or anything InputPlumber-named)
+/// may really be any brand — in that case ask InputPlumber for the physical
+/// composite names and trust those instead.
+fn pad_legend_icon(vendor: Option<u16>, name: &str) -> LegendIcon {
+    let direct = legend_icon_for(vendor, name);
+    // Only an Xbox verdict is ambiguous (it's the fallback and the virtual
+    // pad brand) — anything else came from real identity, trust it.
+    if direct == LegendIcon::Xbox {
+        let composites = crate::pad_brand::current();
+        // A Sony pad is never masked (the ds5 target keeps its identity), so
+        // prefer the first composite that maps to something non-PlayStation.
+        let mapped: Vec<LegendIcon> = composites
+            .iter()
+            .map(|c| legend_icon_for(None, c))
+            .collect();
+        if let Some(icon) = mapped
+            .iter()
+            .find(|i| **i != LegendIcon::PlayStation)
+            .or_else(|| mapped.first())
+        {
+            return *icon;
+        }
+    }
+    direct
+}
 
 /// Load cart-supplied art defensively: macroquad panics on unsupported
 /// formats (e.g. a JPEG renamed .png), so verify the PNG signature first and
@@ -259,17 +414,49 @@ impl MetroState {
             })
             .collect();
 
+        // Save icons for the Save Data marquee: every cached save's 32x32
+        // icon, pixel-crisp. Missing/broken icons are simply skipped.
+        let save_icons: Vec<Texture2D> = save::get_save_details("internal")
+            .map(|details| {
+                details
+                    .into_iter()
+                    .filter_map(|(_, _, icon)| {
+                        let tex = load_cart_texture(&std::fs::read(icon).ok()?)?;
+                        tex.set_filter(FilterMode::Nearest);
+                        Some(tex)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
         Self {
             tab: DEFAULT_TAB, prev_tab: DEFAULT_TAB, anim: 1.0, dir: 1.0,
             tile: primary_tile(DEFAULT_TAB),
             cover_tex: None, icon_tex: None, cart_label: None, cart_optical: false,
             badge_sd, badge_disc, cover_key: String::new(),
             cart_vis: 0.0, outgoing: None,
+            save_icons,
             sel_anim: 1.0, prev_sel: None, press_flash: 0.0,
+            intro_t: 0.0,
+            outro_t: None,
+            legend_icon: LegendIcon::Keyboard,
+            toasts: Vec::new(),
             bokeh, bokeh_tex: make_bokeh_texture(), fade_tex: make_fade_texture(),
             bgm_path: None, bgm_sink: None, bgm_vol: 0.0,
             mounts_fp: String::new(), mounts_polled: -10.0,
         }
+    }
+
+    /// Restart the boot slide-in choreography (used when returning from the
+    /// multicart selection screen).
+    pub fn replay_intro(&mut self) {
+        self.intro_t = 0.0;
+    }
+
+    /// Current confirm-glyph choice, for screens drawn outside metro::draw
+    /// (the multicart selector shares the dashboard's device detection).
+    pub fn legend_icon(&self) -> LegendIcon {
+        self.legend_icon
     }
 
     pub fn stop_bgm(&mut self) {
@@ -314,8 +501,90 @@ fn draw_tile_shadow(x: f32, y: f32, w: f32, h: f32, s: f32, strength: f32) {
     }
 }
 
+/// Two marquee rows of save icons drifting across the Save Data tile in
+/// opposite directions, pixel-crisp and cropped cleanly at the tile edges.
+fn draw_save_marquee(icons: &[Texture2D], x: f32, y: f32, w: f32, s: f32) {
+    let t = get_time() as f32;
+    let icon = 26.0 * s;
+    let gap = 5.0 * s;
+    let step = icon + gap;
+    let n = icons.len();
+    let span = step * n as f32;
+    // Enough repetitions of the icon loop to always cover the tile width.
+    let copies = ((w + step) / span).ceil() as usize + 1;
+
+    // (row y offset, speed in design units/sec; sign = direction)
+    for (row, (y_off, speed)) in [(9.0f32, -7.0f32), (43.0, 5.5)].into_iter().enumerate() {
+        let py = y + y_off * s;
+        let scroll = t * speed * s + row as f32 * step * 0.5;
+        let o = scroll.rem_euclid(span);
+        for j in 0..(n * copies) {
+            let px = x + j as f32 * step - o;
+            if px + icon <= x || px >= x + w {
+                continue;
+            }
+            let tex = &icons[j % n];
+            let (tw, th) = (tex.width(), tex.height());
+            // Crop at the tile edges so partial icons never spill out.
+            let mut dx = px;
+            let mut dw = icon;
+            let mut src_x = 0.0;
+            if dx < x {
+                let cut = x - dx;
+                src_x = cut / icon * tw;
+                dw -= cut;
+                dx = x;
+            }
+            if dx + dw > x + w {
+                dw = x + w - dx;
+            }
+            if dw <= 0.5 {
+                continue;
+            }
+            draw_texture_ex(
+                tex,
+                dx,
+                py,
+                Color::new(1.0, 1.0, 1.0, 0.92),
+                DrawTextureParams {
+                    dest_size: Some(vec2(dw, icon)),
+                    source: Some(Rect::new(src_x, 0.0, dw / icon * tw, th)),
+                    ..Default::default()
+                },
+            );
+        }
+    }
+}
+
+/// Selection glow: a soft gradient halo radiating out from the tile edge
+/// with a slow breathing pulse — replaces the old crisp blinking frame.
+/// Layered outlines with squared falloff read as a smooth gradient once
+/// they overlap (thickness 2x the layer step).
+fn draw_focus_glow(x: f32, y: f32, w: f32, h: f32, s: f32, color: Color) {
+    let t = get_time() as f32;
+    // Slow breath between 72% and 100% instead of a hard blink.
+    let pulse = 0.72 + 0.28 * (0.5 + 0.5 * (t * 2.4).sin());
+    const LAYERS: usize = 8;
+    for i in (0..LAYERS).rev() {
+        let off = (i as f32 + 1.0) * 1.0 * s;
+        let falloff = 1.0 - i as f32 / LAYERS as f32;
+        let a = 0.32 * falloff * falloff * pulse;
+        draw_rectangle_lines(
+            x - off,
+            y - off,
+            w + off * 2.0,
+            h + off * 2.0,
+            2.0 * s,
+            Color::new(color.r, color.g, color.b, a),
+        );
+    }
+    // Crisp core edge so the selection still reads sharply.
+    draw_rectangle_lines(x, y, w, h, 2.0 * s, Color::new(color.r, color.g, color.b, 0.95 * pulse));
+}
+
 /// Selection frame whose edge bars stop `r` short of the corners — reads as
 /// dashx360's small corner radius at dash distance.
+#[allow(dead_code)]
 fn draw_focus_frame(x: f32, y: f32, w: f32, h: f32, th: f32, r: f32, color: Color) {
     draw_rectangle(x + r, y, w - 2.0 * r, th, color);
     draw_rectangle(x + r, y + h - th, w - 2.0 * r, th, color);
@@ -498,6 +767,54 @@ pub fn update(
     // Focus/press animation clocks.
     state.sel_anim = (state.sel_anim + get_frame_time()).min(1.0);
     state.press_flash = (state.press_flash - get_frame_time() / PRESS_FLASH_TIME).max(0.0);
+    state.intro_t = (state.intro_t + get_frame_time() / INTRO_TIME).min(1.0);
+
+    // Legend glyph follows whatever device the user touched last.
+    state.legend_icon = match input_state.last_source {
+        InputSource::Keyboard => LegendIcon::Keyboard,
+        InputSource::Pad => pad_legend_icon(input_state.pad_vendor, &input_state.pad_name),
+    };
+
+    // Player toasts: consume connect/disconnect events from the LED painter
+    // and show them one at a time as a bottom pill.
+    for ev in crate::pad_leds::take_pad_events() {
+        let (r, g, b) = crate::pad_leds::PLAYER_COLORS[ev.slot.min(3)];
+        state.toasts.push(Toast {
+            text: format!(
+                "Player {} {}",
+                ev.slot + 1,
+                if ev.connected { "Connected" } else { "Disconnected" }
+            ),
+            color: Color::from_rgba(r, g, b, 255),
+            t: 0.0,
+        });
+    }
+    if let Some(toast) = state.toasts.first_mut() {
+        toast.t += get_frame_time();
+        if toast.t >= TOAST_TIME {
+            state.toasts.remove(0);
+        }
+    }
+
+    // Play outro: the dashboard slides back out (reverse intro), then the
+    // launch/multicart handoff fires. Navigation is parked while it runs.
+    if let Some(o) = state.outro_t {
+        let o = o + get_frame_time() / OUTRO_TIME;
+        if o < 1.0 {
+            state.outro_t = Some(o);
+        } else {
+            state.outro_t = None;
+            // Slide back in whenever the dash next shows (returning from
+            // the multicart menu, or after the game).
+            state.intro_t = 0.0;
+            activate_play(
+                current_screen, sound_effects, config, log_messages, fade_start_time,
+                current_bgm, music_cache, game_icon_queue, available_games,
+                game_selection, game_process,
+            );
+        }
+        return;
+    }
 
     // Cart branding fade clocks: the current cart fades in, the parked
     // previous cart fades out and is dropped once invisible.
@@ -623,6 +940,28 @@ pub fn update(
         }
     }
 
+    // Eject: North on the Play hero cleanly unmounts the cart (and pops the
+    // tray for discs). The branding fade-out happens on its own once the
+    // mount disappears.
+    if input_state.tertiary && *play_option_enabled {
+        let on_play_hero = TABS[state.tab]
+            .tiles
+            .get(state.tile)
+            .map(|t| t.hero && t.action == BladeAction::Play)
+            .unwrap_or(false);
+        if on_play_hero {
+            state.stop_bgm();
+            if let Some(system_bgm) = current_bgm.as_ref() {
+                system_bgm.set_volume(1.0);
+            }
+            let _ = std::process::Command::new("sudo")
+                .args(["-n", "/usr/bin/kazeta-eject"])
+                .spawn();
+            *flash_message = Some(("CART EJECTED - SAFE TO REMOVE".to_string(), 3.0));
+            sound_effects.play_back(&config);
+        }
+    }
+
     if input_state.select {
         // Metro press acknowledgment: the tile dips dark for a beat.
         state.press_flash = 1.0;
@@ -639,11 +978,10 @@ pub fn update(
             }
             BladeAction::Play => {
                 if *play_option_enabled {
-                    activate_play(
-                        current_screen, sound_effects, config, log_messages, fade_start_time,
-                        current_bgm, music_cache, game_icon_queue, available_games,
-                        game_selection, game_process,
-                    );
+                    // Reverse choreography first; activate_play fires when it
+                    // lands (it plays the select sound itself, so nothing
+                    // extra here — the outro is the acknowledgment).
+                    state.outro_t = Some(0.0);
                 } else {
                     sound_effects.play_reject(&config);
                 }
@@ -690,6 +1028,7 @@ fn draw_hero_brand(
     brand: &HeroBrandDraw,
     rx: f32, ry: f32, rw: f32, rh: f32,
     cover_pass: bool,
+    motion: f32, // 0..1 hover blend for the cover's Ken Burns drift
     font_cache: &HashMap<String, Font>,
     config: &Config,
     s: f32,
@@ -707,9 +1046,30 @@ fn draw_hero_brand(
 
     if cover_pass {
         if let Some(tex) = brand.cover {
+            // Ken Burns while hovered: a gentle push-in with a slow breathing
+            // zoom and a lazy drift, done as a source-rect crop so the art
+            // never spills outside the frame. motion 0 = the plain stretch.
+            let src = if motion > 0.001 {
+                let t = get_time() as f32;
+                let tau = std::f32::consts::TAU;
+                let (tw, th) = (tex.width(), tex.height());
+                let zoom = 1.0 + motion * (0.05 + 0.03 * (0.5 - 0.5 * (t * tau / 14.0).cos()));
+                let sw = tw / zoom;
+                let sh = th / zoom;
+                let px = 0.5 + 0.5 * motion * (t * tau / 23.0).sin();
+                let py = 0.5 + 0.5 * motion * (t * tau / 31.0).cos();
+                Some(Rect::new(
+                    (tw - sw) * px.clamp(0.0, 1.0),
+                    (th - sh) * py.clamp(0.0, 1.0),
+                    sw,
+                    sh,
+                ))
+            } else {
+                None
+            };
             draw_texture_ex(
                 tex, bx, by, tint,
-                DrawTextureParams { dest_size: Some(vec2(bw, bh)), ..Default::default() },
+                DrawTextureParams { dest_size: Some(vec2(bw, bh)), source: src, ..Default::default() },
             );
         }
         return;
@@ -765,16 +1125,28 @@ fn draw_hero_brand(
 /// Ambient bokeh motes over the background: slow upward drift, a lazy sway,
 /// each breathing in and out on its own cycle. Positions are pure functions
 /// of time, so this needs no mutable state.
-fn draw_bokeh(state: &MetroState, s: f32) {
+fn draw_bokeh(state: &MetroState, intro: f32, s: f32) {
     let t = get_time() as f32;
     let w = screen_width();
     let h = screen_height();
     for b in &state.bokeh {
-        let y = (b.y - t * b.speed).rem_euclid(1.15) - 0.075;
-        let x = (b.x + (t * b.wobble_hz * std::f32::consts::TAU + b.phase).sin() * b.wobble)
+        let mut y = (b.y - t * b.speed).rem_euclid(1.15) - 0.075;
+        let mut x = (b.x + (t * b.wobble_hz * std::f32::consts::TAU + b.phase).sin() * b.wobble)
             .rem_euclid(1.0);
         let breath = 0.5 - 0.5 * (t * b.twinkle_hz * std::f32::consts::TAU + b.phase * 1.7).cos();
-        let a = b.alpha * breath;
+        let mut a = b.alpha * breath;
+        // Boot intro: every mote flies out of a point just below
+        // bottom-center, curling as it travels to its resting spot.
+        if intro < 1.0 {
+            let dx = x - 0.5;
+            let dy = y - 1.1;
+            let spin = if b.phase < std::f32::consts::PI { 1.0 } else { -1.0 };
+            let curl = (1.0 - intro) * (0.9 + b.phase * 0.25) * spin;
+            let (sin_c, cos_c) = curl.sin_cos();
+            x = 0.5 + (dx * cos_c - dy * sin_c) * intro;
+            y = 1.1 + (dx * sin_c + dy * cos_c) * intro;
+            a *= intro;
+        }
         if a <= 0.003 {
             continue;
         }
@@ -796,9 +1168,12 @@ fn draw_tab_pane(
     sel_anim: f32,
     prev_sel: Option<usize>,
     press_flash: f32,
+    intro: f32,
     play_option_enabled: bool,
     copy_logs_option_enabled: bool,
     hero_brands: &[HeroBrandDraw],
+    save_icons: &[Texture2D],
+    hint_sd: &Texture2D,
     fade_tex: &Texture2D,
     offset_x: f32,
     origin_y: f32,
@@ -820,7 +1195,17 @@ fn draw_tab_pane(
 
     let draw_one = |idx: usize| {
         let tile = &tab.tiles[idx];
-        let r = tile_rect(tile, tab.tiles, origin_x, origin_y, s);
+        let mut r = tile_rect(tile, tab.tiles, origin_x, origin_y, s);
+        // Boot intro: tiles slide home from the screen edges — left half of
+        // the pane from the left, right half from the right.
+        if intro < 1.0 {
+            let slide = (1.0 - intro) * screen_width() * 0.85;
+            if r.x + r.w / 2.0 < screen_width() / 2.0 {
+                r.x -= slide;
+            } else {
+                r.x += slide;
+            }
+        }
         let is_selected = selected == Some(idx);
         let is_disabled = match tile.action {
             BladeAction::Play => !play_option_enabled,
@@ -865,11 +1250,18 @@ fn draw_tab_pane(
 
         draw_rectangle(rx, ry, rw, rh, fill);
 
-        // Cover pass: cart covers sit under the lighting and frame.
+        // Cover pass: cart covers sit under the lighting and frame. The
+        // focus lift doubles as the Ken Burns hover blend.
         if hero_play {
             for brand in hero_brands {
-                draw_hero_brand(brand, rx, ry, rw, rh, true, font_cache, config, s);
+                draw_hero_brand(brand, rx, ry, rw, rh, true, lift, font_cache, config, s);
             }
+        }
+
+        // Save Data wears a marquee of every saved game's icon, two rows
+        // drifting in opposite directions.
+        if tile.action == BladeAction::SaveData && !save_icons.is_empty() {
+            draw_save_marquee(save_icons, rx, ry, rw, s);
         }
 
         // Top shimmer (dashx360's white-fade band) on the hero only — the
@@ -900,17 +1292,39 @@ fn draw_tab_pane(
             );
         }
 
-        if is_selected {
-            // Metro selection: crisp white frame (soft corners) with a thin
-            // dark seam inside.
-            let border = animation_state.get_cursor_color(config);
-            draw_focus_frame(rx, ry, rw, rh, 2.5 * s, 1.5 * s, border);
-            draw_rectangle_lines(
-                rx + 2.5 * s, ry + 2.5 * s,
-                rw - 5.0 * s, rh - 5.0 * s,
-                1.0 * s,
-                Color::new(0.0, 0.0, 0.0, 0.35),
+        // Empty-cart coaching: the bare Play hero pulses an SD glyph and an
+        // "Insert Cartridge" hint instead of sitting blank.
+        if hero_play && hero_brands.is_empty() {
+            let pulse = 0.30 + 0.14 * (get_time() as f32 * 2.0).sin();
+            let icon_h = 34.0 * s;
+            let icon_w = icon_h * hint_sd.width() / hint_sd.height();
+            let cx = rx + rw / 2.0;
+            let cy = ry + rh / 2.0;
+            draw_texture_ex(
+                hint_sd,
+                cx - icon_w / 2.0,
+                cy - icon_h + 4.0 * s,
+                Color::new(1.0, 1.0, 1.0, pulse),
+                DrawTextureParams {
+                    dest_size: Some(vec2(icon_w, icon_h)),
+                    ..Default::default()
+                },
             );
+            let hint = "Insert Cartridge";
+            let hint_size = (FONT_SIZE as f32 * s * 0.9) as u16;
+            let dims = measure_text(hint, Some(current_font), hint_size, 1.0);
+            draw_text_ex(hint, cx - dims.width / 2.0, cy + 18.0 * s, TextParams {
+                font: Some(current_font),
+                font_size: hint_size,
+                color: Color::new(1.0, 1.0, 1.0, pulse + 0.1),
+                ..Default::default()
+            });
+        }
+
+        if is_selected {
+            // Metro selection: gradient glow halo breathing around the tile.
+            let border = string_to_color(&config.cursor_color);
+            draw_focus_glow(rx, ry, rw, rh, s, border);
         }
 
         // The Play hero's mockup furniture — translucent "Play: NAME" bar,
@@ -919,7 +1333,7 @@ fn draw_tab_pane(
         // disabled) tile on its way out.
         if hero_play && !hero_brands.is_empty() {
             for brand in hero_brands {
-                draw_hero_brand(brand, rx, ry, rw, rh, false, font_cache, config, s);
+                draw_hero_brand(brand, rx, ry, rw, rh, false, 0.0, font_cache, config, s);
             }
         } else {
             // Metro labels: sentence case, bottom-left inside the tile.
@@ -975,6 +1389,7 @@ pub fn draw_game_selection(
     placeholder: &Texture2D,
     selected_game: usize,
     cart_label: Option<&str>,
+    legend_icon: LegendIcon,
     animation_state: &AnimationState,
     background_cache: &HashMap<String, Texture2D>,
     video_cache: &mut HashMap<String, VideoPlayer>,
@@ -1052,12 +1467,8 @@ pub fn draw_game_selection(
         );
 
         if is_selected {
-            let border = animation_state.get_cursor_color(config);
-            draw_rectangle_lines(rx, ry, rw, rh, 2.5 * s, border);
-            draw_rectangle_lines(
-                rx + 2.5 * s, ry + 2.5 * s, rw - 5.0 * s, rh - 5.0 * s,
-                1.0 * s, Color::new(0.0, 0.0, 0.0, 0.35),
-            );
+            let border = string_to_color(&config.cursor_color);
+            draw_focus_glow(rx, ry, rw, rh, s, border);
         }
     }
 
@@ -1081,6 +1492,51 @@ pub fn draw_game_selection(
                 Color::new(1.0, 1.0, 1.0, 0.4),
             );
         }
+    }
+
+    // --- Button legend, lower right like the dashboard: confirm boots the
+    // cart, back returns to the dash. Glyphs match the last-used device. ---
+    {
+        let legend_size = (FONT_SIZE as f32 * s * 0.8) as u16;
+        let icon_h = 18.0 * s;
+        let cy = 324.0 * s;
+        let icon_gap = 4.0 * s;
+        let group_gap = 16.0 * s;
+        let dim_white = Color::new(1.0, 1.0, 1.0, 0.75);
+
+        let back_lbl = "Back";
+        let back_dims = measure_text(back_lbl, Some(current_font), legend_size, 1.0);
+        let back_text_x = screen_width() - 24.0 * s - back_dims.width;
+        LEGEND_ICONS_BACK.with(|icons| {
+            draw_texture_ex(
+                &icons[legend_icon as usize],
+                back_text_x - icon_gap - icon_h,
+                cy - icon_h / 2.0,
+                WHITE,
+                DrawTextureParams { dest_size: Some(vec2(icon_h, icon_h)), ..Default::default() },
+            );
+        });
+        text_with_color(
+            font_cache, config, back_lbl,
+            back_text_x, cy + back_dims.offset_y / 2.0, legend_size, dim_white,
+        );
+
+        let play_lbl = "Play";
+        let play_dims = measure_text(play_lbl, Some(current_font), legend_size, 1.0);
+        let play_text_x = back_text_x - icon_gap - icon_h - group_gap - play_dims.width;
+        LEGEND_ICONS.with(|icons| {
+            draw_texture_ex(
+                &icons[legend_icon as usize],
+                play_text_x - icon_gap - icon_h,
+                cy - icon_h / 2.0,
+                WHITE,
+                DrawTextureParams { dest_size: Some(vec2(icon_h, icon_h)), ..Default::default() },
+            );
+        });
+        text_with_color(
+            font_cache, config, play_lbl,
+            play_text_x, cy + play_dims.offset_y / 2.0, legend_size, dim_white,
+        );
     }
 }
 
@@ -1111,9 +1567,23 @@ pub fn draw(
     let current_font = get_current_font(font_cache, config);
     let origin_y = 112.0 * s;
 
+    // Boot intro choreography: bokeh swirls out of the bottom, tiles slide
+    // in from the edges, the tab strip drops in from the top, and the status
+    // furniture (clock, poll rate, version, legend) fades up last. A Play
+    // outro runs the same choreography in reverse.
+    let (intro, overlay_a) = if let Some(o) = state.outro_t {
+        let p = 1.0 - ease_out(o);
+        (p, ((p - 0.35) / 0.5).clamp(0.0, 1.0))
+    } else {
+        (
+            ease_out(state.intro_t),
+            ease_out_sine(((state.intro_t - 0.35) / 0.5).clamp(0.0, 1.0)),
+        )
+    };
+
     // Ambient bokeh motes float over the background, under everything else.
     if config.background_particles == "ON" {
-        draw_bokeh(state, s);
+        draw_bokeh(state, intro, s);
     }
 
     // --- Hero branding layers: ejected cart fading out under the current
@@ -1142,50 +1612,88 @@ pub fn draw(
     if state.anim < 1.0 && state.prev_tab != state.tab {
         let prev_off = -state.dir * t * w;
         draw_tab_pane(
-            &TABS[state.prev_tab], None, 1.0, None, 0.0,
+            &TABS[state.prev_tab], None, 1.0, None, 0.0, intro,
             play_option_enabled, copy_logs_option_enabled,
-            &hero_brands, &state.fade_tex,
+            &hero_brands, &state.save_icons, &state.badge_sd, &state.fade_tex,
             prev_off, origin_y, animation_state, font_cache, config, s,
         );
     }
     let active_off = state.dir * (1.0 - t) * w;
     draw_tab_pane(
-        &TABS[state.tab], Some(state.tile), state.sel_anim, state.prev_sel, state.press_flash,
+        &TABS[state.tab], Some(state.tile), state.sel_anim, state.prev_sel, state.press_flash, intro,
         play_option_enabled, copy_logs_option_enabled,
-        &hero_brands, &state.fade_tex,
+        &hero_brands, &state.save_icons, &state.badge_sd, &state.fade_tex,
         active_off, origin_y, animation_state, font_cache, config, s,
     );
 
-    // --- Button legend, lower right like the real dash ---
-    {
+    // --- Button legend, lower right like the real dash; the confirm glyph
+    // matches the last-used device (keyboard/pad brand). Fades up with the
+    // rest of the status furniture (hand-rolled shadowed text so the fixed
+    // 0.9-alpha helper shadow can't ghost during the fade) ---
+    if overlay_a > 0.0 {
         let legend_size = (FONT_SIZE as f32 * s * 0.8) as u16;
         let label = "Select";
         let dims = measure_text(label, Some(current_font), legend_size, 1.0);
-        let radius = 7.0 * s;
         let end_x = screen_width() - 24.0 * s;
         let text_x = end_x - dims.width;
         let cy = 324.0 * s;
-        let cx = text_x - 5.0 * s - radius;
-        draw_circle(cx, cy, radius, Color::new(0.36, 0.62, 0.10, 1.0));
-        draw_circle_lines(cx, cy, radius, 1.2 * s, Color::new(0.0, 0.0, 0.0, 0.35));
-        let a_size = (FONT_SIZE as f32 * s * 0.75) as u16;
-        let a_dims = measure_text("A", Some(current_font), a_size, 1.0);
-        text_with_color(
-            font_cache, config, "A",
-            cx - a_dims.width / 2.0,
-            cy + a_dims.offset_y / 2.0,
-            a_size, WHITE,
-        );
-        text_with_color(
-            font_cache, config, label,
-            text_x,
-            cy + dims.offset_y / 2.0,
-            legend_size, Color::new(1.0, 1.0, 1.0, 0.75),
-        );
+        let icon_h = 18.0 * s;
+        LEGEND_ICONS.with(|icons| {
+            draw_texture_ex(
+                &icons[state.legend_icon as usize],
+                text_x - 4.0 * s - icon_h,
+                cy - icon_h / 2.0,
+                Color::new(1.0, 1.0, 1.0, overlay_a),
+                DrawTextureParams {
+                    dest_size: Some(vec2(icon_h, icon_h)),
+                    ..Default::default()
+                },
+            );
+        });
+        let shadowed = |text: &str, x: f32, y: f32, size: u16, alpha: f32| {
+            let so = 1.0 * (size as f32 / FONT_SIZE as f32);
+            draw_text_ex(text, x + so, y + so, TextParams {
+                font: Some(current_font), font_size: size,
+                color: Color::new(0.0, 0.0, 0.0, 0.9 * overlay_a),
+                ..Default::default()
+            });
+            draw_text_ex(text, x, y, TextParams {
+                font: Some(current_font), font_size: size,
+                color: Color::new(1.0, 1.0, 1.0, alpha * overlay_a),
+                ..Default::default()
+            });
+        };
+        shadowed(label, text_x, cy + dims.offset_y / 2.0, legend_size, 0.75);
+
+        // Eject appears only while the Play hero holds a cart to eject.
+        let on_play_hero = TABS[state.tab]
+            .tiles
+            .get(state.tile)
+            .map(|t| t.hero && t.action == BladeAction::Play)
+            .unwrap_or(false);
+        if on_play_hero && play_option_enabled {
+            let ej_lbl = "Eject";
+            let ej_dims = measure_text(ej_lbl, Some(current_font), legend_size, 1.0);
+            let ej_text_x = text_x - 4.0 * s - icon_h - 16.0 * s - ej_dims.width;
+            LEGEND_ICONS_EJECT.with(|icons| {
+                draw_texture_ex(
+                    &icons[state.legend_icon as usize],
+                    ej_text_x - 4.0 * s - icon_h,
+                    cy - icon_h / 2.0,
+                    Color::new(1.0, 1.0, 1.0, overlay_a),
+                    DrawTextureParams {
+                        dest_size: Some(vec2(icon_h, icon_h)),
+                        ..Default::default()
+                    },
+                );
+            });
+            shadowed(ej_lbl, ej_text_x, cy + ej_dims.offset_y / 2.0, legend_size, 0.75);
+        }
     }
 
-    // --- Tab strip: every tab name in a row, active one big and white ---
-    let strip_y = 62.0 * s;
+    // --- Tab strip: every tab name in a row, active one big and white;
+    // during the intro the whole strip slides down from above the screen ---
+    let strip_y = 62.0 * s - (1.0 - intro) * 120.0 * s;
     let mut x = ORIGIN_X * s;
     for (i, tab) in TABS.iter().enumerate() {
         let is_active = i == state.tab;
@@ -1200,7 +1708,55 @@ pub fn draw(
         x += dims.width + 13.0 * s;
     }
 
-    render_ui_overlay(logo_cache, font_cache, config, battery_info, current_time_str, gcc_adapter_poll_rate, scale_factor);
+    render_ui_overlay_alpha(logo_cache, font_cache, config, battery_info, current_time_str, gcc_adapter_poll_rate, scale_factor, overlay_a, true);
+
+    // --- Player toast: "[glyph] [color dot] Player N Connected" pill that
+    // slides up from the bottom edge and drops away after a beat ---
+    if let Some(toast) = state.toasts.first() {
+        let v_in = ease_out((toast.t / 0.25).min(1.0));
+        let v_out = ease_out(((TOAST_TIME - toast.t) / 0.25).clamp(0.0, 1.0));
+        let v = v_in.min(v_out);
+        let size = (FONT_SIZE as f32 * s * 0.85) as u16;
+        let dims = measure_text(&toast.text, Some(current_font), size, 1.0);
+        let icon_h = 16.0 * s;
+        let dot_r = 4.5 * s;
+        let pad = 10.0 * s;
+        let gap = 7.0 * s;
+        let pill_w = pad + icon_h + gap + dot_r * 2.0 + gap + dims.width + pad;
+        let pill_h = 28.0 * s;
+        let px = (screen_width() - pill_w) / 2.0;
+        let py = screen_height() - 46.0 * s * v;
+        draw_rectangle(px, py, pill_w, pill_h, Color::new(0.06, 0.06, 0.07, 0.85 * v));
+        draw_rectangle_lines(px, py, pill_w, pill_h, 1.2 * s, Color::new(1.0, 1.0, 1.0, 0.18 * v));
+        let mut x = px + pad;
+        let cy = py + pill_h / 2.0;
+        TOAST_PAD_ICON.with(|icon| {
+            draw_texture_ex(
+                icon,
+                x,
+                cy - icon_h / 2.0,
+                Color::new(1.0, 1.0, 1.0, v),
+                DrawTextureParams { dest_size: Some(vec2(icon_h, icon_h)), ..Default::default() },
+            );
+        });
+        x += icon_h + gap;
+        TOAST_DOT.with(|dot| {
+            draw_texture_ex(
+                dot,
+                x,
+                cy - dot_r,
+                Color::new(toast.color.r, toast.color.g, toast.color.b, v),
+                DrawTextureParams { dest_size: Some(vec2(dot_r * 2.0, dot_r * 2.0)), ..Default::default() },
+            );
+        });
+        x += dot_r * 2.0 + gap;
+        draw_text_ex(&toast.text, x, cy + dims.offset_y / 2.0, TextParams {
+            font: Some(current_font),
+            font_size: size,
+            color: Color::new(1.0, 1.0, 1.0, 0.95 * v),
+            ..Default::default()
+        });
+    }
 
     // --- Flash message, same treatment as the other menus ---
     if let Some(message) = flash_message {

@@ -1,0 +1,4 @@
+# Kazeta: allow the seat user (kazeta-bios) to set controller LEDs so the
+# dashboard can paint player colors on DualSense lightbars and player dots.
+ACTION=="add", SUBSYSTEM=="leds", KERNEL=="*:rgb:indicator", RUN+="/usr/bin/chmod 0666 /sys%p/brightness /sys%p/multi_intensity"
+ACTION=="add", SUBSYSTEM=="leds", KERNEL=="*:white:player-*", RUN+="/usr/bin/chmod 0666 /sys%p/brightness"

@@ -97,13 +97,12 @@ else
 		exit 0
 	fi
 
-	# SINGLE GAME: no auto-boot either - land on the dashboard, where the
+	# SINGLE GAME: reaching this point means autoboot is ON (autoboot=false
+	# already exited to the dashboard above), so fall through and boot the
+	# game directly, original-Kazeta style. With autoboot OFF the dashboard's
 	# Play hero carries the cart's branding and launches it on demand.
-	# (Direct boot still happens when the BIOS passes a specific .kzi as $1.)
 	if [ "$game_count" -eq 1 ]; then
-		echo "DEBUG: Single game cart. Launching BIOS dashboard."
-		gamescope --filter pixel -- kazeta-bios
-		exit 0
+		echo "DEBUG: Single game cart with autoboot on. Booting game directly."
 	fi
 
 	# No games found: fall through with empty cart paths (BIOS launch below).

@@ -2,6 +2,13 @@ use macroquad::prelude::*;
 use gilrs::{Gilrs, Button, Axis};
 use crate::types::UIFocus; // Assuming UIFocus is in types.rs
 
+/// Which device the user touched last — drives button-glyph selection.
+#[derive(Clone, Copy, PartialEq)]
+pub enum InputSource {
+    Keyboard,
+    Pad,
+}
+
 pub struct InputState {
     pub up: bool,
     pub down: bool,
@@ -13,8 +20,13 @@ pub struct InputState {
     pub cycle: bool,
     pub back: bool,
     pub secondary: bool,
+    pub tertiary: bool, // North button (Y/Triangle/C-Up) / keyboard E
     pub analog_was_neutral: bool,
     pub ui_focus: UIFocus,
+    pub last_source: InputSource,
+    // Identity of the most recently used pad, for brand-matched glyphs.
+    pub pad_vendor: Option<u16>,
+    pub pad_name: String,
 }
 
 impl InputState {
@@ -32,8 +44,12 @@ impl InputState {
             cycle: false,
             back: false,
             secondary: false,
+            tertiary: false,
             analog_was_neutral: true,
             ui_focus: UIFocus::Grid,
+            last_source: InputSource::Keyboard,
+            pad_vendor: None,
+            pad_name: String::new(),
         }
     }
 
@@ -48,6 +64,7 @@ impl InputState {
         self.cycle = false;
         self.back = false;
         self.secondary = false;
+        self.tertiary = false;
         // Note: We do NOT reset analog_was_neutral or ui_focus
     }
 
@@ -61,12 +78,33 @@ impl InputState {
         self.prev = is_key_pressed(KeyCode::LeftBracket);
         self.back = is_key_pressed(KeyCode::Backspace);
         self.secondary = is_key_pressed(KeyCode::X);
+        self.tertiary = is_key_pressed(KeyCode::E);
         self.cycle = is_key_pressed(KeyCode::Tab);
+        // Runs before update_controller each frame, so the flags here are
+        // purely keyboard-derived.
+        if self.up || self.down || self.left || self.right || self.select
+            || self.next || self.prev || self.back || self.secondary
+            || self.tertiary || self.cycle
+        {
+            self.last_source = InputSource::Keyboard;
+        }
+    }
+
+    fn note_pad(&mut self, gilrs: &Gilrs, id: gilrs::GamepadId) {
+        self.last_source = InputSource::Pad;
+        let pad = gilrs.gamepad(id);
+        self.pad_vendor = pad.vendor_id();
+        if self.pad_name != pad.name() {
+            self.pad_name = pad.name().to_string();
+        }
     }
 
     pub fn update_controller(&mut self, gilrs: &mut Gilrs) {
         // Handle button events
         while let Some(ev) = gilrs.next_event() {
+            if let gilrs::EventType::ButtonPressed(..) = ev.event {
+                self.note_pad(gilrs, ev.id);
+            }
             match ev.event {
                 gilrs::EventType::ButtonPressed(Button::DPadUp, _) => self.up = true,
                 gilrs::EventType::ButtonPressed(Button::DPadDown, _) => self.down = true,
@@ -75,6 +113,7 @@ impl InputState {
                 gilrs::EventType::ButtonPressed(Button::South, _) => self.select = true,
                 gilrs::EventType::ButtonPressed(Button::East, _) => self.back = true,
                 gilrs::EventType::ButtonPressed(Button::West, _) => self.secondary = true,
+                gilrs::EventType::ButtonPressed(Button::North, _) => self.tertiary = true,
                 gilrs::EventType::ButtonPressed(Button::RightTrigger, _) => self.next = true,
                 gilrs::EventType::ButtonPressed(Button::LeftTrigger, _) => self.prev = true,
                 _ => {}
@@ -101,6 +140,11 @@ impl InputState {
 
                 // Was the system neutral before this frame?
                 if was_neutral {
+                    self.last_source = InputSource::Pad;
+                    self.pad_vendor = gamepad.vendor_id();
+                    if self.pad_name != gamepad.name() {
+                        self.pad_name = gamepad.name().to_string();
+                    }
                     // Yes. This is a "just pushed" event. Fire it.
                     // Prioritize dominant axis
                     if raw_y.abs() > raw_x.abs() {

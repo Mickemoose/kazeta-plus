@@ -36,6 +36,40 @@ pub struct Theme {
     pub config: ThemeConfigFile, // Store the parsed config
 }
 
+/// Themes bundled with the OS image live here; they get copied into the
+/// user's theme dir on startup so a fresh install has them ready to go.
+const BUNDLED_THEMES_DIR: &str = "/usr/share/kazeta-plus/themes";
+
+/// One-way seed of bundled themes into the user's theme dir. Files that
+/// already exist are never touched, so user customizations always win.
+pub fn seed_bundled_themes() {
+    let Some(user_dir) = get_user_data_dir().map(|d| d.join("themes")) else {
+        return;
+    };
+    let bundled = std::path::Path::new(BUNDLED_THEMES_DIR);
+    if !bundled.is_dir() {
+        return;
+    }
+    if let Err(e) = copy_missing(bundled, &user_dir) {
+        println!("[WARN] Could not seed bundled themes: {}", e);
+    }
+}
+
+fn copy_missing(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    fs::create_dir_all(dst)?;
+    for entry in fs::read_dir(src)?.flatten() {
+        let from = entry.path();
+        let to = dst.join(entry.file_name());
+        if from.is_dir() {
+            copy_missing(&from, &to)?;
+        } else if !to.exists() {
+            fs::copy(&from, &to)?;
+            println!("[INFO] Seeded bundled theme file {}", to.display());
+        }
+    }
+    Ok(())
+}
+
 // LOAD CUSTOM THEMES
 pub async fn load_all_themes() -> HashMap<String, Theme> {
     let mut themes = HashMap::new();

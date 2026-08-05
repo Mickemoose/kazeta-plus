@@ -1,0 +1,20 @@
+# 8BitDo 64 (2.4G dongle, XInput mode) - the dongle scatters the N64 layout
+# across XInput oddly (A/B on stick clicks, C cluster on the face buttons),
+# so remap it into something sane. Kazeta-local config.
+version: 1
+kind: CompositeDevice
+name: 8BitDo 64 Controller
+maximum_sources: 1
+matches: []
+source_devices:
+  - group: gamepad
+    capability_map_id: bitdo64
+    evdev:
+      name: Generic X-Box pad
+      vendor_id: "2dc8"
+      product_id: "3004"
+      handler: event*
+target_devices:
+  - xb360
+  - mouse
+  - keyboard

@@ -1,0 +1,72 @@
+# Capability map for the 8BitDo 64 dongle: physical A/B arrive as stick
+# clicks and the C cluster arrives as the four face buttons. Rearrange so
+# A confirms, B backs, C-Up is the top face button (dashboard Eject), and
+# C-Down/C-Right drive the right stick (camera in games).
+version: 2
+kind: CapabilityMap
+name: 8BitDo 64 N64 layout
+id: bitdo64
+mapping:
+  - name: A
+    source_events:
+      - evdev:
+          event_type: KEY
+          event_code: BTN_THUMBR
+          value_type: button
+    target_event:
+      gamepad:
+        button: South
+
+  - name: B
+    source_events:
+      - evdev:
+          event_type: KEY
+          event_code: BTN_THUMBL
+          value_type: button
+    target_event:
+      gamepad:
+        button: East
+
+  - name: C-Up
+    source_events:
+      - evdev:
+          event_type: KEY
+          event_code: BTN_WEST
+          value_type: button
+    target_event:
+      gamepad:
+        button: North
+
+  - name: C-Left
+    source_events:
+      - evdev:
+          event_type: KEY
+          event_code: BTN_NORTH
+          value_type: button
+    target_event:
+      gamepad:
+        button: West
+
+  - name: C-Down
+    source_events:
+      - evdev:
+          event_type: KEY
+          event_code: BTN_SOUTH
+          value_type: button
+    target_event:
+      gamepad:
+        axis:
+          name: RightStick
+          direction: down
+
+  - name: C-Right
+    source_events:
+      - evdev:
+          event_type: KEY
+          event_code: BTN_EAST
+          value_type: button
+    target_event:
+      gamepad:
+        axis:
+          name: RightStick
+          direction: right

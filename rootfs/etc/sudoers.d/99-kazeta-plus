@@ -4,6 +4,9 @@
 # Allow running the log copy helper script without a password
 %wheel ALL=(ALL:ALL) NOPASSWD: /usr/bin/kazeta-copy-logs
 
+# Allow the cart eject helper (safe unmount / optical eject from the bios)
+%wheel ALL=(ALL:ALL) NOPASSWD: /usr/bin/kazeta-eject
+
 # Allow the error screen helper
 %wheel ALL=(ALL:ALL) NOPASSWD: /usr/bin/kazeta-show-error
 

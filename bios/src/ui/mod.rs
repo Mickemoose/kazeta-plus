@@ -280,10 +280,71 @@ pub fn render_ui_overlay(
     gcc_adapter_poll_rate: &Option<u32>,
     scale_factor: f32,
 ) {
+    render_ui_overlay_alpha(logo_cache, font_cache, config, battery_info, current_time_str, gcc_adapter_poll_rate, scale_factor, 1.0, false);
+}
+
+thread_local! {
+    // 64x64 Wi-Fi glyph baked into the binary, loaded lazily on the render
+    // thread since GPU textures can't live in a plain static.
+    static WIFI_ICON: Texture2D = {
+        let tex = Texture2D::from_file_with_format(include_bytes!("../../WIFI.png"), Some(ImageFormat::Png));
+        tex.set_filter(FilterMode::Linear);
+        tex
+    };
+    // Controller silhouette for the per-pad battery row.
+    static CONTROLLER_ICON: Texture2D = {
+        let tex = Texture2D::from_file_with_format(include_bytes!("../../CONTROLLER.png"), Some(ImageFormat::Png));
+        tex.set_filter(FilterMode::Linear);
+        tex
+    };
+}
+
+// Overlay text at partial alpha; the stock helpers pin their drop shadow at
+// 0.9 so a fade would leave a dark ghost behind the glyphs.
+fn overlay_text(font_cache: &HashMap<String, Font>, config: &Config, text: &str, x: f32, y: f32, font_size: u16, alpha: f32) {
+    let font = get_current_font(font_cache, config);
+    let shadow_offset = 1.0 * (font_size as f32 / FONT_SIZE as f32);
+    draw_text_ex(text, x + shadow_offset, y + shadow_offset, TextParams {
+        font: Some(font),
+        font_size,
+        color: Color { r: 0.0, g: 0.0, b: 0.0, a: 0.9 * alpha },
+        ..Default::default()
+    });
+    let mut color = string_to_color(&config.font_color);
+    color.a *= alpha;
+    draw_text_ex(text, x, y, TextParams {
+        font: Some(font),
+        font_size,
+        color,
+        ..Default::default()
+    });
+}
+
+/// Same overlay, with everything (logo, clock, battery, poll rate, version)
+/// scaled by `alpha` so a menu can fade the furniture in.
+pub fn render_ui_overlay_alpha(
+    logo_cache: &HashMap<String, Texture2D>,
+    font_cache: &HashMap<String, Font>,
+    config: &Config,
+    battery_info: &Option<BatteryInfo>,
+    current_time_str: &str,
+    gcc_adapter_poll_rate: &Option<u32>,
+    scale_factor: f32,
+    alpha: f32,
+    // Metro styling: logo parks bottom-center (top collides with the tab
+    // strip) and the version text drops to 50% opacity.
+    metro_style: bool,
+) {
     const BASE_LOGO_WIDTH: f32 = 200.0;
+
+    if alpha <= 0.0 {
+        return;
+    }
 
     let current_font = get_current_font(font_cache, config);
     let font_size = (FONT_SIZE as f32 * scale_factor) as u16;
+    // Status fine print (poll rate, version) reads at a smaller size.
+    let small_size = (FONT_SIZE as f32 * scale_factor * 0.72) as u16;
 
     // --- UPDATED: Dynamic Logo Drawing ---
     if config.logo_selection != "None" {
@@ -295,13 +356,17 @@ pub fn render_ui_overlay(
 
             // Center the logo horizontally
             let x_pos = (screen_width() - scaled_logo_width) / 2.0;
-            let y_pos = 30.0 * scale_factor; // Scale the vertical position as well
+            let y_pos = if metro_style {
+                screen_height() - scaled_logo_height - (8.0 * scale_factor)
+            } else {
+                30.0 * scale_factor // Scale the vertical position as well
+            };
 
             draw_texture_ex(
                 logo_to_draw,
                 x_pos,
                 y_pos,
-                WHITE,
+                Color::new(1.0, 1.0, 1.0, alpha),
                 DrawTextureParams {
                     dest_size: Some(vec2(scaled_logo_width, scaled_logo_height)),
                     source: Some(Rect::new(0.0, 0.0, logo_to_draw.width(), logo_to_draw.height())),
@@ -320,14 +385,73 @@ pub fn render_ui_overlay(
     } else {
         screen_width() - time_dims.width - (20.0 * scale_factor)
     };
-    text_with_config_color(
+    overlay_text(
         font_cache,
         config,
         current_time_str,
         time_x,
         20.0 * scale_factor,
         font_size,
+        alpha,
     );
+
+    // Date under the clock, small (Metro only — other styles stay stock).
+    if metro_style {
+        let date_str = crate::system::get_current_local_date_string(config);
+        let date_dims = measure_text(&date_str, Some(current_font), small_size, 1.0);
+        let date_x = if config.menu_position == MenuPosition::TopRight {
+            20.0 * scale_factor
+        } else {
+            screen_width() - date_dims.width - (20.0 * scale_factor)
+        };
+        overlay_text(
+            font_cache,
+            config,
+            &date_str,
+            date_x,
+            38.0 * scale_factor,
+            small_size,
+            alpha,
+        );
+    }
+    // Status fine print (version, poll rate) shrinks on Metro; stock size
+    // elsewhere. The date pushes Metro's battery/GCC lines down a slot.
+    let stat_size = if metro_style { small_size } else { font_size };
+    let batt_y = if metro_style { 58.0 } else { 40.0 };
+    let gcc_y = if metro_style { 76.0 } else { 60.0 };
+
+    // Wi-Fi: icon + SSID in the top corner opposite the clock (Metro only).
+    if metro_style {
+    if let Some(ssid) = crate::wifi_status::current_ssid() {
+        let base_y = 20.0 * scale_factor;
+        let icon_h = 14.0 * scale_factor;
+        let gap = 5.0 * scale_factor;
+        let ssid_dims = measure_text(&ssid, Some(current_font), small_size, 1.0);
+        let (icon_x, text_x) = if config.menu_position == MenuPosition::TopRight {
+            // Clock lives top-left in that layout, so mirror to the right.
+            let text_x = screen_width() - ssid_dims.width - (20.0 * scale_factor);
+            (text_x - gap - icon_h, text_x)
+        } else {
+            let left = 20.0 * scale_factor;
+            (left, left + icon_h + gap)
+        };
+        let mut tint = string_to_color(&config.font_color);
+        tint.a *= alpha;
+        WIFI_ICON.with(|tex| {
+            draw_texture_ex(
+                tex,
+                icon_x,
+                base_y - icon_h * 0.8, // icon midline on the text midline
+                tint,
+                DrawTextureParams {
+                    dest_size: Some(vec2(icon_h, icon_h)),
+                    ..Default::default()
+                },
+            );
+        });
+        overlay_text(font_cache, config, &ssid, text_x, base_y, small_size, alpha);
+    }
+    }
 
     // Battery
     if let Some(info) = battery_info {
@@ -348,20 +472,21 @@ pub fn render_ui_overlay(
         } else {
             screen_width() - batt_dims.width - (20.0 * scale_factor)
         };
-        text_with_config_color(
+        overlay_text(
             font_cache,
             config,
             &battery_text,
             batt_x,
-            40.0 * scale_factor,
+            batt_y * scale_factor,
             font_size,
+            alpha,
         );
     }
 
     // GCC Adapter Poll Rate
     if let Some(rate) = gcc_adapter_poll_rate {
         let gcc_text = format!("GCC: {}Hz", rate);
-        let gcc_dims = measure_text(&gcc_text, Some(current_font), font_size, 1.0);
+        let gcc_dims = measure_text(&gcc_text, Some(current_font), stat_size, 1.0);
 
         // Position it in the same corner as the battery/clock
         let gcc_x = if config.menu_position == MenuPosition::TopRight {
@@ -371,18 +496,19 @@ pub fn render_ui_overlay(
         };
 
         // Draw it below the battery line
-        text_with_config_color(
+        overlay_text(
             font_cache,
             config,
             &gcc_text,
             gcc_x,
-            60.0 * scale_factor, // Below the battery's 40.0
-            font_size,
+            gcc_y * scale_factor,
+            stat_size,
+            alpha,
         );
     }
 
     // --- Version Number Drawing ---
-    let version_dims = measure_text(VERSION_NUMBER, Some(current_font), font_size, 1.0);
+    let version_dims = measure_text(VERSION_NUMBER, Some(current_font), stat_size, 1.0);
 
     // Define tighter margins specifically for the version text
     // Reduced from 20.0 to 5.0 to push it into the corner
@@ -396,14 +522,61 @@ pub fn render_ui_overlay(
         screen_width() - version_dims.width - version_margin // Push it further to the right (closer to edge)
     };
 
-    text_with_config_color(
+    overlay_text(
         font_cache,
         config,
         VERSION_NUMBER,
         version_x,
         screen_height() - version_bottom_margin, // Push it lower
-        font_size,
+        stat_size,
+        alpha * if metro_style { 0.3 } else { 1.0 },
     );
+
+    // --- Controller batteries: icon + percent per pad, bottom corner
+    // opposite the version text (Metro only) ---
+    let pads = crate::pad_battery::current();
+    if metro_style && !pads.is_empty() {
+        let base_y = screen_height() - version_bottom_margin;
+        let icon_h = 13.0 * scale_factor;
+        let icon_gap = 3.0 * scale_factor;
+        let pad_gap = 12.0 * scale_factor;
+        let mut tint = string_to_color(&config.font_color);
+        tint.a *= alpha;
+
+        // Measure every entry so the row can right-align when mirrored.
+        let labels: Vec<String> = pads.iter().map(|p| format!("{}%", p)).collect();
+        let total: f32 = labels
+            .iter()
+            .map(|l| icon_h + icon_gap + measure_text(l, Some(current_font), small_size, 1.0).width)
+            .sum::<f32>()
+            + pad_gap * (labels.len().saturating_sub(1)) as f32;
+
+        // Version claims the bottom-left when the menu is bottom-right, so
+        // the battery row mirrors over to the right there.
+        let mut x = if config.menu_position == MenuPosition::BottomRight {
+            screen_width() - total - (20.0 * scale_factor)
+        } else {
+            20.0 * scale_factor
+        };
+
+        for label in &labels {
+            CONTROLLER_ICON.with(|tex| {
+                draw_texture_ex(
+                    tex,
+                    x,
+                    base_y - icon_h * 0.8,
+                    tint,
+                    DrawTextureParams {
+                        dest_size: Some(vec2(icon_h, icon_h)),
+                        ..Default::default()
+                    },
+                );
+            });
+            x += icon_h + icon_gap;
+            overlay_text(font_cache, config, label, x, base_y, small_size, alpha);
+            x += measure_text(label, Some(current_font), small_size, 1.0).width + pad_gap;
+        }
+    }
 }
 
 // GAME SELECTION

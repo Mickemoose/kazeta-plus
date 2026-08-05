@@ -1,0 +1,23 @@
+#! /bin/bash
+# Safely eject cart media: cleanly unmount every removable-media mount under
+# /run/media (carts mount there under their own volume label), popping the
+# tray for optical discs. Run via sudo from the bios (see sudoers.d).
+
+if [ $EUID -ne 0 ]; then
+	echo "$(basename $0) must be run as root"
+	exit 1
+fi
+
+sync
+
+for m in $(findmnt -rn -o TARGET | grep '^/run/media/'); do
+	dev=$(findmnt -n -o SOURCE "$m" 2>/dev/null)
+	umount "$m" 2>/dev/null || umount -l "$m"
+	case "$dev" in
+		/dev/sr*)
+			eject "$dev" 2>/dev/null
+			;;
+	esac
+done
+
+exit 0

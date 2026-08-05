@@ -45,6 +45,10 @@ mod audio;
 mod cd_player_backend;
 mod config;
 mod gcc_adapter;
+mod wifi_status;
+mod pad_leds;
+mod pad_battery;
+mod pad_brand;
 mod input;
 mod memory;
 mod save;
@@ -626,8 +630,10 @@ async fn main() {
         font_to_load
     };
 
-    // Load all themes ONCE at the start
+    // Load all themes ONCE at the start (seeding any bundled themes into the
+    // user dir first, so a fresh install has Metro360 ready to go)
     println!("[INFO] Pre-loading all themes...");
+    theme::seed_bundled_themes();
     let mut loaded_themes: HashMap<String, theme::Theme> = theme::load_all_themes().await;
     println!("[INFO] {} themes loaded successfully.", loaded_themes.len());
 
@@ -864,6 +870,19 @@ async fn main() {
     let (tx_gcc, rx_gcc) = std::sync::mpsc::channel();
     start_gcc_adapter_polling(tx_gcc);
 
+    // WIFI SSID (shown in the overlay corner opposite the clock)
+    wifi_status::start_wifi_ssid_polling();
+
+    // CONTROLLER PLAYER LEDS (DualSense lightbar colors by join order)
+    pad_leds::start_led_painter();
+
+    // CONTROLLER BATTERY LEVELS (icon + % row in the overlay)
+    pad_battery::start_polling();
+
+    // PHYSICAL PAD IDENTITY (for brand-correct button glyphs behind
+    // InputPlumber's virtual devices)
+    pad_brand::start_polling();
+
     // icon cache for multiple game detection screen
     let mut game_icon_cache: HashMap<String, Texture2D> = HashMap::new();
     let mut game_icon_queue: Vec<(String, PathBuf)> = Vec::new();
@@ -964,6 +983,9 @@ async fn main() {
             battery_info = get_battery_info();
             last_battery_check = get_time();
         }
+
+        // Pause the player-LED painter while a game owns the controllers.
+        pad_leds::set_suspended(game_process.is_some());
 
         // GCC
         // Check for messages from the GCC adapter thread
@@ -1313,6 +1335,9 @@ async fn main() {
                 }
                 if input_state.back {
                     current_screen = Screen::MainMenu;
+                    // Replay the Metro boot choreography on the way back in —
+                    // the user liked the tiles sliding home.
+                    metro_state.replay_intro();
                     sound_effects.play_back(&config);
                 }
                 if input_state.select {
@@ -1365,7 +1390,7 @@ async fn main() {
                 if config.menu_style == "METRO" {
                     ui::metro::draw_game_selection(
                         &available_games, &game_icon_cache, &placeholder, game_selection,
-                        metro_state.cart_label.as_deref(), &animation_state,
+                        metro_state.cart_label.as_deref(), metro_state.legend_icon(), &animation_state,
                         &background_cache, &mut video_cache, &font_cache, &config,
                         &mut background_state, scale_factor,
                     );
