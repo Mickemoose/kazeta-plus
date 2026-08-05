@@ -12,6 +12,10 @@ fn default_menu_style() -> String {
     "LIST".to_string()
 }
 
+fn default_background_particles() -> String {
+    "OFF".to_string()
+}
+
 /// Gets the full path to the kazeta.toml configuration file.
 fn get_config_path() -> Result<PathBuf, Box<dyn Error>> {
     let mut config_path = get_user_data_dir().ok_or("Could not find user's data directory.")?;
@@ -43,6 +47,10 @@ pub struct Config {
     pub cursor_transition_speed: String,
     pub background_scroll_speed: String,
     pub color_shift_speed: String,
+    // Ambient bokeh motes over the background ("ON"/"OFF"). serde default so
+    // config.toml files written before this field existed still parse.
+    #[serde(default = "default_background_particles")]
+    pub background_particles: String,
     pub bgm_track: Option<String>,
     pub sfx_pack: String,
     pub logo_selection: String,
@@ -73,6 +81,7 @@ impl Default for Config {
             cursor_transition_speed: "NORMAL".to_string(),
             background_scroll_speed: "NORMAL".to_string(),
             color_shift_speed: "NORMAL".to_string(),
+            background_particles: default_background_particles(),
             bgm_track: None,
             sfx_pack: "Default".to_string(),
             logo_selection: "Kazeta+ (Default)".to_string(),

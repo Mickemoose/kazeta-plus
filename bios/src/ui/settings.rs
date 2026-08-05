@@ -700,6 +700,7 @@ pub fn update(
                             config.cursor_transition_speed = defaults.cursor_transition_speed;
                             config.background_scroll_speed = defaults.background_scroll_speed;
                             config.color_shift_speed = defaults.color_shift_speed;
+                            config.background_particles = defaults.background_particles;
 
                             if let Some(default_theme) = loaded_themes.get("Default") {
                                 *sound_effects = default_theme.sounds.clone();
@@ -725,6 +726,9 @@ pub fn update(
                                 if let Some(val) = &theme.config.cursor_transition_speed { config.cursor_transition_speed = val.clone(); }
                                 if let Some(val) = &theme.config.background_scroll_speed { config.background_scroll_speed = val.clone(); }
                                 if let Some(val) = &theme.config.color_shift_speed { config.color_shift_speed = val.clone(); }
+                                // Particles reset to OFF when the theme doesn't ask for them,
+                                // same logic as menu_style: leaving the theme leaves its motes.
+                                config.background_particles = theme.config.background_particles.clone().unwrap_or_else(|| "OFF".to_string());
                             }
                         }
 

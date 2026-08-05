@@ -18,6 +18,7 @@ pub struct ThemeConfigFile {
     pub cursor_transition_speed: Option<String>,
     pub background_scroll_speed: Option<String>,
     pub color_shift_speed: Option<String>,
+    pub background_particles: Option<String>, // "ON"/"OFF" ambient bokeh motes
     pub sfx_pack: Option<String>,
     pub bgm_track: Option<String>,
     pub logo_selection: Option<String>,
@@ -55,6 +56,7 @@ pub async fn load_all_themes() -> HashMap<String, Theme> {
             cursor_transition_speed: None,
             background_scroll_speed: None,
             color_shift_speed: None,
+            background_particles: None,
             sfx_pack: None,
             bgm_track: None,
             logo_selection: None,

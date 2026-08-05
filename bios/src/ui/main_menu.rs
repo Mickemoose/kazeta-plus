@@ -1,5 +1,5 @@
 use crate::{
-    Screen, UIFocus, InputState, copy_session_logs_to_sd, trigger_session_restart, start_log_reader, render_background, render_ui_overlay, get_current_font, measure_text, text_with_config_color, text_disabled, DEV_MODE, FLASH_MESSAGE_DURATION, FONT_SIZE, MENU_PADDING, MENU_OPTION_HEIGHT, ShakeTarget, save, StorageMediaState, VideoPlayer,
+    Screen, UIFocus, InputState, copy_session_logs_to_sd, trigger_session_restart, trigger_game_launch, start_log_reader, render_background, render_ui_overlay, get_current_font, measure_text, text_with_config_color, text_disabled, DEV_MODE, FLASH_MESSAGE_DURATION, FONT_SIZE, MENU_PADDING, MENU_OPTION_HEIGHT, ShakeTarget, save, StorageMediaState, VideoPlayer,
     audio::SoundEffects,
     config::Config,
     types::{AnimationState, BackgroundState, BatteryInfo, MenuPosition},
@@ -182,7 +182,14 @@ pub fn activate_play(
                                         *current_screen = Screen::Debug;
                                     } else {
                                         // --- PRODUCTION MODE: Fade out and launch ---
-                                        (*current_screen, *fade_start_time) = trigger_session_restart(current_bgm, &music_cache);
+                                        // Ask for this game by path rather than
+                                        // relying on the session script to
+                                        // auto-boot the lone cart: single carts
+                                        // now land on the dashboard, so an
+                                        // unqualified restart would just bounce
+                                        // back here.
+                                        (*current_screen, *fade_start_time) =
+                                            trigger_game_launch(&cart_info, &kzi_path, current_bgm, &music_cache);
                                     }
                                 },
                                 _ => { // multiple games found

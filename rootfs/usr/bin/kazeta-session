@@ -2,14 +2,30 @@
 
 LAUNCH_CMD_FILE="/var/kazeta/state/.LAUNCH_CMD"
 
+# NOTE: the in-game guide daemon (kazeta-guided) is backburned — see
+# WORKFLOW.md. If it is ever restarted here, keep `wait "$BIOS_PID"` below:
+# a bare `wait` also waits on the daemon and hangs game launches.
+
 # If a game was selected from the BIOS, launch it in this self-contained block.
 if [ -f "$LAUNCH_CMD_FILE" ]; then
     LAUNCH_CMD=$(cat "$LAUNCH_CMD_FILE")
 
     rm -f "$LAUNCH_CMD_FILE"
 
-    # Run the game session script.
-    eval "$LAUNCH_CMD"
+    # The dashboard's gamescope just exited to get here. Its DRM/seat teardown
+    # is asynchronous and messy on this hardware (libseat "Could not close
+    # device" in session.log) - starting the game's gamescope into that
+    # half-released display wedges it on a black screen. Wait for the old
+    # compositor to be fully gone, then give the kernel a moment.
+    for i in $(seq 1 25); do
+        pgrep -x gamescope >/dev/null || break
+        sleep 0.2
+    done
+    sleep 1
+
+    # Run the game session script (logged - gamescope/game errors were
+    # previously invisible because this ran outside any redirect).
+    eval "$LAUNCH_CMD" >> /var/kazeta/launch.log 2>&1
 
     # IMPORTANT: After the game quits, restart the entire session.
     # This will cause the script to run again from the top, where it will
@@ -37,6 +53,7 @@ fi
 
 # Launch the BIOS application in the background.
 /usr/bin/kazeta > /var/kazeta/session.log 2>&1 &
+BIOS_PID=$!
 
 # Set default HDMI audio only if the user hasn't set a preference.
 if [ ! -e /var/kazeta/state/.AUDIO_PREFERENCE_SET ]; then
@@ -53,8 +70,9 @@ if [ ! -e /var/kazeta/state/.AUDIO_PREFERENCE_SET ]; then
 	done
 fi
 
-# Wait for the BIOS process to exit.
-wait
+# Wait for the BIOS process to exit. Must target the BIOS pid specifically —
+# a bare `wait` would also block on the guide daemon, which never exits.
+wait "$BIOS_PID"
 
 # After the BIOS quits, check if it wants to restart or shut down.
 RESTART_SESSION_SENTINEL="/var/kazeta/state/.RESTART_SESSION_SENTINEL"

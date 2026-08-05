@@ -16,13 +16,19 @@ fi
 # check for autoboot disabled
 BIOS_CONFIG_FILE="$HOME/.local/share/kazeta-plus/config.toml"
 
-if [ -f "$BIOS_CONFIG_FILE" ]; then
-	# Check if autoboot is set to false.
-	# We use a regex to ignore whitespace around the = sign.
-	if grep -q "^\s*autoboot\s*=\s*false\s*$" "$BIOS_CONFIG_FILE"; then
-		echo "DEBUG: Autoboot disabled in $BIOS_CONFIG_FILE. Booting to BIOS."
-		gamescope --filter pixel -- kazeta-bios
-		exit 0
+# Only consult autoboot when no specific game was requested. The BIOS launches
+# games by re-running this script with the .kzi as $1; without this guard,
+# autoboot=false swallowed that request and bounced straight back to the
+# dashboard, making games unlaunchable.
+if [ -z "$1" ] || [ ! -f "$1" ]; then
+	if [ -f "$BIOS_CONFIG_FILE" ]; then
+		# Check if autoboot is set to false.
+		# We use a regex to ignore whitespace around the = sign.
+		if grep -q "^\s*autoboot\s*=\s*false\s*$" "$BIOS_CONFIG_FILE"; then
+			echo "DEBUG: Autoboot disabled in $BIOS_CONFIG_FILE. Booting to BIOS."
+			gamescope --filter pixel -- kazeta-bios
+			exit 0
+		fi
 	fi
 fi
 
@@ -91,7 +97,16 @@ else
 		exit 0
 	fi
 
-	# Exactly one game (or none): keep the original direct-boot behavior.
+	# SINGLE GAME: no auto-boot either - land on the dashboard, where the
+	# Play hero carries the cart's branding and launches it on demand.
+	# (Direct boot still happens when the BIOS passes a specific .kzi as $1.)
+	if [ "$game_count" -eq 1 ]; then
+		echo "DEBUG: Single game cart. Launching BIOS dashboard."
+		gamescope --filter pixel -- kazeta-bios
+		exit 0
+	fi
+
+	# No games found: fall through with empty cart paths (BIOS launch below).
 	cart_info=$(find ${BASE_EXT} -maxdepth 2 -name "*.kzi" 2>/dev/null | head -1)
 	cart_pkg=$(find ${BASE_EXT} -maxdepth 2 -name "*.kzp" 2>/dev/null | head -1)
 fi
@@ -209,11 +224,20 @@ runtimedir="${BASE_DIR}/run/runtime"
 sudo kazeta-mount "${lower}" "${upper}" "${work}" "${target}" "${runtime}" "${runtimedir}"
 
 # --- TRAP SETUP (Clean up on exit) ---
+# Only unmount cart_path when it is a .kzp loop mount. For a plain .kzi cart
+# it IS the SD card's mount point, and unmounting it leaves the card invisible
+# until physically reinserted.
+if [[ -n "${cart_pkg}" ]] && [[ -f "${cart_pkg}" ]]; then
+	KZP_UNMOUNT="sudo kazeta-mount kzp --unmount \"${cart_path}\";"
+else
+	KZP_UNMOUNT=""
+fi
+
 trap "\
 	if [ -n \"\$PLAYTIME_PID\" ]; then kill \"\$PLAYTIME_PID\" 2>/dev/null; fi; \
 	popd; \
 	sudo kazeta-mount --unmount "${target}" "${runtimedir}"; \
-	sudo kazeta-mount kzp --unmount "${cart_path}"; \
+	${KZP_UNMOUNT} \
 	sudo rm -rf "${work}"; \
 	sudo rm -rf "${upper}/.kazeta/share"; \
 	rmdir --ignore-fail-on-non-empty "${upper}/.kazeta"; \
