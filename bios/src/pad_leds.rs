@@ -32,6 +32,9 @@ pub const PLAYER_COLORS: [(u8, u8, u8); 4] = [
 ];
 
 /// A controller joined or left; consumed by the dashboard for toasts.
+/// name/vendor identify the pad's brand for consumers that want it (the
+/// current toast design shows only slot + color, so they may sit unread).
+#[allow(dead_code)]
 pub struct PadEvent {
     pub slot: usize,        // 0-based player slot at event time
     pub name: String,       // kernel device name

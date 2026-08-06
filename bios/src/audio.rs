@@ -54,6 +54,10 @@ pub struct SoundEffects {
     pub select: SamplesBuffer,
     pub reject: SamplesBuffer,
     pub back: SamplesBuffer,
+    // Optional pack extras with no baked-in default: game-launch flourish
+    // (launch.wav) and toast pop (toast.wav). Silent when a pack lacks them.
+    pub launch: Option<SamplesBuffer>,
+    pub toast: Option<SamplesBuffer>,
 }
 
 impl SoundEffects {
@@ -69,6 +73,8 @@ impl SoundEffects {
                 select: default_select,
                 reject: default_reject,
                 back: default_back,
+                launch: None,
+                toast: None,
             };
         }
 
@@ -93,12 +99,27 @@ impl SoundEffects {
             fallback.clone()
         }
 
+        fn load_optional_sfx(
+            name: &str,
+            user_path_base: &Option<PathBuf>,
+            system_path_base: &str,
+        ) -> Option<SamplesBuffer> {
+            if let Some(base) = user_path_base {
+                if let Ok(sound) = load_from_file(&base.join(name)) {
+                    return Some(sound);
+                }
+            }
+            load_from_file(&Path::new(system_path_base).join(name)).ok()
+        }
+
         let cursor_move = load_one_sfx("move.wav", &user_pack_path, &system_pack_path, &default_move);
         let select = load_one_sfx("select.wav", &user_pack_path, &system_pack_path, &default_select);
         let reject = load_one_sfx("reject.wav", &user_pack_path, &system_pack_path, &default_reject);
         let back = load_one_sfx("back.wav", &user_pack_path, &system_pack_path, &default_back);
+        let launch = load_optional_sfx("launch.wav", &user_pack_path, &system_pack_path);
+        let toast = load_optional_sfx("toast.wav", &user_pack_path, &system_pack_path);
 
-        SoundEffects { cursor_move, select, reject, back }
+        SoundEffects { cursor_move, select, reject, back, launch, toast }
     }
 
     // [!] FIX: We manually create the Sink using .mixer() instead of .play_once()
@@ -130,6 +151,26 @@ impl SoundEffects {
         let sink = Sink::connect_new(&AUDIO.stream.mixer());
         sink.append(source);
         sink.detach();
+    }
+
+    /// Game-launch flourish (launch.wav) — silent if the pack has none.
+    pub fn play_launch(&self, config: &Config) {
+        if let Some(sound) = &self.launch {
+            let source = sound.clone().amplify(config.sfx_volume);
+            let sink = Sink::connect_new(&AUDIO.stream.mixer());
+            sink.append(source);
+            sink.detach();
+        }
+    }
+
+    /// Toast pop (toast.wav) — silent if the pack has none.
+    pub fn play_toast(&self, config: &Config) {
+        if let Some(sound) = &self.toast {
+            let source = sound.clone().amplify(config.sfx_volume);
+            let sink = Sink::connect_new(&AUDIO.stream.mixer());
+            sink.append(source);
+            sink.detach();
+        }
     }
 }
 

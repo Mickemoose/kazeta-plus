@@ -52,9 +52,15 @@ pub const GUI_CUSTOMIZATION_SETTINGS: &[&str] = &[
     "TRANSITION ANIMATION",
     "BACKGROUND SCROLLING",
     "COLOR GRADIENT SHIFTING",
+    "MENU STYLE",
     "AUDIO SETTINGS",
     "CUSTOM ASSETS SETTINGS",
 ];
+
+/// Dashboard styles. Applying a theme overwrites `menu_style` (falling back to
+/// LIST when the theme doesn't name one), so this row is the way back — without
+/// it, leaving Metro means hand-editing config.toml.
+pub const MENU_STYLES: &[&str] = &["LIST", "BLADES", "METRO"];
 
 pub const CUSTOM_ASSET_SETTINGS: &[&str] = &[
     "BACKGROUND MUSIC",
@@ -111,7 +117,7 @@ pub const TIMEZONES: [&str; 25] = [
 ];
 
 // Helper to check if a resolution string belongs to an aspect ratio
-fn matches_aspect_ratio(res: &str, ratio: &str) -> bool {
+pub(crate) fn matches_aspect_ratio(res: &str, ratio: &str) -> bool {
     match ratio {
         "4:3" => matches!(res, "320x240" | "640x480" | "800x600" | "1024x768" | "1280x960" | "1440x1080"),
         "16:9" => matches!(res, "640x360" | "1280x720" | "1920x1080" | "2560x1440" | "3840x2160"),
@@ -138,7 +144,21 @@ pub fn render_settings_page(
     scale_factor: f32,
     system_volume: f32,
     brightness: f32,
+    choices: &crate::ui::metro::SettingsChoices,
 ) {
+    // METRO owns the whole frame and draws its own settings screen. LIST and
+    // BLADES fall through to the original body below, unchanged. This is the
+    // only function all three settings call sites use (the page itself and
+    // both reset dialogs' backdrops), so one gate covers them all.
+    if config.menu_style == "METRO" {
+        crate::ui::metro::draw_settings(
+            page_number, options, logo_cache, background_cache, video_cache, font_cache,
+            config, selection, background_state, battery_info, current_time_str,
+            gcc_adapter_poll_rate, scale_factor, system_volume, brightness, choices,
+        );
+        return;
+    }
+
     // --- Create scaled layout values ---
     let font_size = (FONT_SIZE as f32 * scale_factor) as u16;
     let menu_padding = MENU_PADDING * scale_factor;
@@ -269,8 +289,9 @@ pub fn get_settings_value(page: usize, index: usize, config: &Config, system_vol
             6 => config.cursor_transition_speed.clone(), // CURSOR TRANSITION SPEED
             7 => config.background_scroll_speed.clone(), // BACKGROUND SCROLL SPEED
             8 => config.color_shift_speed.clone(), // COLOR SHIFTING GRADIENT SPEED
-            9 => "<-".to_string(),
-            10 => "->".to_string(),
+            9 => config.menu_style.clone(), // MENU STYLE
+            10 => "<-".to_string(),
+            11 => "->".to_string(),
             _ => "".to_string(),
         },
         // CUSTOM ASSETS
@@ -335,13 +356,69 @@ pub fn update(
     };
 
     // INPUT HANDLING
-    if input_state.up {
-        *settings_menu_selection = if *settings_menu_selection == 0 { options.len() - 1 } else { *settings_menu_selection - 1 };
-        sound_effects.play_cursor_move(&config);
-    }
-    if input_state.down {
-        *settings_menu_selection = (*settings_menu_selection + 1) % options.len();
-        sound_effects.play_cursor_move(&config);
+    if config.menu_style == "METRO" {
+        // Metro draws the page-jump rows as chips sitting side by side beneath
+        // the value list, so the cursor has to move the way the screen looks:
+        // up/down treats that whole chip line as one row, and left/right walks
+        // between the chips. Every other style keeps the flat 1-D walk below.
+        let mut rows: Vec<usize> = Vec::new();
+        let mut jumps: Vec<usize> = Vec::new();
+        for i in 0..options.len() {
+            let v = get_settings_value(page_number, i, config, *system_volume, *brightness);
+            if v == "->" || v == "<-" {
+                jumps.push(i);
+            } else {
+                rows.push(i);
+            }
+        }
+        let sel = *settings_menu_selection;
+        let on_chip = jumps.contains(&sel);
+
+        if input_state.up || input_state.down {
+            let next = if on_chip {
+                // Leaving the chip line: down wraps to the top of the list,
+                // up returns to the last value row.
+                if input_state.down { rows.first().copied() } else { rows.last().copied() }
+            } else {
+                let p = rows.iter().position(|i| *i == sel).unwrap_or(0);
+                if input_state.down {
+                    if p + 1 < rows.len() {
+                        rows.get(p + 1).copied()
+                    } else {
+                        jumps.first().copied().or_else(|| rows.first().copied())
+                    }
+                } else if p > 0 {
+                    rows.get(p - 1).copied()
+                } else {
+                    jumps.first().copied().or_else(|| rows.last().copied())
+                }
+            };
+            if let Some(n) = next {
+                *settings_menu_selection = n;
+                sound_effects.play_cursor_move(&config);
+            }
+        }
+        // Horizontal motion only means "move" on the chip line; on a value
+        // row it keeps its usual job of changing the value.
+        if (input_state.left || input_state.right) && on_chip && jumps.len() > 1 {
+            let q = jumps.iter().position(|i| *i == sel).unwrap_or(0);
+            let nq = if input_state.right {
+                (q + 1) % jumps.len()
+            } else {
+                (q + jumps.len() - 1) % jumps.len()
+            };
+            *settings_menu_selection = jumps[nq];
+            sound_effects.play_cursor_move(&config);
+        }
+    } else {
+        if input_state.up {
+            *settings_menu_selection = if *settings_menu_selection == 0 { options.len() - 1 } else { *settings_menu_selection - 1 };
+            sound_effects.play_cursor_move(&config);
+        }
+        if input_state.down {
+            *settings_menu_selection = (*settings_menu_selection + 1) % options.len();
+            sound_effects.play_cursor_move(&config);
+        }
     }
     if input_state.back {
         *current_screen = Screen::MainMenu;
@@ -856,14 +933,27 @@ pub fn update(
                     sound_effects.play_cursor_move(&config);
                 }
             },
-            9 => { // GO TO AUDIO SETTINGS
+            9 => { // MENU STYLE
+                if input_state.left || input_state.right {
+                    let current_index = MENU_STYLES.iter().position(|&m| m == config.menu_style).unwrap_or(0);
+                    let new_index = if input_state.right {
+                        (current_index + 1) % MENU_STYLES.len()
+                    } else {
+                        (current_index + MENU_STYLES.len() - 1) % MENU_STYLES.len()
+                    };
+                    config.menu_style = MENU_STYLES[new_index].to_string();
+                    config.save();
+                    sound_effects.play_cursor_move(&config);
+                }
+            },
+            10 => { // GO TO AUDIO SETTINGS
                 if input_state.select {
                     *current_screen = Screen::AudioSettings;
                     *settings_menu_selection = 0;
                     sound_effects.play_select(&config);
                 }
             },
-            10 => { // GO TO CUSTOM ASSETS
+            11 => { // GO TO CUSTOM ASSETS
                 if input_state.select {
                     *current_screen = Screen::AssetSettings;
                     *settings_menu_selection = 0;

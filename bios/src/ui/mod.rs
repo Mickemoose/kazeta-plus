@@ -280,7 +280,7 @@ pub fn render_ui_overlay(
     gcc_adapter_poll_rate: &Option<u32>,
     scale_factor: f32,
 ) {
-    render_ui_overlay_alpha(logo_cache, font_cache, config, battery_info, current_time_str, gcc_adapter_poll_rate, scale_factor, 1.0, false);
+    render_ui_overlay_alpha(logo_cache, font_cache, config, battery_info, current_time_str, gcc_adapter_poll_rate, scale_factor, 1.0, false, false);
 }
 
 thread_local! {
@@ -334,6 +334,10 @@ pub fn render_ui_overlay_alpha(
     // Metro styling: logo parks bottom-center (top collides with the tab
     // strip) and the version text drops to 50% opacity.
     metro_style: bool,
+    // Screens that own their whole layout (the Metro settings screen) hide
+    // the logo entirely — it is drawn 200 units wide at whatever aspect the
+    // user's image has, so a square logo would cover half the screen.
+    suppress_logo: bool,
 ) {
     const BASE_LOGO_WIDTH: f32 = 200.0;
 
@@ -347,7 +351,7 @@ pub fn render_ui_overlay_alpha(
     let small_size = (FONT_SIZE as f32 * scale_factor * 0.72) as u16;
 
     // --- UPDATED: Dynamic Logo Drawing ---
-    if config.logo_selection != "None" {
+    if config.logo_selection != "None" && !suppress_logo {
         if let Some(logo_to_draw) = logo_cache.get(&config.logo_selection) {
             // Calculate the scaled width and height while preserving aspect ratio
             let aspect_ratio = logo_to_draw.height() / logo_to_draw.width();
@@ -727,6 +731,13 @@ pub fn render_dialog_box(
     scale_factor: f32,
     animation_state: &AnimationState,
 ) {
+    // METRO draws its own dialog in the dashboard's language; LIST and
+    // BLADES fall through to the original box below, unchanged.
+    if config.menu_style == "METRO" {
+        crate::ui::metro::draw_dialog(message, options, selection, font_cache, config, scale_factor);
+        return;
+    }
+
     let current_font = get_current_font(font_cache, config);
     let font_size = (FONT_SIZE as f32 * scale_factor) as u16;
 
@@ -827,7 +838,19 @@ pub fn render_dialog(
     playtime_cache: &mut PlaytimeCache,
     size_cache: &mut SizeCache,
     scale_factor: f32,
+    storage_state: &Arc<Mutex<crate::StorageMediaState>>,
 ) {
+    // METRO draws the save dialogs as its own sheet; LIST and BLADES fall
+    // through to the original body below, unchanged.
+    if config.menu_style == "METRO" {
+        crate::ui::metro::draw_save_dialog(
+            dialog, memories, selected_memory, icon_cache, font_cache, config, copy_op_state,
+            placeholder, scroll_offset, storage_state, animation_state, playtime_cache,
+            size_cache, scale_factor,
+        );
+        return;
+    }
+
     // --- Scaled variables ---
     let font_size = (FONT_SIZE as f32 * scale_factor) as u16;
     let tile_size = TILE_SIZE * scale_factor;

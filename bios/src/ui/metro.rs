@@ -8,9 +8,11 @@ use crate::{
     Screen, InputState, render_background, render_ui_overlay_alpha, get_current_font, measure_text,
     text_with_config_color, string_to_color, FONT_SIZE,
     StorageMediaState, VideoPlayer, save,
+    Memory, PlaytimeCache, SizeCache, CopyOperationState, Dialog,
     audio::SoundEffects,
     config::Config,
-    types::{AnimationState, BackgroundState, BatteryInfo},
+    memory::{get_game_playtime, get_game_size},
+    types::{AnimationState, BackgroundState, BatteryInfo, DialogState, ShakeTarget, UIFocus},
     ui::text_with_color,
     ui::blades::BladeAction,
     ui::main_menu::{activate_copy_logs, activate_play, activate_save_data},
@@ -21,6 +23,7 @@ use macroquad::prelude::*;
 use rodio::{buffer::SamplesBuffer, Decoder, Sink, Source};
 use std::io::Cursor;
 use std::{
+    cell::RefCell,
     collections::HashMap,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -133,9 +136,14 @@ pub struct MetroState {
     // update() only ticks while Metro is the active screen, so the clock
     // naturally starts when the splash hands over.
     intro_t: f32,
-    // Play outro (0..1 when Some): the reverse choreography that plays after
-    // the Play tile is chosen; the launch fires when it completes.
+    // Outro (0..1 when Some): the reverse choreography that plays after a
+    // tile with a departure animation is chosen; the action fires when it
+    // completes.
     outro_t: Option<f32>,
+    outro_action: OutroAction,
+    // Boot screen: true from game spawn until its process exits — the dash
+    // shows a spinner instead of sliding back in behind the game.
+    booting: bool,
     // Which confirm-button glyph the legend shows, tracking the last-used
     // input device (keyboard vs pad, and pad brand).
     legend_icon: LegendIcon,
@@ -144,6 +152,9 @@ pub struct MetroState {
     // Save icons for the Save Data tile's marquee rows, loaded once at
     // startup from the internal save cache.
     save_icons: Vec<Texture2D>,
+    // CONSOLE_ICONS indices for the inserted cart's runtime(s), shown in a
+    // row under the Play hero. Refreshed with the cart branding.
+    cart_console_icons: Vec<usize>,
     // Ambient bokeh motes (config.background_particles == "ON"): parameters
     // are rolled once at startup, positions are pure functions of time.
     bokeh: Vec<Bokeh>,
@@ -191,11 +202,25 @@ const INTRO_TIME: f32 = 1.0; // boot choreography after the splash video
 const OUTRO_TIME: f32 = 0.7; // reverse choreography when Play is chosen
 const TOAST_TIME: f32 = 2.8; // player connect/disconnect pill lifetime
 
-/// One "Player N Connected" pill queued for the bottom of the screen.
+/// What fires when the outro choreography lands.
+#[derive(Clone, Copy, PartialEq)]
+enum OutroAction {
+    Play,
+    SaveData,
+}
+
+/// One notification pill queued for the bottom of the screen.
 struct Toast {
     text: String,
-    color: Color, // the player slot's LED color
+    dot: Option<Color>, // player slot LED color; None hides the dot
+    icon: ToastIcon,
     t: f32,
+}
+
+#[derive(Clone, Copy)]
+enum ToastIcon {
+    Pad,  // controller silhouette
+    Cart, // SD card badge
 }
 
 /// Confirm-button glyph shown in the legend, by last-used device.
@@ -254,6 +279,184 @@ thread_local! {
     // (draw_circle's small polygons look pixelated at dot sizes).
     static TOAST_PAD_ICON: Texture2D = legend_tex(include_bytes!("../../CONTROLLER.png"));
     static TOAST_DOT: Texture2D = make_dot_texture();
+    // Tile face icons.
+    static TILE_WIFI: Texture2D = legend_tex(include_bytes!("../../WIFI.png"));
+    static TILE_BLUETOOTH: Texture2D = legend_tex(include_bytes!("../../BLUETOOTH.png"));
+    static TILE_SETTINGS: Texture2D = legend_tex(include_bytes!("../../SETTINGS.png"));
+    static TILE_ABOUT: Texture2D = legend_tex(include_bytes!("../../ABOUT.png"));
+    static TILE_THEMES: Texture2D = legend_tex(include_bytes!("../../THEMES.png"));
+    static TILE_UPDATES: Texture2D = legend_tex(include_bytes!("../../UPDATES.png"));
+    static TILE_LOGS: Texture2D = legend_tex(include_bytes!("../../LOGS.png"));
+    // Iridescent soap bubble the cart's console icons float inside.
+    static BUBBLE: Texture2D = legend_tex(include_bytes!("../../BUBBLE.png"));
+    // The settings screen draws outside MetroState, whose fade_tex/badge_disc
+    // are private fields — it keeps its own copies.
+    static FADE_TEX: Texture2D = make_fade_texture();
+    static TILE_DISC: Texture2D = legend_tex(include_bytes!("../../DISC.png"));
+    // Console-family icons shown under the Play hero, indexed by the CI_*
+    // constants below.
+    static CONSOLE_ICONS: [Texture2D; 27] = [
+        legend_tex(include_bytes!("../../consoles/Arcade.png")),
+        legend_tex(include_bytes!("../../consoles/Atari 2600.png")),
+        legend_tex(include_bytes!("../../consoles/Dreamcast.png")),
+        legend_tex(include_bytes!("../../consoles/DS.png")),
+        legend_tex(include_bytes!("../../consoles/Gameboy Color.png")),
+        legend_tex(include_bytes!("../../consoles/Gameboy.png")),
+        legend_tex(include_bytes!("../../consoles/Gamecube.png")),
+        legend_tex(include_bytes!("../../consoles/GameGear.png")),
+        legend_tex(include_bytes!("../../consoles/GBA.png")),
+        legend_tex(include_bytes!("../../consoles/Genesis.png")),
+        legend_tex(include_bytes!("../../consoles/GOG.png")),
+        legend_tex(include_bytes!("../../consoles/Master System.png")),
+        legend_tex(include_bytes!("../../consoles/N64.png")),
+        legend_tex(include_bytes!("../../consoles/NES.png")),
+        legend_tex(include_bytes!("../../consoles/PS1.png")),
+        legend_tex(include_bytes!("../../consoles/PS2.png")),
+        legend_tex(include_bytes!("../../consoles/PS3.png")),
+        legend_tex(include_bytes!("../../consoles/PSP.png")),
+        legend_tex(include_bytes!("../../consoles/Saturn.png")),
+        legend_tex(include_bytes!("../../consoles/SNES.png")),
+        legend_tex(include_bytes!("../../consoles/Steam.png")),
+        legend_tex(include_bytes!("../../consoles/Switch.png")),
+        legend_tex(include_bytes!("../../consoles/Wii.png")),
+        legend_tex(include_bytes!("../../consoles/WiiU.png")),
+        legend_tex(include_bytes!("../../consoles/Xbox 360.png")),
+        legend_tex(include_bytes!("../../consoles/Xbox.png")),
+        legend_tex(include_bytes!("../../consoles/PS4.png")),
+    ];
+}
+
+const CI_ARCADE: usize = 0;
+const CI_ATARI: usize = 1;
+const CI_DREAMCAST: usize = 2;
+const CI_DS: usize = 3;
+const CI_GBC: usize = 4;
+const CI_GAMEBOY: usize = 5;
+const CI_GAMECUBE: usize = 6;
+const CI_GAMEGEAR: usize = 7;
+const CI_GBA: usize = 8;
+const CI_GENESIS: usize = 9;
+const CI_GOG: usize = 10;
+const CI_MASTER_SYSTEM: usize = 11;
+const CI_N64: usize = 12;
+const CI_NES: usize = 13;
+const CI_PS1: usize = 14;
+const CI_PS2: usize = 15;
+const CI_PS3: usize = 16;
+const CI_PSP: usize = 17;
+const CI_SATURN: usize = 18;
+const CI_SNES: usize = 19;
+const CI_STEAM: usize = 20;
+const CI_SWITCH: usize = 21;
+const CI_WII: usize = 22;
+const CI_WIIU: usize = 23;
+const CI_XBOX360: usize = 24;
+const CI_XBOX: usize = 25;
+const CI_PS4: usize = 26;
+
+/// Cheap deterministic 0..1 hash, for per-appearance jitter that stays
+/// stable without storing any state.
+fn hash01(seed: u32) -> f32 {
+    let x = seed.wrapping_mul(2_654_435_761);
+    ((x >> 8) & 0xFFFF) as f32 / 65535.0
+}
+
+/// Console icon(s) for a kzi Runtime value. No runtime = plain PC (GOG),
+/// Windows-flavored runtimes = Steam, Dolphin covers two consoles.
+fn console_icons_for_runtime(rt: &str) -> Vec<usize> {
+    let r = rt.to_lowercase();
+    if r.is_empty() || r == "none" {
+        return vec![CI_GOG];
+    }
+    if r.contains("dolphin") {
+        return vec![CI_GAMECUBE, CI_WII];
+    }
+    if r.contains("windows") || r.contains("proton") || r.contains("wine") || r.contains("umu") {
+        return vec![CI_STEAM];
+    }
+    // Arcade first: these names are distinctive, and checking them before the
+    // console rules keeps a future spelling from tripping a substring like
+    // "nes" or "gb" further down.
+    if r.contains("mame")
+        || r.contains("fbneo")
+        || r.contains("fbalpha")
+        || r.contains("finalburn")
+        || r.contains("final burn")
+        || r.contains("neogeo")
+        || r.contains("neo geo")
+        || r.contains("cps")
+        || r.contains("arcade")
+    {
+        return vec![CI_ARCADE];
+    }
+    // Specific PlayStations before the generic "playstation" catch-all.
+    if r.contains("pcsx2") || r.contains("playstation 2") || r.contains("playstation2") || r.contains("ps2") {
+        return vec![CI_PS2];
+    }
+    if r.contains("rpcs3") || r.contains("playstation 3") || r.contains("ps3") { return vec![CI_PS3]; }
+    if r.contains("shadps4") || r.contains("playstation 4") || r.contains("ps4") { return vec![CI_PS4]; }
+    if r.contains("duckstation") || r.contains("psx") || r.contains("beetle") || r.contains("playstation") || r.contains("ps1") {
+        return vec![CI_PS1];
+    }
+    if r.contains("ppsspp") || r.contains("psp") { return vec![CI_PSP]; }
+    if r.contains("mupen") || r.contains("n64") || r.contains("nintendo64") || r.contains("nintendo 64") || r.contains("parallel") { return vec![CI_N64]; }
+    // "snes" before "nes": every snes name contains nes.
+    if r.contains("snes") || r.contains("bsnes") { return vec![CI_SNES]; }
+    if r.contains("nes") || r.contains("fceumm") || r.contains("mesen") { return vec![CI_NES]; }
+    if r.contains("gba") || r.contains("mgba") { return vec![CI_GBA]; }
+    if r.contains("gbc") { return vec![CI_GBC]; }
+    if r.contains("gambatte") || r.contains("gameboy") || r == "gb" { return vec![CI_GAMEBOY]; }
+    if r.contains("genesis") || r.contains("mega") || r.contains("blastem") { return vec![CI_GENESIS]; }
+    if r.contains("saturn") { return vec![CI_SATURN]; }
+    if r.contains("dreamcast") || r.contains("flycast") || r.contains("redream") { return vec![CI_DREAMCAST]; }
+    if r.contains("melonds") || r.contains("desmume") || r.contains("nds") { return vec![CI_DS]; }
+    if r.contains("yuzu") || r.contains("ryujinx") || r.contains("eden") || r.contains("switch") { return vec![CI_SWITCH]; }
+    if r.contains("xenia") || r.contains("360") { return vec![CI_XBOX360]; }
+    if r.contains("xemu") || r.contains("xbox") { return vec![CI_XBOX]; }
+    if r.contains("cemu") || r.contains("wiiu") { return vec![CI_WIIU]; }
+    if r.contains("atari") || r.contains("stella") { return vec![CI_ATARI]; }
+    if r.contains("gamegear") { return vec![CI_GAMEGEAR]; }
+    if r.contains("master") || r.contains("sms") { return vec![CI_MASTER_SYSTEM]; }
+    // Unknown runtime: call it PC.
+    vec![CI_GOG]
+}
+
+/// Every Runtime= across the mounted cart's .kzi files, mapped to console
+/// icons and deduped in first-seen order.
+fn scan_cart_console_icons() -> Vec<usize> {
+    fn find_kzis(dir: &std::path::Path, depth: u32, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_dir() && depth > 0 {
+                find_kzis(&p, depth - 1, out);
+            } else if p.extension().and_then(|e| e.to_str()) == Some("kzi") {
+                out.push(p);
+            }
+        }
+    }
+    let mut kzis = Vec::new();
+    find_kzis(std::path::Path::new("/run/media"), 2, &mut kzis);
+    find_kzis(std::path::Path::new("/media"), 2, &mut kzis);
+
+    let mut icons: Vec<usize> = Vec::new();
+    for kzi in kzis {
+        let runtime = std::fs::read_to_string(&kzi)
+            .ok()
+            .and_then(|c| {
+                c.lines()
+                    .find(|l| l.starts_with("Runtime="))
+                    .map(|l| l.trim_start_matches("Runtime=").trim().to_string())
+            })
+            .unwrap_or_default();
+        for icon in console_icons_for_runtime(&runtime) {
+            if !icons.contains(&icon) {
+                icons.push(icon);
+            }
+        }
+    }
+    icons.truncate(6);
+    icons
 }
 
 /// Anti-aliased white disc, tinted at draw time with the player color.
@@ -435,10 +638,12 @@ impl MetroState {
             cover_tex: None, icon_tex: None, cart_label: None, cart_optical: false,
             badge_sd, badge_disc, cover_key: String::new(),
             cart_vis: 0.0, outgoing: None,
-            save_icons,
+            save_icons, cart_console_icons: Vec::new(),
             sel_anim: 1.0, prev_sel: None, press_flash: 0.0,
             intro_t: 0.0,
             outro_t: None,
+            outro_action: OutroAction::Play,
+            booting: false,
             legend_icon: LegendIcon::Keyboard,
             toasts: Vec::new(),
             bokeh, bokeh_tex: make_bokeh_texture(), fade_tex: make_fade_texture(),
@@ -501,6 +706,53 @@ fn draw_tile_shadow(x: f32, y: f32, w: f32, h: f32, s: f32, strength: f32) {
     }
 }
 
+/// The "Booting Cartridge..." scene: a sweeping dotted ring over whatever
+/// background the caller has drawn. Used by the dev-mode in-process boot
+/// wait and by the production fade-out handoff to the session script.
+pub fn draw_boot_screen(font_cache: &HashMap<String, Font>, config: &Config, s: f32) {
+    let current_font = get_current_font(font_cache, config);
+    let t = get_time() as f32;
+    let (cx, cy) = (screen_width() / 2.0, screen_height() / 2.0 - 12.0 * s);
+    let radius = 30.0 * s;
+    const DOTS: usize = 12;
+    let head = (t * 0.9).fract();
+    TOAST_DOT.with(|dot| {
+        for i in 0..DOTS {
+            let frac = i as f32 / DOTS as f32;
+            let ang = frac * std::f32::consts::TAU - std::f32::consts::FRAC_PI_2;
+            // How far this dot trails behind the sweeping head (0 = head).
+            let d = (head - frac).rem_euclid(1.0);
+            let a = (1.0 - d) * (1.0 - d) * 0.85 + 0.08;
+            let dr = 3.4 * s * (0.75 + 0.45 * (1.0 - d));
+            draw_texture_ex(
+                dot,
+                cx + ang.cos() * radius - dr,
+                cy + ang.sin() * radius - dr,
+                Color::new(1.0, 1.0, 1.0, a),
+                DrawTextureParams {
+                    dest_size: Some(vec2(dr * 2.0, dr * 2.0)),
+                    ..Default::default()
+                },
+            );
+        }
+    });
+    let label = "Booting Cartridge...";
+    let label_size = (FONT_SIZE as f32 * s * 0.95) as u16;
+    let dims = measure_text(label, Some(current_font), label_size, 1.0);
+    let (tx, ty) = ((screen_width() - dims.width) / 2.0, cy + radius + 28.0 * s);
+    let so = 1.0 * (label_size as f32 / FONT_SIZE as f32);
+    draw_text_ex(label, tx + so, ty + so, TextParams {
+        font: Some(current_font), font_size: label_size,
+        color: Color::new(0.0, 0.0, 0.0, 0.8),
+        ..Default::default()
+    });
+    draw_text_ex(label, tx, ty, TextParams {
+        font: Some(current_font), font_size: label_size,
+        color: Color::new(1.0, 1.0, 1.0, 0.9),
+        ..Default::default()
+    });
+}
+
 /// Two marquee rows of save icons drifting across the Save Data tile in
 /// opposite directions, pixel-crisp and cropped cleanly at the tile edges.
 fn draw_save_marquee(icons: &[Texture2D], x: f32, y: f32, w: f32, s: f32) {
@@ -561,12 +813,21 @@ fn draw_save_marquee(icons: &[Texture2D], x: f32, y: f32, w: f32, s: f32) {
 /// Layered outlines with squared falloff read as a smooth gradient once
 /// they overlap (thickness 2x the layer step).
 fn draw_focus_glow(x: f32, y: f32, w: f32, h: f32, s: f32, color: Color) {
+    // Tuned against 80-unit dashboard tiles: ~9 units of halo, about 11% of
+    // the tile's height.
+    draw_focus_glow_ex(x, y, w, h, s, color, 1.0, 2.0);
+}
+
+/// Same glow with a tunable halo. Short elements (the settings rows, 18 units
+/// tall) need a proportionally tighter spread or the rings from top and bottom
+/// meet in the middle and the element reads as a solid colour wash.
+fn draw_focus_glow_ex(x: f32, y: f32, w: f32, h: f32, s: f32, color: Color, spread: f32, core_th: f32) {
     let t = get_time() as f32;
     // Slow breath between 72% and 100% instead of a hard blink.
     let pulse = 0.72 + 0.28 * (0.5 + 0.5 * (t * 2.4).sin());
     const LAYERS: usize = 8;
     for i in (0..LAYERS).rev() {
-        let off = (i as f32 + 1.0) * 1.0 * s;
+        let off = (i as f32 + 1.0) * spread * s;
         let falloff = 1.0 - i as f32 / LAYERS as f32;
         let a = 0.32 * falloff * falloff * pulse;
         draw_rectangle_lines(
@@ -579,7 +840,7 @@ fn draw_focus_glow(x: f32, y: f32, w: f32, h: f32, s: f32, color: Color) {
         );
     }
     // Crisp core edge so the selection still reads sharply.
-    draw_rectangle_lines(x, y, w, h, 2.0 * s, Color::new(color.r, color.g, color.b, 0.95 * pulse));
+    draw_rectangle_lines(x, y, w, h, core_th * s, Color::new(color.r, color.g, color.b, 0.95 * pulse));
 }
 
 /// Selection frame whose edge bars stop `r` short of the corners — reads as
@@ -722,6 +983,11 @@ pub fn update(
         if let Some(system_bgm) = current_bgm.as_ref() {
             system_bgm.set_volume(1.0);
         }
+        state.cart_console_icons = if *play_option_enabled {
+            scan_cart_console_icons()
+        } else {
+            Vec::new()
+        };
         if *play_option_enabled {
             let info = save::cart_display_info(available_games);
             state.cart_label = info.name;
@@ -779,13 +1045,15 @@ pub fn update(
     // and show them one at a time as a bottom pill.
     for ev in crate::pad_leds::take_pad_events() {
         let (r, g, b) = crate::pad_leds::PLAYER_COLORS[ev.slot.min(3)];
+        sound_effects.play_toast(&config);
         state.toasts.push(Toast {
             text: format!(
                 "Player {} {}",
                 ev.slot + 1,
                 if ev.connected { "Connected" } else { "Disconnected" }
             ),
-            color: Color::from_rgba(r, g, b, 255),
+            dot: Some(Color::from_rgba(r, g, b, 255)),
+            icon: ToastIcon::Pad,
             t: 0.0,
         });
     }
@@ -796,6 +1064,21 @@ pub fn update(
         }
     }
 
+    // Boot screen: the game owns the display; wait for its process to end,
+    // then bring the dashboard back with the full intro.
+    if state.booting {
+        let done = match game_process.as_mut() {
+            Some(child) => child.try_wait().map(|s| s.is_some()).unwrap_or(true),
+            None => true,
+        };
+        if done {
+            *game_process = None;
+            state.booting = false;
+            state.intro_t = 0.0;
+        }
+        return;
+    }
+
     // Play outro: the dashboard slides back out (reverse intro), then the
     // launch/multicart handoff fires. Navigation is parked while it runs.
     if let Some(o) = state.outro_t {
@@ -804,14 +1087,30 @@ pub fn update(
             state.outro_t = Some(o);
         } else {
             state.outro_t = None;
-            // Slide back in whenever the dash next shows (returning from
-            // the multicart menu, or after the game).
-            state.intro_t = 0.0;
-            activate_play(
-                current_screen, sound_effects, config, log_messages, fade_start_time,
-                current_bgm, music_cache, game_icon_queue, available_games,
-                game_selection, game_process,
-            );
+            match state.outro_action {
+                OutroAction::Play => {
+                    activate_play(
+                        current_screen, sound_effects, config, log_messages, fade_start_time,
+                        current_bgm, music_cache, game_icon_queue, available_games,
+                        game_selection, game_process,
+                    );
+                    if game_process.is_some() {
+                        // A game actually spawned: hold on the boot screen
+                        // instead of sliding the dash back in behind it.
+                        state.booting = true;
+                    } else {
+                        // Multicart selector (or a failed launch) — the dash
+                        // slides back in when it next shows.
+                        state.intro_t = 0.0;
+                    }
+                }
+                OutroAction::SaveData => {
+                    state.intro_t = 0.0;
+                    activate_save_data(
+                        current_screen, input_state, storage_state, sound_effects, config,
+                    );
+                }
+            }
         }
         return;
     }
@@ -957,7 +1256,12 @@ pub fn update(
             let _ = std::process::Command::new("sudo")
                 .args(["-n", "/usr/bin/kazeta-eject"])
                 .spawn();
-            *flash_message = Some(("CART EJECTED - SAFE TO REMOVE".to_string(), 3.0));
+            state.toasts.push(Toast {
+                text: "Cart Ejected - Safe to Remove".to_string(),
+                dot: None,
+                icon: ToastIcon::Cart,
+                t: 0.0,
+            });
             sound_effects.play_back(&config);
         }
     }
@@ -974,13 +1278,18 @@ pub fn update(
         let tile = &TABS[state.tab].tiles[state.tile];
         match tile.action {
             BladeAction::SaveData => {
-                activate_save_data(current_screen, input_state, storage_state, sound_effects, config);
+                // Departure animation first: the tile's save icons burst out
+                // while the dash slides away, then the screen opens.
+                state.outro_action = OutroAction::SaveData;
+                state.outro_t = Some(0.0);
             }
             BladeAction::Play => {
                 if *play_option_enabled {
                     // Reverse choreography first; activate_play fires when it
-                    // lands (it plays the select sound itself, so nothing
-                    // extra here — the outro is the acknowledgment).
+                    // lands. The pack's launch flourish (if any) starts with
+                    // the outro so it plays over the slide-out.
+                    sound_effects.play_launch(&config);
+                    state.outro_action = OutroAction::Play;
                     state.outro_t = Some(0.0);
                 } else {
                     sound_effects.play_reject(&config);
@@ -1173,16 +1482,22 @@ fn draw_tab_pane(
     copy_logs_option_enabled: bool,
     hero_brands: &[HeroBrandDraw],
     save_icons: &[Texture2D],
+    cart_consoles: &[usize],
     hint_sd: &Texture2D,
+    badge_disc: &Texture2D,
     fade_tex: &Texture2D,
-    offset_x: f32,
+    // Tab slide state: raw 0..1 progress, direction, and whether this pane
+    // is the one on its way out. Columns move as a staggered wave.
+    slide_anim: f32,
+    slide_dir: f32,
+    exiting: bool,
     origin_y: f32,
-    animation_state: &AnimationState,
+    _animation_state: &AnimationState,
     font_cache: &HashMap<String, Font>,
     config: &Config,
     s: f32,
 ) {
-    let origin_x = ORIGIN_X * s + offset_x;
+    let origin_x = ORIGIN_X * s;
     let current_font = get_current_font(font_cache, config);
 
     // The shrinking-back tile only matters while this pane owns the cursor
@@ -1205,6 +1520,19 @@ fn draw_tab_pane(
             } else {
                 r.x += slide;
             }
+        }
+        // Tab switch: columns arrive (and leave) as a staggered wave instead
+        // of the pane moving as one rigid block.
+        if slide_anim < 1.0 {
+            const STAGGER: f32 = 0.08; // per-column delay, in anim units
+            let span = 1.0 - STAGGER * 3.0;
+            let pt = ease_out(((slide_anim - STAGGER * tile.col as f32).clamp(0.0, span)) / span);
+            let w = screen_width();
+            r.x += if exiting {
+                -slide_dir * pt * w
+            } else {
+                slide_dir * (1.0 - pt) * w
+            };
         }
         let is_selected = selected == Some(idx);
         let is_disabled = match tile.action {
@@ -1261,7 +1589,151 @@ fn draw_tab_pane(
         // Save Data wears a marquee of every saved game's icon, two rows
         // drifting in opposite directions.
         if tile.action == BladeAction::SaveData && !save_icons.is_empty() {
-            draw_save_marquee(save_icons, rx, ry, rw, s);
+            draw_save_marquee(save_icons, rx, ry, rw, s * scale);
+        }
+
+        // Tile face icons, centered above the label zone.
+        {
+            // Tile art scales with the focus grow, so a hovered tile's icon
+            // swells with it instead of sitting at a fixed size.
+            let art = s * scale;
+            let face: Option<(&Texture2D, f32)> = match tile.action {
+                BladeAction::CdPlayer => Some((badge_disc, 44.0)),
+                _ => None,
+            };
+            if let Some((tex, size)) = face {
+                let d = size * art;
+                draw_texture_ex(
+                    tex,
+                    rx + (rw - d) / 2.0,
+                    ry + (rh - d) / 2.0 - 4.0 * s,
+                    Color::new(1.0, 1.0, 1.0, 0.92),
+                    DrawTextureParams { dest_size: Some(vec2(d, d)), ..Default::default() },
+                );
+            }
+            let thread_face: Option<(&'static std::thread::LocalKey<Texture2D>, f32)> = match tile.action {
+                BladeAction::Wifi => Some((&TILE_WIFI, 40.0)),
+                BladeAction::Bluetooth => Some((&TILE_BLUETOOTH, 40.0)),
+                BladeAction::Settings => Some((&TILE_SETTINGS, 42.0)),
+                BladeAction::About => Some((&TILE_ABOUT, 40.0)),
+                BladeAction::ThemeDownloader => Some((&TILE_THEMES, 40.0)),
+                BladeAction::UpdateChecker => Some((&TILE_UPDATES, 40.0)),
+                BladeAction::CopyLogs => Some((&TILE_LOGS, 40.0)),
+                _ => None,
+            };
+            if let Some((key, size)) = thread_face {
+                let d = size * art;
+                key.with(|tex| {
+                    draw_texture_ex(
+                        tex,
+                        rx + (rw - d) / 2.0,
+                        ry + (rh - d) / 2.0 - 4.0 * s,
+                        Color::new(1.0, 1.0, 1.0, 0.92),
+                        DrawTextureParams { dest_size: Some(vec2(d, d)), ..Default::default() },
+                    );
+                });
+            }
+        }
+
+        // Runtimes runs a slow carousel of console icons: three on the tile
+        // at once, each drifting through its own lane before fading out and
+        // being replaced by the next system in the pool. Positions and
+        // alphas are pure functions of time, so this keeps no state.
+        if tile.action == BladeAction::RuntimeDownloader {
+            const SLOTS: usize = 4;
+            const CYCLE: f32 = 5.4; // seconds one icon spends on the tile
+            const FADE: f32 = 0.2;  // fraction of the cycle spent fading
+            // Per-lane vertical offset so the four never sit in a straight row.
+            const LANE_Y: [f32; SLOTS] = [-6.0, 5.0, -3.0, 7.0];
+            let t = get_time() as f32;
+            let art = s * scale;
+            let cell = 22.0 * art;
+            let lane_w = rw / SLOTS as f32;
+            let zone_top = ry + 5.0 * art;
+            let zone_h = rh * 0.60; // stays clear of the label band
+            CONSOLE_ICONS.with(|icons| {
+                for k in 0..SLOTS {
+                    // Stagger the lanes so they never swap in unison.
+                    let tk = t + k as f32 * CYCLE / SLOTS as f32;
+                    let n = (tk / CYCLE).floor();
+                    let p = tk / CYCLE - n;
+                    let env = (p / FADE).min((1.0 - p) / FADE).min(1.0);
+                    if env <= 0.01 {
+                        continue;
+                    }
+                    // Consecutive pool entries, so the three on screen are
+                    // always different systems.
+                    let seq = (n as i64 * SLOTS as i64 + k as i64)
+                        .rem_euclid(icons.len() as i64) as usize;
+                    let h1 = hash01(seq as u32 * 2 + 1);
+                    let h2 = hash01(seq as u32 * 2 + 7);
+                    // Lazy drift across the lane over the icon's lifetime,
+                    // with a per-appearance offset so it never repeats.
+                    let dx = (h1 - 0.5) * 9.0 * art + (p - 0.5) * 7.0 * art;
+                    let dy = (h2 - 0.5) * 6.0 * art - (p - 0.5) * 5.0 * art + LANE_Y[k] * art;
+                    let size = cell * (0.86 + 0.14 * env);
+                    let x = rx + lane_w * (k as f32 + 0.5) - size / 2.0 + dx;
+                    let y = zone_top + (zone_h - size) / 2.0 + dy;
+                    draw_texture_ex(
+                        &icons[seq],
+                        x,
+                        y,
+                        Color::new(1.0, 1.0, 1.0, 0.92 * env),
+                        DrawTextureParams {
+                            dest_size: Some(vec2(size, size)),
+                            ..Default::default()
+                        },
+                    );
+                }
+            });
+        }
+
+        // Console family icons for the cart's runtime(s) drift under the
+        // hero, each sealed in a soap bubble that bobs on its own clock.
+        // Anchored to the unscaled rect so the focus grow doesn't jiggle them.
+        if hero_play && !hero_brands.is_empty() && !cart_consoles.is_empty() {
+            let t = get_time() as f32;
+            let bub = 44.0 * s;   // bubble diameter
+            let ico = 27.0 * s;   // console icon inside it
+            let step = bub + 6.0 * s;
+            let base_x = r.x + 4.0 * s;
+            let base_y = r.y + r.h + 3.0 * s;
+            CONSOLE_ICONS.with(|icons| {
+                BUBBLE.with(|bubble| {
+                    for (i, idx) in cart_consoles.iter().enumerate() {
+                        let ph = i as f32 * 1.7;
+                        // Lazy bob with a gentler sideways sway, each bubble
+                        // on its own phase so they never move in lockstep.
+                        let bx = base_x + i as f32 * step
+                            + (t * 0.55 + ph * 1.3).sin() * 2.5 * s;
+                        let by = base_y + (t * 0.85 + ph).sin() * 3.5 * s;
+                        let tex = &icons[*idx];
+                        let iw = ico * tex.width() / tex.height();
+                        draw_texture_ex(
+                            tex,
+                            bx + (bub - iw) / 2.0,
+                            by + (bub - ico) / 2.0,
+                            Color::new(1.0, 1.0, 1.0, 0.95),
+                            DrawTextureParams {
+                                dest_size: Some(vec2(iw, ico)),
+                                ..Default::default()
+                            },
+                        );
+                        // Bubble over the icon: light enough that the art
+                        // reads through, with the rim selling the glass.
+                        draw_texture_ex(
+                            bubble,
+                            bx,
+                            by,
+                            Color::new(1.0, 1.0, 1.0, 0.55),
+                            DrawTextureParams {
+                                dest_size: Some(vec2(bub, bub)),
+                                ..Default::default()
+                            },
+                        );
+                    }
+                });
+            });
         }
 
         // Top shimmer (dashx360's white-fade band) on the hero only — the
@@ -1296,7 +1768,7 @@ fn draw_tab_pane(
         // "Insert Cartridge" hint instead of sitting blank.
         if hero_play && hero_brands.is_empty() {
             let pulse = 0.30 + 0.14 * (get_time() as f32 * 2.0).sin();
-            let icon_h = 34.0 * s;
+            let icon_h = 34.0 * s * scale;
             let icon_w = icon_h * hint_sd.width() / hint_sd.height();
             let cx = rx + rw / 2.0;
             let cy = ry + rh / 2.0;
@@ -1390,7 +1862,7 @@ pub fn draw_game_selection(
     selected_game: usize,
     cart_label: Option<&str>,
     legend_icon: LegendIcon,
-    animation_state: &AnimationState,
+    _animation_state: &AnimationState,
     background_cache: &HashMap<String, Texture2D>,
     video_cache: &mut HashMap<String, VideoPlayer>,
     font_cache: &HashMap<String, Font>,
@@ -1561,9 +2033,7 @@ pub fn draw(
     draw_rectangle(0.0, 0.0, screen_width(), screen_height(), BG_FALLBACK);
     render_background(background_cache, video_cache, config, background_state);
 
-    let w = screen_width();
     let s = scale_factor;
-    let t = ease_out(state.anim);
     let current_font = get_current_font(font_cache, config);
     let origin_y = 112.0 * s;
 
@@ -1584,6 +2054,15 @@ pub fn draw(
     // Ambient bokeh motes float over the background, under everything else.
     if config.background_particles == "ON" {
         draw_bokeh(state, intro, s);
+    }
+
+    // Boot screen: just the background, a sweeping dotted ring, and a label —
+    // shown from game spawn until the game's process takes over / exits.
+    // (Dev-mode path; production goes through Screen::FadingOut, which calls
+    // draw_boot_screen directly.)
+    if state.booting {
+        draw_boot_screen(font_cache, config, s);
+        return;
     }
 
     // --- Hero branding layers: ejected cart fading out under the current
@@ -1608,22 +2087,21 @@ pub fn draw(
         });
     }
 
-    // --- Panes: the active pane slides in over the previous one ---
+    // --- Panes: the active pane's columns wave in over the previous one's
+    // columns waving out ---
     if state.anim < 1.0 && state.prev_tab != state.tab {
-        let prev_off = -state.dir * t * w;
         draw_tab_pane(
             &TABS[state.prev_tab], None, 1.0, None, 0.0, intro,
             play_option_enabled, copy_logs_option_enabled,
-            &hero_brands, &state.save_icons, &state.badge_sd, &state.fade_tex,
-            prev_off, origin_y, animation_state, font_cache, config, s,
+            &hero_brands, &state.save_icons, &state.cart_console_icons, &state.badge_sd, &state.badge_disc, &state.fade_tex,
+            state.anim, state.dir, true, origin_y, animation_state, font_cache, config, s,
         );
     }
-    let active_off = state.dir * (1.0 - t) * w;
     draw_tab_pane(
         &TABS[state.tab], Some(state.tile), state.sel_anim, state.prev_sel, state.press_flash, intro,
         play_option_enabled, copy_logs_option_enabled,
-        &hero_brands, &state.save_icons, &state.badge_sd, &state.fade_tex,
-        active_off, origin_y, animation_state, font_cache, config, s,
+        &hero_brands, &state.save_icons, &state.cart_console_icons, &state.badge_sd, &state.badge_disc, &state.fade_tex,
+        state.anim, state.dir, false, origin_y, animation_state, font_cache, config, s,
     );
 
     // --- Button legend, lower right like the real dash; the confirm glyph
@@ -1708,7 +2186,42 @@ pub fn draw(
         x += dims.width + 13.0 * s;
     }
 
-    render_ui_overlay_alpha(logo_cache, font_cache, config, battery_info, current_time_str, gcc_adapter_poll_rate, scale_factor, overlay_a, true);
+    render_ui_overlay_alpha(logo_cache, font_cache, config, battery_info, current_time_str, gcc_adapter_poll_rate, scale_factor, overlay_a, true, false);
+
+    // --- Save Data departure: the tile's marquee icons burst outward,
+    // growing and fading, while the dash slides away underneath ---
+    if let (Some(o), OutroAction::SaveData) = (state.outro_t, state.outro_action) {
+        if !state.save_icons.is_empty() {
+            let p = ease_out(o);
+            let tile = &TABS[0].tiles[0];
+            let r = tile_rect(tile, TABS[0].tiles, ORIGIN_X * s, origin_y, s);
+            let (cx, cy) = (r.x + r.w / 2.0, r.y + r.h / 2.0);
+            let n = state.save_icons.len();
+            for (i, tex) in state.save_icons.iter().enumerate() {
+                // Even radial fan with a slight per-icon spread so rings of
+                // icons don't fly in lockstep.
+                let ang = i as f32 / n as f32 * std::f32::consts::TAU + 0.6;
+                let dist = p * (240.0 + (i % 3) as f32 * 70.0) * s;
+                let x = cx + ang.cos() * dist;
+                let y = cy + ang.sin() * dist * 0.8;
+                let size = 26.0 * s * (1.0 + 1.8 * p);
+                let a = (1.0 - p) * 0.95;
+                if a <= 0.01 {
+                    continue;
+                }
+                draw_texture_ex(
+                    tex,
+                    x - size / 2.0,
+                    y - size / 2.0,
+                    Color::new(1.0, 1.0, 1.0, a),
+                    DrawTextureParams {
+                        dest_size: Some(vec2(size, size)),
+                        ..Default::default()
+                    },
+                );
+            }
+        }
+    }
 
     // --- Player toast: "[glyph] [color dot] Player N Connected" pill that
     // slides up from the bottom edge and drops away after a beat ---
@@ -1722,7 +2235,8 @@ pub fn draw(
         let dot_r = 4.5 * s;
         let pad = 10.0 * s;
         let gap = 7.0 * s;
-        let pill_w = pad + icon_h + gap + dot_r * 2.0 + gap + dims.width + pad;
+        let dot_w = if toast.dot.is_some() { dot_r * 2.0 + gap } else { 0.0 };
+        let pill_w = pad + icon_h + gap + dot_w + dims.width + pad;
         let pill_h = 28.0 * s;
         let px = (screen_width() - pill_w) / 2.0;
         let py = screen_height() - 46.0 * s * v;
@@ -1730,26 +2244,32 @@ pub fn draw(
         draw_rectangle_lines(px, py, pill_w, pill_h, 1.2 * s, Color::new(1.0, 1.0, 1.0, 0.18 * v));
         let mut x = px + pad;
         let cy = py + pill_h / 2.0;
-        TOAST_PAD_ICON.with(|icon| {
-            draw_texture_ex(
-                icon,
-                x,
-                cy - icon_h / 2.0,
-                Color::new(1.0, 1.0, 1.0, v),
-                DrawTextureParams { dest_size: Some(vec2(icon_h, icon_h)), ..Default::default() },
-            );
-        });
+        let icon_tint = Color::new(1.0, 1.0, 1.0, v);
+        let icon_params = DrawTextureParams {
+            dest_size: Some(vec2(icon_h, icon_h)),
+            ..Default::default()
+        };
+        match toast.icon {
+            ToastIcon::Pad => TOAST_PAD_ICON.with(|icon| {
+                draw_texture_ex(icon, x, cy - icon_h / 2.0, icon_tint, icon_params.clone());
+            }),
+            ToastIcon::Cart => {
+                draw_texture_ex(&state.badge_sd, x, cy - icon_h / 2.0, icon_tint, icon_params.clone());
+            }
+        }
         x += icon_h + gap;
-        TOAST_DOT.with(|dot| {
-            draw_texture_ex(
-                dot,
-                x,
-                cy - dot_r,
-                Color::new(toast.color.r, toast.color.g, toast.color.b, v),
-                DrawTextureParams { dest_size: Some(vec2(dot_r * 2.0, dot_r * 2.0)), ..Default::default() },
-            );
-        });
-        x += dot_r * 2.0 + gap;
+        if let Some(color) = toast.dot {
+            TOAST_DOT.with(|dot| {
+                draw_texture_ex(
+                    dot,
+                    x,
+                    cy - dot_r,
+                    Color::new(color.r, color.g, color.b, v),
+                    DrawTextureParams { dest_size: Some(vec2(dot_r * 2.0, dot_r * 2.0)), ..Default::default() },
+                );
+            });
+            x += dot_r * 2.0 + gap;
+        }
         draw_text_ex(&toast.text, x, cy + dims.offset_y / 2.0, TextParams {
             font: Some(current_font),
             font_size: size,
@@ -1794,6 +2314,2160 @@ pub struct GuideState {
 impl GuideState {
     pub fn new() -> Self {
         Self { open: false, selection: 0 }
+    }
+}
+
+// ===================================
+// METRO SETTINGS SCREEN
+// ===================================
+// A dashboard-styled face for the existing settings pages: a column of value
+// rows on the left, a detail pane on the right, page names as a tab strip.
+// `ui::settings::update()` is not touched — this is a different picture of
+// the same state machine, so every binding keeps its exact meaning, and
+// `get_settings_value` stays the single source of every value string.
+
+/// Dynamic choice lists, for showing the focused row's position in its list
+/// ("7 / 13") and its neighbours. Static lists (colours, speeds, resolutions,
+/// timezones) come straight from settings.rs's own consts, so they are never
+/// duplicated here.
+pub struct SettingsChoices<'a> {
+    pub themes: &'a HashMap<String, crate::theme::Theme>,
+    pub sinks: &'a [crate::AudioSink],
+    pub bgm: &'a [String],
+    pub sfx_packs: &'a [String],
+    pub logos: &'a [String],
+    pub backgrounds: &'a [String],
+    pub fonts: &'a [String],
+    pub legend: LegendIcon,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum SWidget {
+    Toggle,
+    Percent,
+    Step,
+    Enum,
+    Swatch,
+    Aspect,
+    Action,
+    Jump(bool), // true = forward (later page)
+}
+
+/// Which control a row gets. Jump is detected from the VALUE ("->" / "<-"),
+/// never the label: AUDIO_SETTINGS[4] reads "VIDEO SETTINGS" but actually
+/// jumps to the General page, so trusting labels would ship that mislabel.
+/// Mirrors the shape of settings.rs `get_settings_value`, never its content.
+fn s_widget(page: usize, index: usize, value: &str) -> SWidget {
+    if value == "->" {
+        return SWidget::Jump(true);
+    }
+    if value == "<-" {
+        return SWidget::Jump(false);
+    }
+    match (page, index) {
+        (1, 0) => SWidget::Action,
+        (1, 2) => SWidget::Aspect,
+        (1, 5) | (2, 0) | (2, 1) | (2, 2) => SWidget::Percent,
+        (1, 3) | (1, 6) | (1, 7) | (1, 8) => SWidget::Toggle,
+        (3, 2) | (3, 3) => SWidget::Swatch,
+        (3, 5) | (3, 6) | (3, 7) | (3, 8) => SWidget::Step,
+        _ => SWidget::Enum,
+    }
+}
+
+/// Metro's own display labels: Title Case, shortened, and correct. The
+/// settings.rs arrays keep their exact strings and indices for LIST/BLADES.
+fn s_label(page: usize, index: usize) -> &'static str {
+    match (page, index) {
+        (1, 0) => "Reset Settings",
+        (1, 1) => "Resolution",
+        (1, 2) => "Aspect Ratio",
+        (1, 3) => "Splash Screen",
+        (1, 4) => "Time Zone",
+        (1, 5) => "Brightness",
+        (1, 6) => "Wi-Fi",
+        (1, 7) => "Bluetooth",
+        (1, 8) => "Autoboot",
+        (1, 9) => "Audio",
+        (2, 0) => "Master Volume",
+        (2, 1) => "Music Volume",
+        (2, 2) => "Effects Volume",
+        (2, 3) => "Audio Output",
+        (2, 4) => "General",
+        (2, 5) => "Interface",
+        (3, 0) => "Theme",
+        (3, 1) => "Menu Position",
+        (3, 2) => "Font Color",
+        (3, 3) => "Cursor Color",
+        (3, 4) => "Cursor Style",
+        (3, 5) => "Cursor Blink",
+        (3, 6) => "Transitions",
+        (3, 7) => "Background Scroll",
+        (3, 8) => "Color Shift",
+        (3, 9) => "Menu Style",
+        (3, 10) => "Audio",
+        (3, 11) => "Assets",
+        (4, 0) => "Background Music",
+        (4, 1) => "Sound Pack",
+        (4, 2) => "Logo",
+        (4, 3) => "Background",
+        (4, 4) => "Font",
+        (4, 5) => "Interface",
+        _ => "",
+    }
+}
+
+/// Bounded prettifier for known value strings. Deliberately a lookup and not
+/// a heuristic: a PipeWire sink name or a font filename must pass through
+/// byte-identical rather than get title-cased into nonsense.
+fn s_value_case(v: &str) -> String {
+    match v {
+        "ON" => "On", "OFF" => "Off",
+        "SLOW" => "Slow", "NORMAL" => "Normal", "FAST" => "Fast",
+        "BOX" => "Box", "TEXT" => "Text", "CONFIRM" => "Confirm",
+        "WHITE" => "White", "BLACK" => "Black", "PINK" => "Pink", "RED" => "Red",
+        "ORANGE" => "Orange", "YELLOW" => "Yellow", "GREEN" => "Green",
+        "BLUE" => "Blue", "PURPLE" => "Purple",
+        "CENTER" => "Center", "TOPLEFT" => "Top Left", "TOPRIGHT" => "Top Right",
+        "BOTTOMLEFT" => "Bottom Left", "BOTTOMRIGHT" => "Bottom Right",
+        "LIST" => "List", "BLADES" => "Blades", "METRO" => "Metro",
+        other => return other.to_string(),
+    }
+    .to_string()
+}
+
+/// One line of plain-language help per row. Empty means "nothing truthful to
+/// say" — a stale description is worse than none.
+fn s_help(page: usize, index: usize) -> &'static str {
+    match (page, index) {
+        (1, 0) => "Restores every default, including the menu style. A restart is required.",
+        (1, 1) => "Screen resolution. Only sizes matching the aspect ratio are offered.",
+        (1, 2) => "Screen shape. Changing it also picks the best matching resolution.",
+        (1, 3) => "Play the boot video before the dashboard appears.",
+        (1, 4) => "Clock offset from UTC, used by the clock and date in the corner.",
+        (1, 5) => "Panel backlight. No effect on displays without backlight control.",
+        (1, 6) => "Wireless networking. Turning it off disconnects any active network.",
+        (1, 7) => "Bluetooth radio. Turning it off disconnects wireless controllers.",
+        (1, 8) => "Boot the inserted cartridge instead of stopping at the dashboard.",
+        (1, 9) => "Opens the Audio page. The shoulder buttons change page too.",
+        (2, 0) => "System output volume. Affects everything the console plays.",
+        (2, 1) => "Volume of the dashboard's background music.",
+        (2, 2) => "Volume of menu sound effects.",
+        (2, 3) => "Which audio device the console plays through.",
+        (2, 4) => "Opens the General page. The shoulder buttons change page too.",
+        (2, 5) => "Opens the Interface page. The shoulder buttons change page too.",
+        (3, 0) => "Applies a whole look at once: sounds, music, logo, background, font, colors AND menu style. A theme that names no style returns you to the List menu.",
+        (3, 1) => "Where the menu sits on screen. Also moves the clock and status text.",
+        (3, 2) => "Color of menu text. The Metro dashboard always draws its labels white.",
+        (3, 3) => "Color of the selection cursor, including Metro's focus glow.",
+        (3, 4) => "Classic cursor shape. Metro uses its glow instead.",
+        (3, 5) => "How fast the classic cursor blinks.",
+        (3, 6) => "How fast menu transitions play.",
+        (3, 7) => "How fast a background image scrolls.",
+        (3, 8) => "How fast the background's color gradient drifts.",
+        (3, 9) => "Which dashboard to use: the classic List, the 360-style Blades, or Metro.",
+        (3, 10) => "Opens the Audio page. The shoulder buttons change page too.",
+        (3, 11) => "Opens the Assets page. The shoulder buttons change page too.",
+        (4, 0) => "Music that loops on the dashboard.",
+        (4, 1) => "Set of menu sound effects.",
+        (4, 2) => "Logo shown on the dashboard.",
+        (4, 3) => "Wallpaper behind every menu.",
+        (4, 4) => "Typeface for all menu text.",
+        (4, 5) => "Opens the Interface page. The shoulder buttons change page too.",
+        _ => "",
+    }
+}
+
+/// The focused row's full choice list plus where the current value sits in it.
+/// Returns None when the row has no enumerable list, or when the current value
+/// isn't found — the pane then shows the value alone, which is the safe way to
+/// fail (it can never point at the wrong entry).
+fn s_choices(
+    page: usize,
+    index: usize,
+    config: &Config,
+    ch: &SettingsChoices,
+    current: &str,
+) -> Option<(Vec<String>, usize)> {
+    use crate::ui::settings as st;
+    let list: Vec<String> = match (page, index) {
+        (1, 1) => st::RESOLUTIONS
+            .iter()
+            .filter(|r| st::matches_aspect_ratio(r, &config.aspect_ratio))
+            .map(|r| r.to_string())
+            .collect(),
+        (1, 2) => st::ASPECT_RATIOS.iter().map(|r| r.to_string()).collect(),
+        (1, 4) => st::TIMEZONES.iter().map(|t| t.to_uppercase()).collect(),
+        (2, 3) => ch.sinks.iter().map(|s| s.name.to_uppercase()).collect(),
+        (3, 0) => {
+            let mut names: Vec<String> = ch.themes.keys().cloned().collect();
+            names.sort();
+            names.iter().map(|n| n.replace('_', " ").to_uppercase()).collect()
+        }
+        (3, 1) => ["CENTER", "TOPLEFT", "TOPRIGHT", "BOTTOMLEFT", "BOTTOMRIGHT"]
+            .iter().map(|p| p.to_string()).collect(),
+        (3, 2) | (3, 3) => st::COLORS.iter().map(|c| c.to_string()).collect(),
+        (3, 4) => st::CURSOR_STYLES.iter().map(|c| c.to_string()).collect(),
+        (3, 5) | (3, 6) | (3, 7) | (3, 8) => st::SPEEDS.iter().map(|c| c.to_string()).collect(),
+        (3, 9) => st::MENU_STYLES.iter().map(|m| m.to_string()).collect(),
+        (4, 0) => ch.bgm.iter().map(|v| asset_display(v)).collect(),
+        (4, 1) => ch.sfx_packs.iter().map(|v| v.replace('_', " ").to_uppercase()).collect(),
+        (4, 2) => ch.logos.iter().map(|v| asset_display(v)).collect(),
+        (4, 3) => ch.backgrounds.iter().map(|v| asset_display(v)).collect(),
+        (4, 4) => ch.fonts.iter().map(|v| asset_display(v)).collect(),
+        _ => return None,
+    };
+    let at = list.iter().position(|e| e == current)?;
+    Some((list, at))
+}
+
+/// Same shaping settings.rs applies to asset names when it displays them.
+fn asset_display(v: &str) -> String {
+    crate::utils::trim_extension(v).replace('_', " ").to_uppercase()
+}
+
+// --- Save Data wall geometry. The classic screen is a 13x5 grid of bare
+// 32px icons; Metro trades capacity for legibility with a 5x3 wall of named
+// tiles. ui::data::update() reads these so its cursor math matches.
+pub const SAVE_COLS: usize = 5;
+pub const SAVE_ROWS: usize = 3;
+const SAVE_GAP: f32 = 4.0;
+const SAVE_TILE_H: f32 = 54.0;
+const SAVE_GRID_TOP: f32 = 90.0;
+const SAVE_INTRO_TIME: f32 = 0.55;
+const SAVE_POP_TIME: f32 = 0.20;
+const SAVE_MEDIA_TIME: f32 = 0.30;
+
+/// types.rs keeps its dialog easing inline, so the save screen carries its own.
+fn smoothstep(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+/// Dialog option verbs ("COPY", "CANCEL") in Metro's sentence case. Separate
+/// from s_value_case, which formats settings values — the two screens share no
+/// vocabulary and coupling them would be a trap.
+fn dlg_label(v: &str) -> String {
+    match v {
+        "OK" => return "OK".to_string(),
+        _ => {}
+    }
+    let lower = v.to_lowercase();
+    let mut c = lower.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
+}
+
+const SET_INTRO_TIME: f32 = 0.45;
+const SET_LIST_TOP: f32 = 84.0;
+const SET_LIST_H: f32 = 178.0;
+const SET_CHIP_Y: f32 = 268.0;
+const SET_CHIP_H: f32 = 18.0;
+const TILE_FOCUS: Color = Color::new(0.38, 0.39, 0.41, 1.0);
+const TILE_RED: Color = Color::new(0.52, 0.11, 0.11, 1.0);
+const TILE_RED_DIM: Color = Color::new(0.30, 0.16, 0.16, 1.0);
+
+/// Animation clocks for the settings screen. Lives here rather than in
+/// MetroState because the screen is drawn straight from settings.rs and has
+/// no state of its own to thread through.
+struct SettingsAnim {
+    last_draw: f64,
+    entering: bool,
+    intro: f32,
+    dir: f32,
+    page: usize,
+    sel: usize,
+    prev_sel: Option<usize>,
+    sel_anim: f32,
+    val: String,
+    val_key: (usize, usize),
+    val_flash: f32,
+    val_dir: f32,
+    meter: f32,
+}
+
+impl SettingsAnim {
+    fn new() -> Self {
+        Self {
+            last_draw: -10.0, entering: true, intro: 1.0, dir: 1.0,
+            page: 0, sel: usize::MAX, prev_sel: None, sel_anim: 1.0,
+            val: String::new(), val_key: (0, usize::MAX),
+            val_flash: 0.0, val_dir: 1.0, meter: 0.0,
+        }
+    }
+}
+
+thread_local! {
+    static SET_ANIM: RefCell<SettingsAnim> = RefCell::new(SettingsAnim::new());
+}
+
+pub fn draw_settings(
+    page_number: usize,
+    options: &[&str],
+    logo_cache: &HashMap<String, Texture2D>,
+    background_cache: &HashMap<String, Texture2D>,
+    video_cache: &mut HashMap<String, VideoPlayer>,
+    font_cache: &HashMap<String, Font>,
+    config: &Config,
+    selection: usize,
+    background_state: &mut BackgroundState,
+    battery_info: &Option<BatteryInfo>,
+    current_time_str: &str,
+    gcc_adapter_poll_rate: &Option<u32>,
+    s: f32,
+    system_volume: f32,
+    brightness: f32,
+    choices: &SettingsChoices,
+) {
+    let font = get_current_font(font_cache, config);
+    let w = screen_width();
+    let h = screen_height();
+    let w_du = w / s;
+
+    // --- Frame, derived from the live screen so 4:3 (480 design units wide)
+    // and 16:10 work as well as 16:9 ---
+    let m = ORIGIN_X;
+    let small_w = 80.0 * (185.0 / 131.0);
+    let grid_right = m + 4.0 * small_w + 3.0 * 2.0; // the dash's own tile-grid edge
+    let content_r = grid_right.min(w_du - m);
+    let content_w = content_r - m;
+    let col_gap = 8.0;
+    let list_w = (2.0 * small_w + 2.0).min((content_w - col_gap) * 0.55);
+    let pane_w = content_w - col_gap - list_w;
+    let list_x = m;
+    let pane_x = m + list_w + col_gap;
+
+    // --- Split the page's options into value rows and page-jump chips ---
+    let mut rows: Vec<(usize, String)> = Vec::new();
+    let mut chips: Vec<(usize, bool)> = Vec::new(); // (option index, forward)
+    for i in 0..options.len() {
+        let v = crate::ui::settings::get_settings_value(page_number, i, config, system_volume, brightness);
+        match s_widget(page_number, i, &v) {
+            SWidget::Jump(fwd) => chips.push((i, fwd)),
+            _ => rows.push((i, v)),
+        }
+    }
+    let n = rows.len().max(1) as f32;
+    let pitch = ((SET_LIST_H + 2.0) / n).clamp(15.0, 26.0);
+    let row_h = pitch - 2.0;
+
+    let cur_val = crate::ui::settings::get_settings_value(page_number, selection, config, system_volume, brightness);
+    let cur_widget = s_widget(page_number, selection, &cur_val);
+    let cur_choices = s_choices(page_number, selection, config, choices, &cur_val);
+
+    // --- Clocks ---
+    let (intro, dir, entering, sel_anim, prev_sel, val_flash, val_dir, meter_disp) =
+        SET_ANIM.with(|cell| {
+            let mut a = cell.borrow_mut();
+            let now = get_time();
+            let dt = get_frame_time();
+            // A gap between draws means we arrived from another screen.
+            let fresh = now - a.last_draw > 0.25;
+            a.last_draw = now;
+
+            if fresh {
+                a.intro = 0.0;
+                a.entering = true;
+                a.dir = 1.0;
+                a.page = page_number;
+                a.sel = selection;
+                a.prev_sel = None;
+                a.sel_anim = 1.0;
+                a.val.clear();
+                a.val_flash = 0.0;
+            } else if page_number != a.page {
+                a.dir = if (page_number + 4 - a.page) % 4 == 1 { 1.0 } else { -1.0 };
+                a.page = page_number;
+                a.intro = 0.0;
+                a.entering = false;
+                a.prev_sel = None;
+                a.sel = selection;
+                a.sel_anim = 1.0;
+            } else if selection != a.sel {
+                a.prev_sel = Some(a.sel);
+                a.sel = selection;
+                a.sel_anim = 0.0;
+            }
+
+            // Value edits are detected by diffing the string, so the renderer
+            // never needs to see InputState and update() stays untouched.
+            if a.val_key == (page_number, selection) && cur_val != a.val && !a.val.is_empty() {
+                a.val_flash = 1.0;
+                a.val_dir = match (
+                    a.val.trim_end_matches('%').parse::<f32>(),
+                    cur_val.trim_end_matches('%').parse::<f32>(),
+                ) {
+                    (Ok(old), Ok(new)) if cur_val.ends_with('%') => {
+                        if new >= old { 1.0 } else { -1.0 }
+                    }
+                    _ => 1.0,
+                };
+            }
+            if a.val_key != (page_number, selection) {
+                a.val_key = (page_number, selection);
+            }
+            a.val = cur_val.clone();
+
+            a.intro = (a.intro + dt / SET_INTRO_TIME).min(1.0);
+            a.sel_anim = (a.sel_anim + dt).min(1.0);
+            a.val_flash = (a.val_flash - dt / 0.14).max(0.0);
+
+            // Meters and toggles ease toward their value so a 10% step reads
+            // as a sweep rather than a jump.
+            let target = match cur_widget {
+                SWidget::Percent => cur_val.trim_end_matches('%').parse::<f32>().unwrap_or(0.0) / 100.0,
+                _ => 0.0,
+            };
+            let k = (dt / 0.12).min(1.0);
+            a.meter += (target - a.meter) * k;
+
+            (a.intro, a.dir, a.entering, a.sel_anim, a.prev_sel, a.val_flash, a.val_dir, a.meter)
+        });
+
+    let overlay_a = ease_out_sine(((intro - 0.18) / 0.25).clamp(0.0, 1.0));
+
+    // --- Text helpers. Hand-rolled shadow: the shared helper pins its shadow
+    // at 0.9 alpha, which ghosts while the screen fades in. ---
+    let txt = |text: &str, x: f32, y: f32, size: u16, color: Color| {
+        let so = 1.0 * (size as f32 / FONT_SIZE as f32);
+        draw_text_ex(text, x + so, y + so, TextParams {
+            font: Some(font), font_size: size,
+            color: Color::new(0.0, 0.0, 0.0, 0.85 * color.a),
+            ..Default::default()
+        });
+        draw_text_ex(text, x, y, TextParams {
+            font: Some(font), font_size: size, color, ..Default::default()
+        });
+    };
+    let fs = |k: f32| ((FONT_SIZE as f32 * s * k) as u16).max(9);
+    // Shrink to fit, then truncate with an ellipsis if it still overflows at
+    // the 9-device-pixel floor.
+    let fit = |text: &str, k: f32, max_w: f32| -> (String, u16) {
+        let mut size = fs(k);
+        let d = measure_text(text, Some(font), size, 1.0);
+        if d.width > max_w && d.width > 0.0 {
+            size = (((size as f32) * max_w / d.width).floor() as u16).max(9);
+        }
+        let mut out = text.to_string();
+        if measure_text(&out, Some(font), size, 1.0).width > max_w {
+            while out.chars().count() > 1
+                && measure_text(&format!("{}…", out), Some(font), size, 1.0).width > max_w
+            {
+                out.pop();
+            }
+            out.push('…');
+        }
+        (out, size)
+    };
+
+    // --- Background ---
+    draw_rectangle(0.0, 0.0, w, h, BG_FALLBACK);
+    render_background(background_cache, video_cache, config, background_state);
+    draw_rectangle(0.0, 0.0, w, h, Color::new(0.0, 0.0, 0.0, 0.35));
+    // Top wash so the header reads over bright wallpapers (a stretched ramp,
+    // never stacked strips — those band).
+    FADE_TEX.with(|tex| {
+        draw_texture_ex(tex, 0.0, 0.0, Color::new(0.0, 0.0, 0.0, 0.35), DrawTextureParams {
+            dest_size: Some(vec2(w, 100.0 * s)),
+            flip_y: true,
+            ..Default::default()
+        });
+    });
+
+    // --- Detail pane (drawn under the rows, so a focused row's glow bleeds
+    // over its edge rather than being clipped by it) ---
+    let pane_slide = if intro < 1.0 {
+        let p = ease_out((intro / 0.34).min(1.0));
+        if entering { (1.0 - p) * w * 0.60 } else { dir * (1.0 - p) * w * 0.60 }
+    } else {
+        0.0
+    };
+    let px = pane_x * s + pane_slide;
+    let py = SET_LIST_TOP * s;
+    let pw = pane_w * s;
+    let ph = 132.0 * s;
+    {
+        let fill = match cur_widget {
+            SWidget::Jump(_) => XBOX_GREEN,
+            SWidget::Action => TILE_RED,
+            _ => TILE_SLATE_ALT,
+        };
+        draw_rectangle(px, py, pw, ph, fill);
+        FADE_TEX.with(|tex| {
+            draw_texture_ex(tex, px, py, Color::new(1.0, 1.0, 1.0, 0.28), DrawTextureParams {
+                dest_size: Some(vec2(pw, ph * 0.16)), flip_y: true, ..Default::default()
+            });
+            draw_texture_ex(tex, px, py + ph * 0.74, Color::new(0.0, 0.0, 0.0, 0.55), DrawTextureParams {
+                dest_size: Some(vec2(pw, ph * 0.26)), ..Default::default()
+            });
+        });
+
+        // Icon: what family of setting this is.
+        let icon_d = 40.0 * s;
+        let ix = px + 14.0 * s;
+        let iy = py + 14.0 * s;
+        let tint = Color::new(1.0, 1.0, 1.0, 0.92);
+        let t = get_time() as f32;
+        if let SWidget::Jump(fwd) = cur_widget {
+            // Page chips get a big directional chevron rather than an icon.
+            let cxx = ix + icon_d * 0.5;
+            let cyy = iy + icon_d * 0.5;
+            let hw = icon_d * 0.34;
+            let hh = icon_d * 0.44;
+            let tip = if fwd { cxx + hw } else { cxx - hw };
+            let back = if fwd { cxx - hw * 0.45 } else { cxx + hw * 0.45 };
+            draw_triangle(vec2(tip, cyy), vec2(back, cyy - hh), vec2(back, cyy + hh), tint);
+        } else {
+        match (page_number, selection) {
+            (1, 6) => TILE_WIFI.with(|x| draw_texture_ex(x, ix, iy, tint,
+                DrawTextureParams { dest_size: Some(vec2(icon_d, icon_d)), ..Default::default() })),
+            (1, 7) => TILE_BLUETOOTH.with(|x| draw_texture_ex(x, ix, iy, tint,
+                DrawTextureParams { dest_size: Some(vec2(icon_d, icon_d)), ..Default::default() })),
+            (2, 0) | (2, 1) | (2, 2) | (2, 3) | (4, 0) | (4, 1) => TILE_DISC.with(|x| {
+                // The music row's disc spins while a track is set.
+                let spin = if page_number == 4 && cur_val != "OFF" { t * 0.25 } else { 0.0 };
+                draw_texture_ex(x, ix, iy, tint, DrawTextureParams {
+                    dest_size: Some(vec2(icon_d, icon_d)), rotation: spin, ..Default::default()
+                })
+            }),
+            (4, 2) => {
+                // Show the actual logo, so picking one isn't guesswork.
+                // Logos are wide, so they get a banner-shaped slot.
+                let drawn = logo_cache.get(&config.logo_selection).map(|tex| {
+                    let max_w = 110.0 * s;
+                    let ar = tex.height() / tex.width();
+                    let mut lw = max_w;
+                    let mut lh = lw * ar;
+                    if lh > icon_d {
+                        lh = icon_d;
+                        lw = lh / ar;
+                    }
+                    draw_texture_ex(tex, ix, iy + (icon_d - lh) / 2.0, tint, DrawTextureParams {
+                        dest_size: Some(vec2(lw, lh)), ..Default::default()
+                    });
+                });
+                if drawn.is_none() {
+                    // "None", or an asset that failed to load.
+                    TILE_THEMES.with(|x| draw_texture_ex(x, ix, iy,
+                        Color::new(1.0, 1.0, 1.0, 0.45),
+                        DrawTextureParams { dest_size: Some(vec2(icon_d, icon_d)), ..Default::default() }));
+                }
+            }
+            (3, _) | (4, _) => TILE_THEMES.with(|x| {
+                draw_texture_ex(x, ix, iy, tint, DrawTextureParams {
+                    dest_size: Some(vec2(icon_d, icon_d)), ..Default::default()
+                })
+            }),
+            (1, 2) => {
+                // Aspect ratio draws its own true proportion instead of art.
+                let (aw, ah) = match cur_val.as_str() {
+                    "4:3" => (44.0, 33.0),
+                    "16:10" => (44.0, 27.5),
+                    _ => (44.0, 24.75),
+                };
+                draw_rectangle_lines(ix, iy + (40.0 - ah) * 0.5 * s, aw * s, ah * s, 1.5 * s,
+                    Color::new(1.0, 1.0, 1.0, 0.7));
+            }
+            _ => TILE_SETTINGS.with(|x| draw_texture_ex(x, ix, iy, tint,
+                DrawTextureParams { dest_size: Some(vec2(icon_d, icon_d)), ..Default::default() })),
+        }
+        }
+
+        // Position in the choice list: dots when short, "7 / 25" when long.
+        if let Some((list, at)) = &cur_choices {
+            if list.len() > 1 {
+                let cy = py + 34.0 * s;
+                if list.len() <= 13 {
+                    let gap = 6.0 * s;
+                    let total = (list.len() - 1) as f32 * gap;
+                    let start = px + pw - 14.0 * s - total;
+                    TOAST_DOT.with(|dot| {
+                        for i in 0..list.len() {
+                            let r = if i == *at { 2.8 * s } else { 2.0 * s };
+                            let a = if i == *at { 0.95 } else { 0.30 };
+                            draw_texture_ex(dot, start + i as f32 * gap - r, cy - r,
+                                Color::new(1.0, 1.0, 1.0, a),
+                                DrawTextureParams { dest_size: Some(vec2(r * 2.0, r * 2.0)), ..Default::default() });
+                        }
+                    });
+                } else {
+                    let label = format!("{} / {}", at + 1, list.len());
+                    let size = fs(0.72);
+                    let d = measure_text(&label, Some(font), size, 1.0);
+                    txt(&label, px + pw - 14.0 * s - d.width, cy + d.offset_y * 0.5, size,
+                        Color::new(1.0, 1.0, 1.0, 0.55));
+                }
+            }
+        }
+
+        // Name of the focused setting.
+        let (name, name_size) = fit(s_label(page_number, selection), 1.0, pw - 28.0 * s);
+        txt(&name, px + 14.0 * s, py + 76.0 * s, name_size, Color::new(1.0, 1.0, 1.0, 0.85));
+
+        // Widget band: the same control as the row, at pane scale.
+        let band_y = py + 84.0 * s;
+        match cur_widget {
+            SWidget::Percent => {
+                let cells_x = px + 14.0 * s;
+                let cells_w = pw - 28.0 * s;
+                let gap = 1.6 * s;
+                let cw = (cells_w - 9.0 * gap) / 10.0;
+                let filled = ((meter_disp * 10.0).round() as i32).clamp(0, 10) as usize;
+                let fill_col = string_to_color(&config.cursor_color);
+                for i in 0..10 {
+                    let c = if i < filled { fill_col } else { Color::new(1.0, 1.0, 1.0, 0.16) };
+                    draw_rectangle(cells_x + i as f32 * (cw + gap), band_y, cw, 9.0 * s, c);
+                }
+            }
+            SWidget::Step => {
+                let steps = ["OFF", "SLOW", "NORMAL", "FAST"];
+                let filled = steps.iter().position(|v| *v == cur_val).unwrap_or(0);
+                let cells_x = px + 14.0 * s;
+                let gap = 8.0 * s;
+                let cw = (pw - 28.0 * s - 2.0 * gap) / 3.0;
+                let fill_col = string_to_color(&config.cursor_color);
+                for i in 0..3 {
+                    let c = if i < filled { fill_col } else { Color::new(1.0, 1.0, 1.0, 0.16) };
+                    draw_rectangle(cells_x + i as f32 * (cw + gap), band_y, cw, 9.0 * s, c);
+                }
+            }
+            SWidget::Toggle => {
+                let on = cur_val == "ON";
+                let tw = 60.0 * s;
+                let th = 22.0 * s;
+                let tx = px + 14.0 * s;
+                let ty = py + 80.0 * s;
+                draw_rectangle(tx, ty, tw, th,
+                    if on { XBOX_GREEN } else { Color::new(1.0, 1.0, 1.0, 0.16) });
+                draw_rectangle(if on { tx + tw - th } else { tx }, ty, th, th,
+                    if on { Color::new(0.97, 0.97, 0.97, 1.0) } else { Color::new(1.0, 1.0, 1.0, 0.55) });
+            }
+            SWidget::Jump(_) => {
+                let g = 22.0 * s;
+                LEGEND_ICONS.with(|icons| {
+                    draw_texture_ex(&icons[choices.legend as usize], px + 14.0 * s, band_y - 6.0 * s,
+                        Color::new(1.0, 1.0, 1.0, 0.95),
+                        DrawTextureParams { dest_size: Some(vec2(g, g)), ..Default::default() });
+                });
+                txt("Select", px + 14.0 * s + g + 6.0 * s, band_y + 10.0 * s, fs(0.8),
+                    Color::new(1.0, 1.0, 1.0, 0.85));
+            }
+            SWidget::Enum | SWidget::Swatch | SWidget::Aspect => {
+                // Neighbour ghosts: what's one press away in each direction.
+                if let Some((list, at)) = &cur_choices {
+                    if list.len() > 1 {
+                        let ghost = Color::new(1.0, 1.0, 1.0, 0.30);
+                        let chev = Color::new(1.0, 1.0, 1.0, 0.55);
+                        let gy = py + 94.0 * s;
+                        let max_w = (pw - 28.0 * s) * 0.40;
+                        let nudge = (get_time() as f32 * 2.4).sin() * 1.0 * s;
+                        let prev = &list[(at + list.len() - 1) % list.len()];
+                        let next = &list[(at + 1) % list.len()];
+                        let (pt, ps) = fit(&s_value_case(prev), 0.68, max_w);
+                        let (nt, ns) = fit(&s_value_case(next), 0.68, max_w);
+                        let lx = px + 14.0 * s;
+                        let rx2 = px + pw - 14.0 * s;
+                        draw_triangle(
+                            vec2(lx - 3.0 * s + nudge, gy - 4.0 * s),
+                            vec2(lx + 4.0 * s, gy - 8.0 * s),
+                            vec2(lx + 4.0 * s, gy), chev);
+                        draw_triangle(
+                            vec2(rx2 + 3.0 * s - nudge, gy - 4.0 * s),
+                            vec2(rx2 - 4.0 * s, gy - 8.0 * s),
+                            vec2(rx2 - 4.0 * s, gy), chev);
+                        txt(&pt, lx + 8.0 * s, gy, ps, ghost);
+                        let nd = measure_text(&nt, Some(font), ns, 1.0);
+                        txt(&nt, rx2 - 8.0 * s - nd.width, gy, ns, ghost);
+                    }
+                }
+            }
+            SWidget::Action => {}
+        }
+
+        // The value, big. This pane is the safety valve for long strings —
+        // it always shows more than the row does.
+        // A chip's raw value is the arrow glyph the classic screen shows —
+        // say what it does instead.
+        let shown = if matches!(cur_widget, SWidget::Jump(_)) {
+            "Open".to_string()
+        } else {
+            s_value_case(&cur_val)
+        };
+        let kick = val_dir * 4.0 * s * val_flash;
+        if page_number == 2 && selection == 3 {
+            // Sink names are long and unshrinkable; give them two lines.
+            let max_w = pw - 28.0 * s;
+            let size = fs(0.85);
+            let mut line1 = String::new();
+            let mut line2 = String::new();
+            for c in shown.chars() {
+                let probe = format!("{}{}", line1, c);
+                if line2.is_empty() && measure_text(&probe, Some(font), size, 1.0).width <= max_w {
+                    line1.push(c);
+                } else {
+                    line2.push(c);
+                }
+            }
+            let (l2, l2s) = fit(&line2, 0.85, max_w);
+            txt(&line1, px + 14.0 * s + kick, py + 112.0 * s, size, WHITE);
+            txt(&l2, px + 14.0 * s + kick, py + 126.0 * s, l2s, WHITE);
+        } else {
+            let (v, vs) = fit(&shown, 1.45, pw - 28.0 * s);
+            txt(&v, px + 14.0 * s + kick, py + 122.0 * s, vs, WHITE);
+        }
+    }
+
+    // --- Blurb strip ---
+    {
+        let bx = px;
+        let by = 218.0 * s;
+        let bw = pw;
+        let bh = 68.0 * s;
+        draw_rectangle(bx, by, bw, bh, TILE_SLATE);
+        let help = s_help(page_number, selection);
+        if !help.is_empty() {
+            let a = (sel_anim / 0.12).min(1.0) * 0.72;
+            let size = fs(0.72);
+            let max_w = bw - 20.0 * s;
+            // Greedy wrap, four lines max.
+            let mut line = String::new();
+            let mut lines: Vec<String> = Vec::new();
+            for word in help.split_whitespace() {
+                let probe = if line.is_empty() { word.to_string() } else { format!("{} {}", line, word) };
+                if measure_text(&probe, Some(font), size, 1.0).width <= max_w {
+                    line = probe;
+                } else {
+                    lines.push(std::mem::take(&mut line));
+                    line = word.to_string();
+                }
+            }
+            if !line.is_empty() {
+                lines.push(line);
+            }
+            for (i, l) in lines.iter().take(4).enumerate() {
+                txt(l, bx + 10.0 * s, by + (18.0 + i as f32 * 14.0) * s, size,
+                    Color::new(1.0, 1.0, 1.0, a));
+            }
+        }
+    }
+
+    // --- Rows and chips, unfocused first then the focused one last, so a
+    // grown element overlaps its neighbours instead of being cut by them ---
+    let row_slide = |i: usize| -> f32 {
+        if intro >= 1.0 {
+            return 0.0;
+        }
+        let pt = ease_out(((intro - i as f32 * 0.018) / 0.30).clamp(0.0, 1.0));
+        if entering { -(1.0 - pt) * w * 0.55 } else { dir * (1.0 - pt) * w * 0.55 }
+    };
+
+    let draw_row = |slot: usize, opt: usize, value: &String, focused: bool, shrinking: bool| {
+        let k = if focused {
+            ease_out((sel_anim / SEL_GROW_TIME).min(1.0))
+        } else if shrinking {
+            1.0 - ease_out_sine((sel_anim / SEL_SHRINK_TIME).min(1.0))
+        } else {
+            0.0
+        };
+        // A short bar can't take the tile's 1.07x scale (it would jump the
+        // gutter), so focus lifts it by a fixed inset instead.
+        let gx = k * 5.0 * s;
+        let gy = k * ((pitch - row_h) * 0.5).min(2.0) * s;
+        let rx = list_x * s - gx + row_slide(slot);
+        let ry = (SET_LIST_TOP + slot as f32 * pitch) * s - gy;
+        let rw = list_w * s + gx * 2.0;
+        let rh = row_h * s + gy * 2.0;
+
+        if k > 0.01 {
+            draw_tile_shadow(rx, ry, rw, rh, s, k);
+        }
+        let fill = if page_number == 1 && opt == 0 {
+            if focused { TILE_RED } else { TILE_RED_DIM }
+        } else if focused {
+            TILE_FOCUS
+        } else if slot % 2 == 0 {
+            TILE_SLATE
+        } else {
+            TILE_SLATE_ALT
+        };
+        draw_rectangle(rx, ry, rw, rh, fill);
+        FADE_TEX.with(|tex| {
+            draw_texture_ex(tex, rx, ry, Color::new(1.0, 1.0, 1.0, 0.05), DrawTextureParams {
+                dest_size: Some(vec2(rw, rh * 0.40)), flip_y: true, ..Default::default()
+            });
+            draw_texture_ex(tex, rx, ry + rh * 0.60, Color::new(0.0, 0.0, 0.0, 0.40), DrawTextureParams {
+                dest_size: Some(vec2(rw, rh * 0.40)), ..Default::default()
+            });
+        });
+
+        let pad = 8.0 * s;
+        let (label, lsize) = fit(s_label(page_number, opt), 0.80, list_w * s * 0.46);
+        let ld = measure_text(&label, Some(font), lsize, 1.0);
+        let base_y = ry + rh / 2.0 + ld.offset_y * 0.5;
+        txt(&label, rx + pad, base_y, lsize,
+            if focused { WHITE } else { Color::new(1.0, 1.0, 1.0, 0.82) });
+
+        // Value side. Every widget pins to the row's right edge so nothing
+        // shifts as the value string changes width.
+        let value_r = rx + rw - pad;
+        let kick = if focused { val_dir * 4.0 * s * val_flash } else { 0.0 };
+        let widget = s_widget(page_number, opt, value);
+        match widget {
+            SWidget::Toggle => {
+                let on = value == "ON";
+                let tw = 24.0 * s;
+                let th = 10.0 * s;
+                let ty = ry + rh / 2.0 - th / 2.0;
+                let tx = value_r - tw;
+                draw_rectangle(tx, ty, tw, th,
+                    if on { XBOX_GREEN } else { Color::new(1.0, 1.0, 1.0, 0.16) });
+                draw_rectangle(if on { tx + tw - th } else { tx }, ty, th, th,
+                    if on { Color::new(0.97, 0.97, 0.97, 1.0) } else { Color::new(1.0, 1.0, 1.0, 0.55) });
+                let word = if on { "On" } else { "Off" };
+                let size = fs(0.72);
+                let d = measure_text(word, Some(font), size, 1.0);
+                let wx = tx - 8.0 * s - d.width;
+                txt(word, wx + kick, base_y, size, Color::new(1.0, 1.0, 1.0, 0.9));
+                // Radio rows also show their brand mark, lit or dim.
+                let brand = match (page_number, opt) {
+                    (1, 6) => Some(&TILE_WIFI),
+                    (1, 7) => Some(&TILE_BLUETOOTH),
+                    _ => None,
+                };
+                if let Some(key) = brand {
+                    let g = 12.0 * s;
+                    key.with(|tex| {
+                        draw_texture_ex(tex, wx - 6.0 * s - g, ry + rh / 2.0 - g / 2.0,
+                            Color::new(1.0, 1.0, 1.0, if on { 0.85 } else { 0.25 }),
+                            DrawTextureParams { dest_size: Some(vec2(g, g)), ..Default::default() });
+                    });
+                }
+            }
+            SWidget::Percent => {
+                let size = fs(0.72);
+                let num_zone = 30.0 * s;
+                let d = measure_text(value, Some(font), size, 1.0);
+                txt(value, value_r - d.width + kick, base_y, size, Color::new(1.0, 1.0, 1.0, 0.9));
+                let meter_r = value_r - num_zone - 6.0 * s;
+                let meter_w = (list_w * 0.34).min(96.0) * s;
+                let gap = 1.2 * s;
+                let cw = (meter_w - 9.0 * gap) / 10.0;
+                let ch = 5.0 * s;
+                let cy = ry + rh / 2.0 - ch / 2.0;
+                // One cell per 10%, which is exactly the step every handler
+                // takes — so one press moves exactly one cell.
+                let frac = if focused {
+                    meter_disp
+                } else {
+                    value.trim_end_matches('%').parse::<f32>().unwrap_or(0.0) / 100.0
+                };
+                let filled = ((frac * 10.0).round() as i32).clamp(0, 10) as usize;
+                let fill_col = if focused {
+                    string_to_color(&config.cursor_color)
+                } else {
+                    Color::new(1.0, 1.0, 1.0, 0.92)
+                };
+                for i in 0..10 {
+                    let c = if i < filled { fill_col } else { Color::new(1.0, 1.0, 1.0, 0.16) };
+                    draw_rectangle(meter_r - meter_w + i as f32 * (cw + gap), cy, cw, ch, c);
+                }
+            }
+            SWidget::Step => {
+                let size = fs(0.72);
+                let word_zone = 44.0 * s;
+                let shown = s_value_case(value);
+                let d = measure_text(&shown, Some(font), size, 1.0);
+                txt(&shown, value_r - d.width + kick, base_y, size, Color::new(1.0, 1.0, 1.0, 0.9));
+                let steps = ["OFF", "SLOW", "NORMAL", "FAST"];
+                let filled = steps.iter().position(|v| *v == value.as_str()).unwrap_or(0);
+                let gap = 3.0 * s;
+                let cw = 10.0 * s;
+                let ch = 5.0 * s;
+                let cy = ry + rh / 2.0 - ch / 2.0;
+                let cells_r = value_r - word_zone - 6.0 * s;
+                let fill_col = if focused {
+                    string_to_color(&config.cursor_color)
+                } else {
+                    Color::new(1.0, 1.0, 1.0, 0.92)
+                };
+                for i in 0..3 {
+                    let c = if i < filled { fill_col } else { Color::new(1.0, 1.0, 1.0, 0.16) };
+                    draw_rectangle(cells_r - 3.0 * (cw + gap) + i as f32 * (cw + gap), cy, cw, ch, c);
+                }
+            }
+            SWidget::Action => {
+                let g = 12.0 * s;
+                LEGEND_ICONS.with(|icons| {
+                    draw_texture_ex(&icons[choices.legend as usize], value_r - g, ry + rh / 2.0 - g / 2.0,
+                        Color::new(1.0, 1.0, 1.0, 0.95),
+                        DrawTextureParams { dest_size: Some(vec2(g, g)), ..Default::default() });
+                });
+                let size = fs(0.72);
+                let d = measure_text("Confirm", Some(font), size, 1.0);
+                txt("Confirm", value_r - g - 6.0 * s - d.width, base_y, size, Color::new(1.0, 1.0, 1.0, 0.9));
+            }
+            SWidget::Swatch | SWidget::Aspect | SWidget::Enum => {
+                let shown = s_value_case(value);
+                let extra = if matches!(widget, SWidget::Enum) { 0.0 } else { 16.0 * s };
+                let (v, size) = fit(&shown, 0.76, list_w * s * 0.44 - extra);
+                let d = measure_text(&v, Some(font), size, 1.0);
+                let vx = value_r - d.width;
+                txt(&v, vx + kick, base_y, size, Color::new(1.0, 1.0, 1.0, 0.92));
+                match widget {
+                    SWidget::Swatch => {
+                        let sw = 10.0 * s;
+                        let sx = vx - 6.0 * s - sw;
+                        let sy = ry + rh / 2.0 - sw / 2.0;
+                        draw_rectangle(sx, sy, sw, sw, string_to_color(value));
+                        draw_rectangle_lines(sx, sy, sw, sw, 1.0 * s, Color::new(1.0, 1.0, 1.0, 0.30));
+                    }
+                    SWidget::Aspect => {
+                        let (aw, ah) = match value.as_str() {
+                            "4:3" => (18.0, 13.5),
+                            "16:10" => (18.0, 11.25),
+                            _ => (18.0, 10.125),
+                        };
+                        draw_rectangle_lines(vx - 6.0 * s - aw * s, ry + rh / 2.0 - ah * s / 2.0,
+                            aw * s, ah * s, 1.0 * s, Color::new(1.0, 1.0, 1.0, 0.55));
+                    }
+                    _ => {}
+                }
+            }
+            SWidget::Jump(_) => {}
+        }
+
+        if focused {
+            if val_flash > 0.0 {
+                draw_rectangle(rx, ry, rw, rh, Color::new(1.0, 1.0, 1.0, 0.14 * val_flash));
+            }
+            // Tighter halo than the dashboard's: an 18-unit bar needs the
+            // same ~11% proportion the 80-unit tiles get.
+            draw_focus_glow_ex(rx, ry, rw, rh, s, string_to_color(&config.cursor_color), 0.45, 1.0);
+        }
+    };
+
+    let draw_chip = |slot: usize, opt: usize, forward: bool, focused: bool| {
+        let k = if focused { ease_out((sel_anim / SEL_GROW_TIME).min(1.0)) } else { 0.0 };
+        let g = k * 1.0 * s; // half the gutter, so two chips never overlap
+        let slot_w = (list_w - 2.0) / 2.0;
+        let bx = (list_x + if slot == 0 { 0.0 } else { slot_w + 2.0 }) * s;
+        let rx = bx - g + row_slide(rows.len() + slot);
+        let ry = SET_CHIP_Y * s - g;
+        let rw = slot_w * s + g * 2.0;
+        let rh = SET_CHIP_H * s + g * 2.0;
+
+        if k > 0.01 {
+            draw_tile_shadow(rx, ry, rw, rh, s, k);
+        }
+        draw_rectangle(rx, ry, rw, rh, if focused { XBOX_GREEN } else { TILE_SLATE_ALT });
+        // Leading-edge bar on the side you're travelling toward.
+        let bar_w = 3.0 * s;
+        let bar_x = if forward { rx + rw - bar_w } else { rx };
+        draw_rectangle(bar_x, ry, bar_w, rh, if focused { WHITE } else { XBOX_GREEN });
+
+        let cy = ry + rh / 2.0;
+        let chev_x = if forward { rx + rw - 12.0 * s } else { rx + 12.0 * s };
+        let tipx = if forward { chev_x + 5.0 * s } else { chev_x - 5.0 * s };
+        draw_triangle(
+            vec2(tipx, cy),
+            vec2(chev_x, cy - 4.5 * s),
+            vec2(chev_x, cy + 4.5 * s),
+            Color::new(1.0, 1.0, 1.0, 0.92));
+
+        let (label, size) = fit(s_label(page_number, opt), 0.70, rw - 40.0 * s);
+        let d = measure_text(&label, Some(font), size, 1.0);
+        txt(&label, rx + (rw - d.width) / 2.0, cy + d.offset_y * 0.5, size,
+            if focused { WHITE } else { Color::new(1.0, 1.0, 1.0, 0.82) });
+
+        if focused {
+            let gi = 11.0 * s;
+            let ix = if forward { rx + 6.0 * s } else { rx + rw - 6.0 * s - gi };
+            LEGEND_ICONS.with(|icons| {
+                draw_texture_ex(&icons[choices.legend as usize], ix, cy - gi / 2.0, WHITE,
+                    DrawTextureParams { dest_size: Some(vec2(gi, gi)), ..Default::default() });
+            });
+            draw_focus_glow_ex(rx, ry, rw, rh, s, string_to_color(&config.cursor_color), 0.45, 1.0);
+        }
+    };
+
+    // Pass 1: everything at rest. Pass 2: the tile shrinking back. Pass 3:
+    // the focused element, on top.
+    for (slot, (opt, value)) in rows.iter().enumerate() {
+        if *opt != selection && Some(*opt) != prev_sel {
+            draw_row(slot, *opt, value, false, false);
+        }
+    }
+    // Back jumps take the left slot, forward jumps the right, so the chips
+    // read in the same order as the pages they lead to.
+    for (opt, forward) in chips.iter() {
+        if *opt != selection {
+            draw_chip(if *forward { 1 } else { 0 }, *opt, *forward, false);
+        }
+    }
+    if let Some(p) = prev_sel {
+        if let Some((slot, (opt, value))) = rows.iter().enumerate().find(|(_, (o, _))| *o == p) {
+            draw_row(slot, *opt, value, false, true);
+        }
+    }
+    if let Some((slot, (opt, value))) = rows.iter().enumerate().find(|(_, (o, _))| *o == selection) {
+        draw_row(slot, *opt, value, true, false);
+    }
+    if let Some((opt, forward)) = chips.iter().find(|(o, _)| *o == selection) {
+        draw_chip(if *forward { 1 } else { 0 }, *opt, *forward, true);
+    }
+
+    // --- Header: eyebrow, page tabs, bumper chevrons ---
+    let strip_y = 62.0 * s - (1.0 - ease_out(intro)) * 120.0 * s;
+    txt("settings", m * s, 36.0 * s - (1.0 - ease_out(intro)) * 120.0 * s, fs(0.80),
+        Color::new(1.0, 1.0, 1.0, 0.45));
+    {
+        const PAGES: [&str; 4] = ["general", "audio", "interface", "assets"];
+        // Measure first: a wide custom font could otherwise run the strip
+        // into the clock.
+        let mut strip_w = 0.0;
+        for (i, name) in PAGES.iter().enumerate() {
+            let size = fs(if i + 1 == page_number { 1.45 } else { 0.95 });
+            strip_w += measure_text(name, Some(font), size, 1.0).width + 13.0 * s;
+        }
+        let squeeze = {
+            let avail = w - (m + 110.0) * s;
+            if strip_w > avail && strip_w > 0.0 { avail / strip_w } else { 1.0 }
+        };
+        let mut x = m * s;
+        for (i, name) in PAGES.iter().enumerate() {
+            let active = i + 1 == page_number;
+            let size = ((fs(if active { 1.45 } else { 0.95 }) as f32 * squeeze) as u16).max(9);
+            txt(name, x, strip_y, size,
+                if active { WHITE } else { Color::new(1.0, 1.0, 1.0, 0.42) });
+            x += measure_text(name, Some(font), size, 1.0).width + 13.0 * s * squeeze;
+        }
+        let nudge = (get_time() as f32 * 2.4).sin() * 1.0 * s;
+        let cy = strip_y - 6.0 * s;
+        let chev = Color::new(1.0, 1.0, 1.0, 0.30);
+        draw_triangle(
+            vec2(m * s - 12.0 * s - nudge, cy),
+            vec2(m * s - 6.0 * s, cy - 4.0 * s),
+            vec2(m * s - 6.0 * s, cy + 4.0 * s), chev);
+        draw_triangle(
+            vec2(x + 6.0 * s + nudge, cy),
+            vec2(x, cy - 4.0 * s),
+            vec2(x, cy + 4.0 * s), chev);
+    }
+
+    // --- Legend, bottom right: what the buttons do here ---
+    {
+        let cy = 324.0 * s;
+        let icon_h = 18.0 * s;
+        let size = fs(0.80);
+        let a = overlay_a;
+        let leg = |text: &str, x: f32| {
+            let d = measure_text(text, Some(font), size, 1.0);
+            txt(text, x - d.width, cy + d.offset_y * 0.5, size, Color::new(1.0, 1.0, 1.0, 0.75 * a));
+            x - d.width
+        };
+        let back_x = leg("Back", w - 24.0 * s);
+        LEGEND_ICONS_BACK.with(|icons| {
+            draw_texture_ex(&icons[choices.legend as usize], back_x - 4.0 * s - icon_h, cy - icon_h / 2.0,
+                Color::new(1.0, 1.0, 1.0, a),
+                DrawTextureParams { dest_size: Some(vec2(icon_h, icon_h)), ..Default::default() });
+        });
+        let group_x = back_x - 4.0 * s - icon_h - 16.0 * s;
+        // Adjustable rows advertise left/right; everything else advertises
+        // Select — and rows with nothing to change advertise neither.
+        let adjustable = matches!(cur_widget,
+            SWidget::Toggle | SWidget::Percent | SWidget::Step | SWidget::Enum
+            | SWidget::Swatch | SWidget::Aspect)
+            && cur_choices.as_ref().map(|(l, _)| l.len() > 1).unwrap_or(matches!(cur_widget,
+                SWidget::Toggle | SWidget::Percent));
+        if adjustable {
+            let x = leg("Adjust", group_x);
+            let bx = x - 4.0 * s - icon_h;
+            let ccy = cy;
+            let c = Color::new(1.0, 1.0, 1.0, 0.75 * a);
+            let nudge = (get_time() as f32 * 2.4).sin() * 1.0 * s;
+            draw_triangle(
+                vec2(bx - nudge, ccy),
+                vec2(bx + 6.0 * s, ccy - 5.0 * s),
+                vec2(bx + 6.0 * s, ccy + 5.0 * s), c);
+            draw_triangle(
+                vec2(bx + icon_h + nudge, ccy),
+                vec2(bx + icon_h - 6.0 * s, ccy - 5.0 * s),
+                vec2(bx + icon_h - 6.0 * s, ccy + 5.0 * s), c);
+        } else if matches!(cur_widget, SWidget::Action | SWidget::Jump(_)) {
+            let x = leg("Select", group_x);
+            LEGEND_ICONS.with(|icons| {
+                draw_texture_ex(&icons[choices.legend as usize], x - 4.0 * s - icon_h, cy - icon_h / 2.0,
+                    Color::new(1.0, 1.0, 1.0, a),
+                    DrawTextureParams { dest_size: Some(vec2(icon_h, icon_h)), ..Default::default() });
+            });
+        }
+    }
+
+    // --- Bottom left: the shoulder buttons change page. Names follow the
+    // controller brand rather than assuming Xbox. ---
+    {
+        let (lb, rb) = match choices.legend {
+            LegendIcon::Keyboard => ("[", "]"),
+            LegendIcon::PlayStation => ("L1", "R1"),
+            LegendIcon::Switch | LegendIcon::Switch2 | LegendIcon::N64 => ("L", "R"),
+            _ => ("LB", "RB"),
+        };
+        let a = overlay_a;
+        let size = fs(0.62);
+        let cw = 15.0 * s;
+        let chh = 11.0 * s;
+        let cy = 318.0 * s;
+        for (i, name) in [lb, rb].iter().enumerate() {
+            let bx = (m + i as f32 * 18.0) * s;
+            draw_rectangle(bx, cy, cw, chh, Color::new(0.24, 0.25, 0.26, 0.85 * a));
+            let d = measure_text(name, Some(font), size, 1.0);
+            txt(name, bx + (cw - d.width) / 2.0, cy + chh / 2.0 + d.offset_y * 0.5, size,
+                Color::new(1.0, 1.0, 1.0, 0.85 * a));
+        }
+        txt("Page", (m + 38.0) * s, cy + chh / 2.0 + 3.0 * s, fs(0.68),
+            Color::new(1.0, 1.0, 1.0, 0.55 * a));
+    }
+
+    // The dashboard's own status furniture, minus the logo — a tall custom
+    // logo would otherwise land on the detail pane.
+    render_ui_overlay_alpha(logo_cache, font_cache, config, battery_info, current_time_str,
+        gcc_adapter_poll_rate, s, overlay_a, true, true);
+}
+
+// ===================================
+// METRO SAVE DATA SCREEN
+// ===================================
+
+/// Animation clocks for the save wall. Same shape as SettingsAnim: one
+/// thread_local, ticked from the draw call, nothing threaded through main.rs.
+struct SaveAnim {
+    last_draw: f64,
+    intro: f32,
+    sel: usize,
+    prev_sel: Option<usize>,
+    sel_anim: f32,
+    scroll: usize,
+    media: usize,
+    len: usize,
+    pop: f32,
+    pop_time: f32,
+    ul_x: f32,
+    ul_w: f32,
+    veil: f32,
+    legend: usize,
+}
+
+impl SaveAnim {
+    fn new() -> Self {
+        Self {
+            last_draw: -10.0, intro: 1.0, sel: usize::MAX, prev_sel: None, sel_anim: 1.0,
+            scroll: 0, media: usize::MAX, len: usize::MAX, pop: 1.0, pop_time: SAVE_POP_TIME,
+            ul_x: 0.0, ul_w: 0.0, veil: 0.0, legend: 0,
+        }
+    }
+}
+
+thread_local! {
+    static SAVE_ANIM: RefCell<SaveAnim> = RefCell::new(SaveAnim::new());
+}
+
+pub fn draw_save_data(
+    state: &MetroState,
+    selected_memory: usize,
+    memories: &[Memory],
+    icon_cache: &HashMap<String, Texture2D>,
+    logo_cache: &HashMap<String, Texture2D>,
+    font_cache: &HashMap<String, Font>,
+    config: &Config,
+    storage_state: &Arc<Mutex<StorageMediaState>>,
+    placeholder: &Texture2D,
+    scroll_offset: usize,
+    input_state: &InputState,
+    animation_state: &AnimationState,
+    playtime_cache: &mut PlaytimeCache,
+    size_cache: &mut SizeCache,
+    battery_info: &Option<BatteryInfo>,
+    current_time_str: &str,
+    gcc_adapter_poll_rate: &Option<u32>,
+    dialog_state: &DialogState,
+    s: f32,
+) {
+    let font = get_current_font(font_cache, config);
+    let w = screen_width();
+    let h = screen_height();
+    let w_du = w / s;
+
+    // Snapshot the storage list once and drop the guard — never hold a lock
+    // across a draw, and `media` can legitimately be empty on a console with
+    // no writable storage, so every later read goes through .get().
+    let (media_ids, media_free, media_sel) = storage_state
+        .lock()
+        .map(|st| {
+            (
+                st.media.iter().map(|d| d.id.clone()).collect::<Vec<_>>(),
+                st.media.iter().map(|d| d.free).collect::<Vec<_>>(),
+                st.selected,
+            )
+        })
+        .unwrap_or_default();
+
+    // Same frame the settings screen uses, so the wall lines up with the
+    // dashboard's tiles at every aspect ratio.
+    let m = ORIGIN_X;
+    let small_w = 80.0 * (185.0 / 131.0);
+    let grid_right = m + 4.0 * small_w + 3.0 * 2.0;
+    let content_r = grid_right.min(w_du - m);
+    let content_w = content_r - m;
+    let tile_w = (content_w - (SAVE_COLS as f32 - 1.0) * SAVE_GAP) / SAVE_COLS as f32;
+
+    let grid_focus = input_state.ui_focus == UIFocus::Grid;
+    let page_len = memories.len().saturating_sub(SAVE_COLS * scroll_offset);
+    let on_page = page_len.min(SAVE_COLS * SAVE_ROWS);
+    let rows_total = (memories.len() + SAVE_COLS - 1) / SAVE_COLS;
+
+    let legend_now = match input_state.last_source {
+        InputSource::Keyboard => LegendIcon::Keyboard,
+        InputSource::Pad => pad_legend_icon(input_state.pad_vendor, &input_state.pad_name),
+    };
+
+    // --- Clocks: one borrow, tick everything, hand back plain values ---
+    let (intro, sel_anim, prev_sel, pop, veil) = SAVE_ANIM.with(|cell| {
+        let mut a = cell.borrow_mut();
+        let now = get_time();
+        let dt = get_frame_time();
+        // Frame-relative, because this screen awaits a texture load per frame
+        // while icons are still warming up; a fixed threshold would either
+        // restart the cascade mid-flight or skip it entirely.
+        let fresh = now - a.last_draw > (dt as f64 * 3.0).max(0.35);
+        a.last_draw = now;
+
+        if fresh {
+            a.intro = 0.0;
+            a.pop = 1.0;
+            a.sel = selected_memory;
+            a.prev_sel = None;
+            a.sel_anim = 1.0;
+            a.veil = 0.0;
+            a.media = media_sel;
+            a.len = memories.len();
+            a.scroll = scroll_offset;
+        }
+        if selected_memory != a.sel {
+            a.prev_sel = Some(a.sel);
+            a.sel = selected_memory;
+            a.sel_anim = 0.0;
+        }
+        if scroll_offset != a.scroll {
+            a.scroll = scroll_offset;
+            a.pop = 0.0;
+            a.pop_time = SAVE_POP_TIME;
+        }
+        if memories.len() != a.len {
+            a.len = memories.len();
+            a.pop = 0.0;
+            a.pop_time = SAVE_POP_TIME;
+        }
+        if media_sel != a.media {
+            a.media = media_sel;
+            a.pop = 0.0;
+            a.pop_time = SAVE_MEDIA_TIME;
+        }
+
+        // Clamp dt so one long frame (an icon decode) can't eat the cascade.
+        let step = dt.min(0.05);
+        a.intro = (a.intro + step / SAVE_INTRO_TIME).min(1.0);
+        a.sel_anim = (a.sel_anim + step).min(1.0);
+        a.pop = (a.pop + step / a.pop_time).min(1.0);
+
+        let d = match dialog_state {
+            DialogState::Opening => smoothstep(animation_state.dialog_transition_progress),
+            DialogState::Open => 1.0,
+            DialogState::Closing => 1.0 - smoothstep(animation_state.dialog_transition_progress),
+            DialogState::None => 0.0,
+        };
+        let target = 0.6 * d;
+        a.veil += (target - a.veil) * (dt / 0.08).min(1.0);
+
+        a.legend = legend_now as usize;
+        (a.intro, a.sel_anim, a.prev_sel, a.pop, a.veil)
+    });
+
+    let overlay_a = ease_out_sine(((intro - 0.18) / 0.25).clamp(0.0, 1.0));
+    let header_drop = (1.0 - ease_out(intro)) * 120.0 * s;
+
+    // --- Text helpers (device pixels throughout) ---
+    let txt = |text: &str, x: f32, y: f32, size: u16, color: Color| {
+        let so = 1.0 * (size as f32 / FONT_SIZE as f32);
+        draw_text_ex(text, x + so, y + so, TextParams {
+            font: Some(font), font_size: size,
+            color: Color::new(0.0, 0.0, 0.0, 0.85 * color.a), ..Default::default()
+        });
+        draw_text_ex(text, x, y, TextParams {
+            font: Some(font), font_size: size, color, ..Default::default()
+        });
+    };
+    let fs = |k: f32| ((FONT_SIZE as f32 * s * k) as u16).max(9);
+    let fit = |text: &str, k: f32, max_w: f32| -> (String, u16) {
+        let mut size = fs(k);
+        let d = measure_text(text, Some(font), size, 1.0);
+        if d.width > max_w && d.width > 0.0 {
+            size = (((size as f32) * max_w / d.width).floor() as u16).max(9);
+        }
+        let mut out = text.to_string();
+        if measure_text(&out, Some(font), size, 1.0).width > max_w {
+            while out.chars().count() > 1
+                && measure_text(&format!("{}…", out), Some(font), size, 1.0).width > max_w
+            {
+                out.pop();
+            }
+            out.push('…');
+        }
+        (out, size)
+    };
+
+    // --- Background continuity: main.rs already drew the theme background
+    // immediately before this call, so we never redraw it. The bokeh keeps
+    // drifting in the field the dashboard left it in. ---
+    draw_rectangle(0.0, 0.0, w, h, Color::new(0.0, 0.0, 0.0, 0.35));
+    FADE_TEX.with(|tex| {
+        draw_texture_ex(tex, 0.0, 0.0, Color::new(0.0, 0.0, 0.0, 0.35), DrawTextureParams {
+            dest_size: Some(vec2(w, 100.0 * s)), flip_y: true, ..Default::default()
+        });
+        draw_texture_ex(tex, 0.0, h - 70.0 * s, Color::new(0.0, 0.0, 0.0, 0.45), DrawTextureParams {
+            dest_size: Some(vec2(w, 70.0 * s)), ..Default::default()
+        });
+    });
+    if config.background_particles == "ON" {
+        // The dashboard's outro collapsed the motes toward bottom-centre; feed
+        // this screen's own intro so they fly back out instead of snapping.
+        draw_bokeh(state, ease_out(intro), s);
+    }
+
+    // --- Header: eyebrow + storage tab strip ---
+    txt("save data", m * s, 36.0 * s - header_drop, fs(0.80), Color::new(1.0, 1.0, 1.0, 0.45));
+    let strip_y = 62.0 * s - header_drop;
+    let shake = (animation_state.calculate_shake_offset(ShakeTarget::LeftArrow)
+        + animation_state.calculate_shake_offset(ShakeTarget::RightArrow)) * s;
+    let mut active_ul = (m * s, 0.0);
+    if media_ids.is_empty() {
+        txt("no storage", m * s + shake, strip_y, fs(1.45), Color::new(1.0, 1.0, 1.0, 0.35));
+    } else {
+        let names: Vec<String> = media_ids.iter().map(|id| id.to_lowercase().replace('_', " ")).collect();
+        let mut strip_w = 0.0;
+        for (i, n) in names.iter().enumerate() {
+            let size = fs(if i == media_sel { 1.45 } else { 0.95 });
+            strip_w += measure_text(n, Some(font), size, 1.0).width + 13.0 * s;
+        }
+        let avail = w - (m + 110.0) * s;
+        let squeeze = if strip_w > avail && strip_w > 0.0 { avail / strip_w } else { 1.0 };
+        let mut x = m * s + shake;
+        for (i, n) in names.iter().enumerate() {
+            let active = i == media_sel;
+            let size = ((fs(if active { 1.45 } else { 0.95 }) as f32 * squeeze) as u16).max(9);
+            let d = measure_text(n, Some(font), size, 1.0);
+            if active {
+                active_ul = (x, d.width);
+                if !grid_focus {
+                    // The strip has the cursor: back it with a plate and glow.
+                    let px = x - 7.0 * s;
+                    let py = strip_y - 16.0 * s;
+                    let pw2 = d.width + 14.0 * s;
+                    let ph2 = 24.0 * s;
+                    draw_rectangle(px, py, pw2, ph2, Color::new(0.30, 0.31, 0.33, 0.55));
+                    draw_focus_glow_ex(px, py, pw2, ph2, s,
+                        string_to_color(&config.cursor_color), 0.45, 1.0);
+                }
+            }
+            let col = if active {
+                WHITE
+            } else if grid_focus {
+                Color::new(1.0, 1.0, 1.0, 0.42)
+            } else {
+                Color::new(1.0, 1.0, 1.0, 0.60)
+            };
+            txt(n, x, strip_y, size, col);
+            x += d.width + 13.0 * s * squeeze;
+        }
+        if media_ids.len() > 1 {
+            let nudge = (get_time() as f32 * 2.4).sin() * 1.0 * s;
+            let cy = strip_y - 6.0 * s;
+            let dim = |on: bool| if on { Color::new(1.0, 1.0, 1.0, 0.30) } else { Color::new(1.0, 1.0, 1.0, 0.10) };
+            draw_triangle(
+                vec2(m * s - 12.0 * s - nudge + shake, cy),
+                vec2(m * s - 6.0 * s + shake, cy - 4.0 * s),
+                vec2(m * s - 6.0 * s + shake, cy + 4.0 * s), dim(media_sel > 0));
+            draw_triangle(
+                vec2(x + 6.0 * s + nudge, cy),
+                vec2(x, cy - 4.0 * s),
+                vec2(x, cy + 4.0 * s), dim(media_sel + 1 < media_ids.len()));
+        }
+    }
+    // The active-medium underline slides rather than teleports, so a storage
+    // switch reads as motion instead of a repaint.
+    let (ul_x, ul_w) = SAVE_ANIM.with(|cell| {
+        let mut a = cell.borrow_mut();
+        if a.ul_w <= 0.0 {
+            a.ul_x = active_ul.0;
+            a.ul_w = active_ul.1;
+        }
+        let k = (get_frame_time() / 0.09).min(1.0);
+        a.ul_x += (active_ul.0 - a.ul_x) * k;
+        a.ul_w += (active_ul.1 - a.ul_w) * k;
+        (a.ul_x, a.ul_w)
+    });
+    if !media_ids.is_empty() && ul_w > 0.0 {
+        let (bar_h, bar_col) = if grid_focus {
+            (2.0 * s, XBOX_GREEN)
+        } else {
+            (3.0 * s, string_to_color(&config.cursor_color))
+        };
+        draw_rectangle(ul_x, strip_y + 5.0 * s, ul_w, bar_h, bar_col);
+    }
+
+    // Sub-caption: free space on the left, page range on the right.
+    if let Some(free) = media_free.get(media_sel) {
+        let free_txt = if *free >= 1024 {
+            format!("{:.1} GB free", *free as f32 / 1024.0)
+        } else {
+            format!("{} MB free", free)
+        };
+        txt(&free_txt, m * s, 82.0 * s - header_drop, fs(0.72), Color::new(1.0, 1.0, 1.0, 0.55));
+    }
+    if memories.len() > SAVE_COLS * SAVE_ROWS {
+        let first = scroll_offset * SAVE_COLS + 1;
+        let last = (first + SAVE_COLS * SAVE_ROWS - 1).min(memories.len());
+        let label = format!("{}–{} of {}", first, last, memories.len());
+        let d = measure_text(&label, Some(font), fs(0.72), 1.0);
+        txt(&label, content_r * s - d.width, 82.0 * s - header_drop, fs(0.72),
+            Color::new(1.0, 1.0, 1.0, 0.45));
+    }
+
+    // --- The wall. Tiles fly in along the same rays the dashboard's Save Data
+    // tile threw its icons out on, so the burst you just watched reassembles
+    // into this grid. ---
+    let burst_origin = {
+        let r = tile_rect(&TABS[0].tiles[0], TABS[0].tiles, ORIGIN_X * s, 112.0 * s, s);
+        vec2(r.x + r.w / 2.0, r.y + r.h / 2.0)
+    };
+    let slot_rect = |i: usize| -> (f32, f32) {
+        let col = (i % SAVE_COLS) as f32;
+        let row = (i / SAVE_COLS) as f32;
+        (
+            (m + col * (tile_w + SAVE_GAP)) * s,
+            (SAVE_GRID_TOP + row * (SAVE_TILE_H + SAVE_GAP)) * s,
+        )
+    };
+    let tw = tile_w * s;
+    let th = SAVE_TILE_H * s;
+
+    // Entry wave per slot, plus the gentler reflow wave for scrolls and list
+    // changes.
+    let entry = |i: usize| -> (f32, Vec2, f32) {
+        let q = ease_out(((intro - i as f32 * 0.028) / 0.62).clamp(0.0, 1.0));
+        let (x, y) = slot_rect(i);
+        let c = vec2(x + tw * 0.5, y + th * 0.5);
+        let mut dir = (c - burst_origin).normalize_or_zero();
+        if dir == Vec2::ZERO {
+            dir = vec2(0.0, -1.0);
+        }
+        let dist = (1.0 - q) * (240.0 + (i % 3) as f32 * 70.0) * s;
+        (q, vec2(dir.x * dist, dir.y * dist * 0.8), q)
+    };
+    let reflow = |i: usize| -> f32 {
+        ease_out(((pop - (i % SAVE_COLS) as f32 * 0.012 - (i / SAVE_COLS) as f32 * 0.030) / 0.55)
+            .clamp(0.0, 1.0))
+    };
+
+    let draw_slot = |i: usize, focused: bool, shrinking: bool| {
+        let (q, off, tile_alpha) = entry(i);
+        let p = reflow(i);
+        let (bx, by) = slot_rect(i);
+        let occupied = i < on_page;
+        let mem = memories.get(SAVE_COLS * scroll_offset + i);
+
+        let scale = if focused {
+            1.0 + (SEL_SCALE - 1.0) * ease_out((sel_anim / SEL_GROW_TIME).min(1.0))
+        } else if shrinking {
+            1.0 + (SEL_SCALE - 1.0) * (1.0 - ease_out_sine((sel_anim / SEL_SHRINK_TIME).min(1.0)))
+        } else {
+            1.0
+        };
+        let assemble = (0.90 + 0.10 * q) * (0.92 + 0.08 * p);
+        let sc = scale * assemble;
+        let ghost_pull = if occupied { 1.0 } else { 0.5 };
+        let cx = bx + tw * 0.5 + off.x * ghost_pull;
+        let cy = by + th * 0.5 + off.y * ghost_pull + (1.0 - p) * 8.0 * s;
+        let rw = tw * sc;
+        let rh = th * sc;
+        let rx = cx - rw * 0.5;
+        let ry = cy - rh * 0.5;
+        let alpha = tile_alpha * p * if occupied { 1.0 } else { 0.5 };
+        if alpha <= 0.01 {
+            return;
+        }
+
+        if !occupied {
+            // Empty slot: just a whisper of a plate, so the wall reads as a
+            // card with capacity rather than a void.
+            draw_rectangle(rx, ry, rw, rh, Color::new(1.0, 1.0, 1.0, 0.045 * alpha));
+            return;
+        }
+
+        let lift = ((scale - 1.0) / (SEL_SCALE - 1.0)).clamp(0.0, 1.0);
+        if lift > 0.01 {
+            draw_tile_shadow(rx, ry, rw, rh, s, lift);
+        }
+        let col = i % SAVE_COLS;
+        let row = i / SAVE_COLS;
+        let fill = if focused {
+            TILE_FOCUS
+        } else if (col + row) % 2 == 0 {
+            TILE_SLATE
+        } else {
+            TILE_SLATE_ALT
+        };
+        draw_rectangle(rx, ry, rw, rh, Color::new(fill.r, fill.g, fill.b, alpha));
+
+        // Icon on the pixel grid: a fixed integer size regardless of the
+        // tile's focus scale, so nearest-neighbour never drops rows on the
+        // one tile you're looking at.
+        if let Some(mem) = mem {
+            let icon = icon_cache.get(&mem.id).unwrap_or(placeholder);
+            icon.set_filter(FilterMode::Nearest);
+            let ip = (32.0 * s).round();
+            let iq = 1.0 + 1.4 * (1.0 - q);
+            let isz = (ip * iq).round();
+            draw_texture_ex(
+                icon,
+                (rx + (rw - isz) * 0.5).round(),
+                (ry + 6.0 * s * sc).round(),
+                Color::new(1.0, 1.0, 1.0, q.powf(0.6) * p),
+                DrawTextureParams { dest_size: Some(vec2(isz, isz)), ..Default::default() },
+            );
+        }
+
+        FADE_TEX.with(|tex| {
+            draw_texture_ex(tex, rx, ry + rh - rh * 0.30, Color::new(0.0, 0.0, 0.0, 0.72 * alpha),
+                DrawTextureParams { dest_size: Some(vec2(rw, rh * 0.30)), ..Default::default() });
+        });
+
+        if let Some(mem) = mem {
+            // An absent OR empty Name attribute both fall back to the id, so a
+            // tile is never nameless.
+            let name = mem.name.clone().filter(|n| !n.trim().is_empty())
+                .unwrap_or_else(|| mem.id.clone());
+            let (label, size) = fit(&name, 0.72, rw - 12.0 * s);
+            let c = if focused { 1.0 } else { 0.82 };
+            txt(&label, rx + 6.0 * s, ry + rh - 6.0 * s, size, Color::new(1.0, 1.0, 1.0, c * alpha));
+        }
+
+        if focused && grid_focus {
+            draw_focus_glow_ex(rx, ry, rw, rh, s, string_to_color(&config.cursor_color), 0.75, 1.5);
+        }
+    };
+
+    // Ghosts first, then resting tiles, then the one shrinking back, then the
+    // focused tile last so it overlaps its neighbours.
+    for i in on_page..(SAVE_COLS * SAVE_ROWS) {
+        draw_slot(i, false, false);
+    }
+    for i in 0..on_page {
+        if i != selected_memory && Some(i) != prev_sel {
+            draw_slot(i, false, false);
+        }
+    }
+    if let Some(p) = prev_sel {
+        if p < on_page && p != selected_memory {
+            draw_slot(p, false, true);
+        }
+    }
+    if selected_memory < on_page {
+        draw_slot(selected_memory, true, false);
+    }
+
+    // Scroll rail and overflow chevrons.
+    if rows_total > SAVE_ROWS {
+        let rail_x = (content_r + 6.0) * s;
+        let rail_y = SAVE_GRID_TOP * s;
+        let rail_h = (SAVE_ROWS as f32 * SAVE_TILE_H + (SAVE_ROWS as f32 - 1.0) * SAVE_GAP) * s;
+        let a = ease_out(intro);
+        draw_rectangle(rail_x, rail_y, 3.0 * s, rail_h, Color::new(1.0, 1.0, 1.0, 0.10 * a));
+        let thumb_h = (rail_h * SAVE_ROWS as f32 / rows_total as f32).max(18.0 * s);
+        let span = (rows_total - SAVE_ROWS) as f32;
+        let ty = rail_y + (rail_h - thumb_h) * (scroll_offset as f32 / span.max(1.0));
+        let tc = if grid_focus { string_to_color(&config.cursor_color) } else { Color::new(1.0, 1.0, 1.0, 1.0) };
+        draw_rectangle(rail_x, ty, 3.0 * s, thumb_h, Color::new(tc.r, tc.g, tc.b, 0.75 * a));
+
+        let nudge = (get_time() as f32 * 2.4).sin() * 1.0 * s;
+        let mid = (m + content_w * 0.5) * s;
+        let chev = Color::new(1.0, 1.0, 1.0, 0.50 * a);
+        if scroll_offset > 0 {
+            let cy = 84.0 * s;
+            draw_triangle(vec2(mid, cy - 4.0 * s - nudge), vec2(mid - 4.0 * s, cy), vec2(mid + 4.0 * s, cy), chev);
+        }
+        if SAVE_COLS * (SAVE_ROWS + scroll_offset) < memories.len() {
+            let cy = 266.0 * s;
+            draw_triangle(vec2(mid, cy + 4.0 * s + nudge), vec2(mid - 4.0 * s, cy), vec2(mid + 4.0 * s, cy), chev);
+        }
+    }
+
+    // --- Detail bar: the Play hero's translucent bar, describing whatever
+    // holds the cursor ---
+    {
+        let bar_rise = (1.0 - ease_out((intro / 0.40).min(1.0))) * 70.0 * s;
+        let bx = m * s;
+        let by = 270.0 * s + bar_rise;
+        let bw = content_w * s;
+        let bh = 36.0 * s;
+        let a = ease_out(intro);
+        draw_rectangle(bx, by, bw, bh, Color::new(0.0, 0.0, 0.0, 0.55 * a));
+        FADE_TEX.with(|tex| {
+            draw_texture_ex(tex, bx, by, Color::new(1.0, 1.0, 1.0, 0.06 * a), DrawTextureParams {
+                dest_size: Some(vec2(bw, 7.2 * s)), flip_y: true, ..Default::default()
+            });
+        });
+        draw_rectangle(bx, by, 3.0 * s, bh, Color::new(XBOX_GREEN.r, XBOX_GREEN.g, XBOX_GREEN.b, a));
+
+        let name_x = bx + 48.0 * s;
+        let kick = (1.0 - (sel_anim / 0.12).min(1.0)) * 4.0 * s;
+        let text_a = (0.35 + 0.65 * (sel_anim / 0.12).min(1.0)) * a;
+        let mem = if grid_focus {
+            memories.get(SAVE_COLS * scroll_offset + selected_memory)
+        } else {
+            None
+        };
+
+        let (title, meta, right_top) = if let Some(mem) = mem {
+            let icon = icon_cache.get(&mem.id).unwrap_or(placeholder);
+            icon.set_filter(FilterMode::Nearest);
+            let ip = (26.0 * s).round();
+            draw_texture_ex(icon, bx + 12.0 * s, by + 5.0 * s, Color::new(1.0, 1.0, 1.0, a),
+                DrawTextureParams { dest_size: Some(vec2(ip, ip)), ..Default::default() });
+            // An absent OR empty Name attribute both fall back to the id, so a
+            // tile is never nameless.
+            let name = mem.name.clone().filter(|n| !n.trim().is_empty())
+                .unwrap_or_else(|| mem.id.clone());
+            (
+                name,
+                format!(
+                    "{:.1} MB  ·  {:.1} h  ·  {}",
+                    get_game_size(mem, size_cache),
+                    get_game_playtime(mem, playtime_cache),
+                    mem.drive_name.to_lowercase()
+                ),
+                media_free.get(media_sel).map(|f| if *f >= 1024 {
+                    format!("{:.1} GB free", *f as f32 / 1024.0)
+                } else {
+                    format!("{} MB free", f)
+                }).unwrap_or_default(),
+            )
+        } else if media_ids.is_empty() {
+            ("No storage detected".to_string(), "Insert a card or restart the console".to_string(), String::new())
+        } else if !grid_focus {
+            // The strip holds the cursor: the bar describes the device.
+            let id = media_ids.get(media_sel).cloned().unwrap_or_default();
+            if id.to_lowercase() == "internal" {
+                draw_rectangle(bx + 12.0 * s, by + 11.0 * s, 20.0 * s, 14.0 * s, Color::new(1.0, 1.0, 1.0, 0.85 * a));
+                draw_rectangle(bx + 15.0 * s, by + 14.0 * s, 14.0 * s, 1.0 * s, Color::new(0.15, 0.15, 0.15, a));
+                draw_rectangle(bx + 15.0 * s, by + 17.0 * s, 14.0 * s, 1.0 * s, Color::new(0.15, 0.15, 0.15, a));
+            } else {
+                let ip = (26.0 * s).round();
+                draw_texture_ex(&state.badge_sd, bx + 12.0 * s, by + 5.0 * s,
+                    Color::new(1.0, 1.0, 1.0, 0.85 * a),
+                    DrawTextureParams { dest_size: Some(vec2(ip, ip)), ..Default::default() });
+            }
+            (
+                id.to_lowercase(),
+                format!("{} saves", memories.len()),
+                media_free.get(media_sel).map(|f| if *f >= 1024 {
+                    format!("{:.1} GB free", *f as f32 / 1024.0)
+                } else {
+                    format!("{} MB free", f)
+                }).unwrap_or_default(),
+            )
+        } else {
+            let id = media_ids.get(media_sel).cloned().unwrap_or_default();
+            ("No save data".to_string(), format!("on {}", id.to_lowercase()), "0 saves".to_string())
+        };
+
+        let (t, tsize) = fit(&title, 1.10, bw - 200.0 * s);
+        txt(&t, name_x + kick, by + 18.0 * s, tsize, Color::new(1.0, 1.0, 1.0, 0.95 * text_a));
+        let (mt, msize) = fit(&meta, 0.72, bw - 200.0 * s);
+        txt(&mt, name_x + kick, by + 31.0 * s, msize, Color::new(1.0, 1.0, 1.0, 0.62 * text_a));
+        if !right_top.is_empty() {
+            let d = measure_text(&right_top, Some(font), fs(0.85), 1.0);
+            txt(&right_top, bx + bw - 12.0 * s - d.width, by + 18.0 * s, fs(0.85),
+                Color::new(1.0, 1.0, 1.0, 0.88 * a));
+        }
+        let counter = if grid_focus && !memories.is_empty() {
+            format!("save {} of {}", SAVE_COLS * scroll_offset + selected_memory + 1, memories.len())
+        } else if !grid_focus && !media_ids.is_empty() {
+            format!("storage {} of {}", media_sel + 1, media_ids.len())
+        } else {
+            String::new()
+        };
+        if !counter.is_empty() {
+            let d = measure_text(&counter, Some(font), fs(0.72), 1.0);
+            txt(&counter, bx + bw - 12.0 * s - d.width, by + 31.0 * s, fs(0.72),
+                Color::new(1.0, 1.0, 1.0, 0.45 * a));
+        }
+    }
+
+    // --- Legend, suppressed while a dialog owns the screen ---
+    if *dialog_state == DialogState::None {
+        let cy = 324.0 * s;
+        let icon_h = 18.0 * s;
+        let size = fs(0.80);
+        let leg = |text: &str, x: f32| -> f32 {
+            let d = measure_text(text, Some(font), size, 1.0);
+            txt(text, x - d.width, cy + d.offset_y * 0.5, size, Color::new(1.0, 1.0, 1.0, 0.75 * overlay_a));
+            x - d.width
+        };
+        let back_x = leg("Back", w - 24.0 * s);
+        LEGEND_ICONS_BACK.with(|icons| {
+            draw_texture_ex(&icons[legend_now as usize], back_x - 4.0 * s - icon_h, cy - icon_h / 2.0,
+                Color::new(1.0, 1.0, 1.0, overlay_a),
+                DrawTextureParams { dest_size: Some(vec2(icon_h, icon_h)), ..Default::default() });
+        });
+        let mut gx = back_x - 4.0 * s - icon_h - 16.0 * s;
+        if grid_focus && !memories.is_empty() {
+            let x = leg("Manage", gx);
+            LEGEND_ICONS.with(|icons| {
+                draw_texture_ex(&icons[legend_now as usize], x - 4.0 * s - icon_h, cy - icon_h / 2.0,
+                    Color::new(1.0, 1.0, 1.0, overlay_a),
+                    DrawTextureParams { dest_size: Some(vec2(icon_h, icon_h)), ..Default::default() });
+            });
+            gx = x - 4.0 * s - icon_h - 16.0 * s;
+        }
+        if !grid_focus && media_ids.len() > 1 {
+            let x = leg("Storage", gx);
+            let bx2 = x - 4.0 * s - icon_h;
+            let c = Color::new(1.0, 1.0, 1.0, 0.75 * overlay_a);
+            let nudge = (get_time() as f32 * 2.4).sin() * 1.0 * s;
+            draw_triangle(vec2(bx2 - nudge, cy), vec2(bx2 + 6.0 * s, cy - 5.0 * s), vec2(bx2 + 6.0 * s, cy + 5.0 * s), c);
+            draw_triangle(vec2(bx2 + icon_h + nudge, cy), vec2(bx2 + icon_h - 6.0 * s, cy - 5.0 * s), vec2(bx2 + icon_h - 6.0 * s, cy + 5.0 * s), c);
+        }
+
+        // Shoulder hint, same geometry as the settings screen so the two line up.
+        if media_ids.len() > 1 {
+            let (lb, rb) = match legend_now {
+                LegendIcon::Keyboard => ("[", "]"),
+                LegendIcon::PlayStation => ("L1", "R1"),
+                LegendIcon::Switch | LegendIcon::Switch2 | LegendIcon::N64 => ("L", "R"),
+                _ => ("LB", "RB"),
+            };
+            let psize = fs(0.62);
+            let cw = 15.0 * s;
+            let chh = 11.0 * s;
+            let pcy = 318.0 * s;
+            for (i, name) in [lb, rb].iter().enumerate() {
+                let px2 = (m + i as f32 * 18.0) * s;
+                draw_rectangle(px2, pcy, cw, chh, Color::new(0.24, 0.25, 0.26, 0.85 * overlay_a));
+                let d = measure_text(name, Some(font), psize, 1.0);
+                txt(name, px2 + (cw - d.width) / 2.0, pcy + chh / 2.0 + d.offset_y * 0.5, psize,
+                    Color::new(1.0, 1.0, 1.0, 0.85 * overlay_a));
+            }
+            txt("Storage", (m + 38.0) * s, pcy + chh / 2.0 + 3.0 * s, fs(0.68),
+                Color::new(1.0, 1.0, 1.0, 0.55 * overlay_a));
+        }
+    }
+
+    render_ui_overlay_alpha(logo_cache, font_cache, config, battery_info, current_time_str,
+        gcc_adapter_poll_rate, s, overlay_a, true, true);
+
+    // Veil under any dialog, eased so even the delete path (which jumps
+    // straight back to None with no transition) fades rather than snaps.
+    if veil > 0.001 {
+        draw_rectangle(0.0, 0.0, w, h, Color::new(0.0, 0.0, 0.0, veil));
+    }
+}
+
+/// Metro sheet for the save dialogs: manage, copy-to, confirm-delete, the
+/// already-exists notice, errors, and the copy progress meter. The dialog
+/// constructors in ui/dialog.rs are untouched — same ids, same option values,
+/// same default selections — so update() behaves exactly as before.
+pub fn draw_save_dialog(
+    dialog: &Dialog,
+    memories: &[Memory],
+    selected_memory: usize,
+    icon_cache: &HashMap<String, Texture2D>,
+    font_cache: &HashMap<String, Font>,
+    config: &Config,
+    copy_op_state: &Arc<Mutex<CopyOperationState>>,
+    placeholder: &Texture2D,
+    scroll_offset: usize,
+    storage_state: &Arc<Mutex<StorageMediaState>>,
+    animation_state: &AnimationState,
+    playtime_cache: &mut PlaytimeCache,
+    size_cache: &mut SizeCache,
+    s: f32,
+) {
+    let font = get_current_font(font_cache, config);
+    let w = screen_width();
+    let h = screen_height();
+    let txt = |text: &str, x: f32, y: f32, size: u16, color: Color| {
+        let so = 1.0 * (size as f32 / FONT_SIZE as f32);
+        draw_text_ex(text, x + so, y + so, TextParams {
+            font: Some(font), font_size: size,
+            color: Color::new(0.0, 0.0, 0.0, 0.85 * color.a), ..Default::default()
+        });
+        draw_text_ex(text, x, y, TextParams {
+            font: Some(font), font_size: size, color, ..Default::default()
+        });
+    };
+    let fs = |k: f32| ((FONT_SIZE as f32 * s * k) as u16).max(9);
+    let fit = |text: &str, k: f32, max_w: f32| -> (String, u16) {
+        let mut size = fs(k);
+        let d = measure_text(text, Some(font), size, 1.0);
+        if d.width > max_w && d.width > 0.0 {
+            size = (((size as f32) * max_w / d.width).floor() as u16).max(9);
+        }
+        let mut out = text.to_string();
+        if measure_text(&out, Some(font), size, 1.0).width > max_w {
+            while out.chars().count() > 1
+                && measure_text(&format!("{}…", out), Some(font), size, 1.0).width > max_w
+            {
+                out.pop();
+            }
+            out.push('…');
+        }
+        (out, size)
+    };
+
+    // Snapshot once: `running` flips from the copy worker thread and a
+    // mid-frame change would draw a sheet with neither rows nor meter.
+    let (copy_progress, copy_running) = copy_op_state
+        .lock()
+        .map(|st| (st.progress, st.running))
+        .unwrap_or((0, false));
+    let legend = SAVE_ANIM.with(|c| c.borrow().legend);
+    // Local index: ui/mod.rs's get_memory_index is hard-wired to the classic
+    // 13-wide grid and would name a different save here.
+    let memory_index = selected_memory + SAVE_COLS * scroll_offset;
+    let subject = memories.get(memory_index);
+
+    let destructive = dialog.id == "confirm_delete" || dialog.id == "error";
+    let eyebrow = match dialog.id.as_str() {
+        "main" => "manage",
+        "copy_storage_select" => "copy to",
+        "confirm_delete" => "delete",
+        "save_exists" => "notice",
+        _ => "error",
+    };
+
+    // --- Sheet geometry ---
+    let pw = 320.0;
+    let pwd = pw * s;
+    let px = (w - pwd) / 2.0;
+    let desc_lines: Vec<String> = match &dialog.desc {
+        Some(d) => {
+            let size = fs(0.90);
+            let max_w = (pw - 32.0) * s;
+            let mut out = Vec::new();
+            let mut line = String::new();
+            for word in d.split_whitespace() {
+                let probe = if line.is_empty() { word.to_string() } else { format!("{} {}", line, word) };
+                if measure_text(&probe, Some(font), size, 1.0).width <= max_w {
+                    line = probe;
+                } else {
+                    out.push(std::mem::take(&mut line));
+                    line = word.to_string();
+                }
+            }
+            if !line.is_empty() {
+                out.push(line);
+            }
+            out.truncate(4);
+            out
+        }
+        None => Vec::new(),
+    };
+    let desc_h = if desc_lines.is_empty() { 0.0 } else { desc_lines.len() as f32 * 14.0 + 8.0 };
+    let n = dialog.options.len().max(1) as f32;
+    // Pitch shrinks rather than letting the sheet run off screen when a
+    // console has many mounted media.
+    let pitch = if copy_running { 27.0 } else { ((340.0 - 66.0 - desc_h - 16.0) / n).clamp(18.0, 27.0) };
+    let block_h = if copy_running { 60.0 } else { n * pitch - 3.0 };
+    let ph = (66.0 + desc_h + block_h + 16.0).min(340.0);
+    let phd = ph * s;
+    let py = (h - phd) / 2.0;
+
+    draw_tile_shadow(px, py, pwd, phd, s, 1.0);
+    draw_rectangle(px, py, pwd, phd, TILE_SLATE);
+    FADE_TEX.with(|tex| {
+        draw_texture_ex(tex, px, py, Color::new(1.0, 1.0, 1.0, 0.20), DrawTextureParams {
+            dest_size: Some(vec2(pwd, phd * 0.16)), flip_y: true, ..Default::default()
+        });
+        draw_texture_ex(tex, px, py + phd * 0.72, Color::new(0.0, 0.0, 0.0, 0.45), DrawTextureParams {
+            dest_size: Some(vec2(pwd, phd * 0.28)), ..Default::default()
+        });
+    });
+    draw_rectangle(px, py, 3.0 * s, phd, if destructive { TILE_RED } else { XBOX_GREEN });
+
+    // --- Subject header: you can never act on a save the sheet hasn't named ---
+    if let Some(mem) = subject {
+        let icon = icon_cache.get(&mem.id).unwrap_or(placeholder);
+        icon.set_filter(FilterMode::Nearest);
+        let ip = (32.0 * s).round();
+        draw_texture_ex(icon, px + 16.0 * s, py + 14.0 * s, WHITE,
+            DrawTextureParams { dest_size: Some(vec2(ip, ip)), ..Default::default() });
+        let name = mem.name.clone().filter(|n| !n.trim().is_empty())
+            .unwrap_or_else(|| mem.id.clone());
+        let (t, tsize) = fit(&name, 1.10, pwd - 74.0 * s);
+        txt(&t, px + 62.0 * s, py + 32.0 * s, tsize, Color::new(1.0, 1.0, 1.0, 0.95));
+        let meta = format!(
+            "{:.1} MB · {:.1} h",
+            get_game_size(mem, size_cache),
+            get_game_playtime(mem, playtime_cache)
+        );
+        txt(&meta, px + 62.0 * s, py + 47.0 * s, fs(0.72), Color::new(1.0, 1.0, 1.0, 0.60));
+    }
+    {
+        let d = measure_text(eyebrow, Some(font), fs(0.68), 1.0);
+        txt(eyebrow, px + pwd - 16.0 * s - d.width, py + 32.0 * s, fs(0.68),
+            Color::new(1.0, 1.0, 1.0, 0.45));
+    }
+    draw_rectangle(px + 16.0 * s, py + 58.0 * s, pwd - 32.0 * s, 1.0 * s, Color::new(1.0, 1.0, 1.0, 0.12));
+
+    for (i, line) in desc_lines.iter().enumerate() {
+        txt(line, px + 16.0 * s, py + (76.0 + i as f32 * 14.0) * s, fs(0.90),
+            Color::new(1.0, 1.0, 1.0, 0.85));
+    }
+
+    let oy = py + (66.0 + desc_h) * s;
+
+    if copy_running {
+        // Same 10-cell meter the settings screen uses for percentages.
+        let done = copy_progress >= 100;
+        txt(if done { "Copy complete" } else { "Copying…" }, px + 16.0 * s, oy + 16.0 * s,
+            fs(0.90), Color::new(1.0, 1.0, 1.0, 0.90));
+        let pct = format!("{}%", copy_progress.min(100));
+        let d = measure_text(&pct, Some(font), fs(0.72), 1.0);
+        txt(&pct, px + pwd - 16.0 * s - d.width, oy + 16.0 * s, fs(0.72), Color::new(1.0, 1.0, 1.0, 0.60));
+        let total = pwd - 32.0 * s;
+        let gap = 1.6 * s;
+        let cw = (total - 9.0 * gap) / 10.0;
+        let filled = ((copy_progress as f32 / 10.0).round() as i32).clamp(0, 10) as usize;
+        let fill_col = if done { XBOX_GREEN } else { string_to_color(&config.cursor_color) };
+        for i in 0..10 {
+            let c = if i < filled { fill_col } else { Color::new(1.0, 1.0, 1.0, 0.16) };
+            draw_rectangle(px + 16.0 * s + i as f32 * (cw + gap), oy + 26.0 * s, cw, 9.0 * s, c);
+        }
+    } else {
+        let free_by_id: Vec<(String, u32)> = storage_state
+            .lock()
+            .map(|st| st.media.iter().map(|d| (d.id.clone(), d.free)).collect())
+            .unwrap_or_default();
+        let subject_mb = subject.map(|m| get_game_size(m, size_cache)).unwrap_or(0.0);
+
+        for (i, opt) in dialog.options.iter().enumerate() {
+            let focused = i == dialog.selection;
+            let delete_row = opt.value == "DELETE";
+            let shake = if opt.disabled {
+                animation_state.calculate_shake_offset(ShakeTarget::Dialog) * s
+            } else {
+                0.0
+            };
+            let rx = px + 16.0 * s + shake;
+            let ry = oy + i as f32 * pitch * s;
+            let rw = pwd - 32.0 * s;
+            let rh = (pitch - 3.0) * s;
+
+            // A disabled row keeps the cursor visible but never looks
+            // actionable — the main sheet opens with COPY disabled and
+            // focused on a single-storage console.
+            let fill = if opt.disabled {
+                Color::new(TILE_SLATE_ALT.r * 0.45, TILE_SLATE_ALT.g * 0.45, TILE_SLATE_ALT.b * 0.45, 1.0)
+            } else if delete_row {
+                if focused { TILE_RED } else { TILE_RED_DIM }
+            } else if focused {
+                XBOX_GREEN
+            } else {
+                TILE_SLATE_ALT
+            };
+            if focused {
+                draw_tile_shadow(rx, ry, rw, rh, s, 1.0);
+            }
+            draw_rectangle(rx, ry, rw, rh, fill);
+
+            let label = dlg_label(&opt.value);
+            let label = if dialog.id == "copy_storage_select" && opt.value != "CANCEL" {
+                opt.value.to_lowercase()
+            } else {
+                label
+            };
+            let lcol = if opt.disabled {
+                Color::new(1.0, 1.0, 1.0, 0.40)
+            } else if focused {
+                WHITE
+            } else {
+                Color::new(1.0, 1.0, 1.0, 0.85)
+            };
+            let (lt, lsize) = fit(&label, 0.85, rw * 0.55);
+            let d = measure_text(&lt, Some(font), lsize, 1.0);
+            txt(&lt, rx + 10.0 * s, ry + rh / 2.0 + d.offset_y * 0.5, lsize, lcol);
+
+            // Right-hand hint: say why, instead of only shaking.
+            let mut hint = String::new();
+            let mut hint_col = Color::new(1.0, 1.0, 1.0, 0.55);
+            if dialog.id == "main" {
+                hint = match opt.value.as_str() {
+                    "COPY" => if opt.disabled { "no other storage".into() } else { "to another storage".into() },
+                    "DELETE" => "permanent".to_string(),
+                    _ => String::new(),
+                };
+            } else if dialog.id == "copy_storage_select" && opt.value != "CANCEL" {
+                if let Some((_, free)) = free_by_id.iter().find(|(id, _)| *id == opt.value) {
+                    if subject_mb > *free as f32 {
+                        hint = "not enough space".to_string();
+                        hint_col = Color::new(1.0, 0.42, 0.42, 1.0);
+                        draw_rectangle(rx, ry, 2.0 * s, rh, Color::new(1.0, 0.42, 0.42, 1.0));
+                    } else {
+                        hint = format!("{} MB free", free);
+                    }
+                }
+            }
+            let glyph_w = if focused && !opt.disabled { 26.0 * s } else { 10.0 * s };
+            if !hint.is_empty() {
+                let (ht, hsize) = fit(&hint, 0.68, rw * 0.42);
+                let hd = measure_text(&ht, Some(font), hsize, 1.0);
+                txt(&ht, rx + rw - glyph_w - hd.width, ry + rh / 2.0 + hd.offset_y * 0.5, hsize, hint_col);
+            }
+            if focused && !opt.disabled {
+                let g = 12.0 * s;
+                LEGEND_ICONS.with(|icons| {
+                    draw_texture_ex(&icons[legend], rx + rw - 10.0 * s - g, ry + rh / 2.0 - g / 2.0,
+                        WHITE, DrawTextureParams { dest_size: Some(vec2(g, g)), ..Default::default() });
+                });
+            }
+            if focused {
+                let glow = if opt.disabled {
+                    Color::new(0.6, 0.6, 0.6, 1.0)
+                } else if delete_row {
+                    Color::new(1.0, 0.35, 0.35, 1.0)
+                } else {
+                    string_to_color(&config.cursor_color)
+                };
+                draw_focus_glow_ex(rx, ry, rw, rh, s, glow, 0.45, 1.0);
+            }
+        }
+    }
+
+    // --- Dialog legend ---
+    {
+        let cy = 324.0 * s;
+        let icon_h = 18.0 * s;
+        let size = fs(0.80);
+        let leg = |text: &str, x: f32| -> f32 {
+            let d = measure_text(text, Some(font), size, 1.0);
+            txt(text, x - d.width, cy + d.offset_y * 0.5, size, Color::new(1.0, 1.0, 1.0, 0.75));
+            x - d.width
+        };
+        let back_x = leg("Cancel", w - 24.0 * s);
+        LEGEND_ICONS_BACK.with(|icons| {
+            draw_texture_ex(&icons[legend], back_x - 4.0 * s - icon_h, cy - icon_h / 2.0, WHITE,
+                DrawTextureParams { dest_size: Some(vec2(icon_h, icon_h)), ..Default::default() });
+        });
+        if !copy_running {
+            let focused_delete = dialog
+                .options
+                .get(dialog.selection)
+                .map(|o| o.value == "DELETE")
+                .unwrap_or(false);
+            let x = leg(if focused_delete { "Delete" } else { "Select" },
+                back_x - 4.0 * s - icon_h - 16.0 * s);
+            LEGEND_ICONS.with(|icons| {
+                draw_texture_ex(&icons[legend], x - 4.0 * s - icon_h, cy - icon_h / 2.0, WHITE,
+                    DrawTextureParams { dest_size: Some(vec2(icon_h, icon_h)), ..Default::default() });
+            });
+        }
+    }
+}
+
+/// Metro skin for the modal dialogs (reset confirmation and its follow-up).
+/// Same slate-and-green vocabulary as the tiles, so the settings screen
+/// doesn't drop out of its own language for the one screen that matters most.
+pub fn draw_dialog(
+    message: &str,
+    options: Option<(&str, &str)>,
+    selection: usize,
+    font_cache: &HashMap<String, Font>,
+    config: &Config,
+    s: f32,
+) {
+    let font = get_current_font(font_cache, config);
+    let w = screen_width();
+    let h = screen_height();
+    let txt = |text: &str, x: f32, y: f32, size: u16, color: Color| {
+        let so = 1.0 * (size as f32 / FONT_SIZE as f32);
+        draw_text_ex(text, x + so, y + so, TextParams {
+            font: Some(font), font_size: size,
+            color: Color::new(0.0, 0.0, 0.0, 0.85 * color.a), ..Default::default()
+        });
+        draw_text_ex(text, x, y, TextParams {
+            font: Some(font), font_size: size, color, ..Default::default()
+        });
+    };
+    let fs = |k: f32| ((FONT_SIZE as f32 * s * k) as u16).max(9);
+
+    draw_rectangle(0.0, 0.0, w, h, Color::new(0.0, 0.0, 0.0, 0.6));
+
+    let bw = 300.0 * s;
+    let bh = 132.0 * s;
+    let bx = (w - bw) / 2.0;
+    let by = (h - bh) / 2.0;
+    draw_rectangle(bx, by, bw, bh, TILE_SLATE);
+    FADE_TEX.with(|tex| {
+        draw_texture_ex(tex, bx, by, Color::new(1.0, 1.0, 1.0, 0.20), DrawTextureParams {
+            dest_size: Some(vec2(bw, bh * 0.16)), flip_y: true, ..Default::default()
+        });
+        draw_texture_ex(tex, bx, by + bh * 0.72, Color::new(0.0, 0.0, 0.0, 0.45), DrawTextureParams {
+            dest_size: Some(vec2(bw, bh * 0.28)), ..Default::default()
+        });
+    });
+    // Leading green bar, the dash's "this is actionable" mark.
+    draw_rectangle(bx, by, 3.0 * s, bh, XBOX_GREEN);
+
+    // Eyebrow with the settings mark.
+    let icon = 14.0 * s;
+    TILE_SETTINGS.with(|tex| {
+        draw_texture_ex(tex, bx + 14.0 * s, by + 12.0 * s, Color::new(1.0, 1.0, 1.0, 0.75),
+            DrawTextureParams { dest_size: Some(vec2(icon, icon)), ..Default::default() });
+    });
+    txt("settings", bx + 14.0 * s + icon + 6.0 * s, by + 23.0 * s, fs(0.8),
+        Color::new(1.0, 1.0, 1.0, 0.45));
+
+    // Message, centred.
+    let msg_size = fs(0.95);
+    let mut y = by + 56.0 * s;
+    for line in message.lines() {
+        let d = measure_text(line, Some(font), msg_size, 1.0);
+        txt(line, bx + (bw - d.width) / 2.0, y, msg_size, Color::new(1.0, 1.0, 1.0, 0.92));
+        y += d.height + 6.0 * s;
+    }
+
+    // Choices as Metro chips; the focused one takes the green fill and glow.
+    if let Some((opt1, opt2)) = options {
+        let cw = 84.0 * s;
+        let ch = 24.0 * s;
+        let gap = 12.0 * s;
+        let total = cw * 2.0 + gap;
+        let cx = bx + (bw - total) / 2.0;
+        let cy = by + bh - ch - 14.0 * s;
+        for (i, label) in [opt1, opt2].iter().enumerate() {
+            let x = cx + i as f32 * (cw + gap);
+            let focused = i == selection;
+            draw_rectangle(x, cy, cw, ch, if focused { XBOX_GREEN } else { TILE_SLATE_ALT });
+            let size = fs(0.85);
+            let d = measure_text(label, Some(font), size, 1.0);
+            txt(label, x + (cw - d.width) / 2.0, cy + ch / 2.0 + d.offset_y * 0.5, size,
+                if focused { WHITE } else { Color::new(1.0, 1.0, 1.0, 0.82) });
+            if focused {
+                draw_focus_glow_ex(x, cy, cw, ch, s, string_to_color(&config.cursor_color), 0.5, 1.2);
+            }
+        }
     }
 }
 

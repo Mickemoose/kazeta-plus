@@ -1093,15 +1093,27 @@ async fn main() {
                 );
                 }
 
+                // Metro hands off with a boot scene instead of a bare fade:
+                // theme background + the dotted ring + "Booting Cartridge...".
+                if config.menu_style == "METRO" {
+                    draw_rectangle(0.0, 0.0, screen_width(), screen_height(),
+                        Color { r: 0.12, g: 0.12, b: 0.12, a: 1.0 });
+                    render_background(&background_cache, &mut video_cache, &config, &mut background_state);
+                    ui::metro::draw_boot_screen(&font_cache, &config, scale_factor);
+                }
+
                 // Calculate fade progress
                 if let Some(start_time) = fade_start_time {
                     let elapsed = get_time() - start_time;
                     let fade_progress = (elapsed / FADE_DURATION).min(1.0);
 
-                    // Draw fade overlay
-                    let alpha = fade_progress as f32;
-                    draw_rectangle(0.0, 0.0, screen_width(), screen_height(),
-                        Color { r: 0.0, g: 0.0, b: 0.0, a: alpha });
+                    // Draw fade overlay (Metro keeps its boot scene visible
+                    // right up to the handoff instead of fading to black)
+                    if config.menu_style != "METRO" {
+                        let alpha = fade_progress as f32;
+                        draw_rectangle(0.0, 0.0, screen_width(), screen_height(),
+                            Color { r: 0.0, g: 0.0, b: 0.0, a: alpha });
+                    }
 
                     // If fade is complete, wait for linger duration then exit
                     if fade_progress >= 1.0 {
@@ -1255,11 +1267,21 @@ async fn main() {
 
                 // --- Draw the UI ---
                 if page_number > 0 {
+                    let choices = ui::metro::SettingsChoices {
+                        themes: &loaded_themes,
+                        sinks: &available_sinks,
+                        bgm: &bgm_choices,
+                        sfx_packs: &sound_pack_choices,
+                        logos: &logo_choices,
+                        backgrounds: &background_choices,
+                        fonts: &font_choices,
+                        legend: metro_state.legend_icon(),
+                    };
                     ui::settings::render_settings_page(
                         page_number, options, &logo_cache, &background_cache, &mut video_cache, &font_cache,
                         &mut config, settings_menu_selection, &animation_state, &mut background_state,
                         &battery_info, &current_time_str, &app_state.gcc_adapter_poll_rate,
-                        scale_factor, system_volume, brightness,
+                        scale_factor, system_volume, brightness, &choices,
                     );
                 }
             },
@@ -1488,11 +1510,21 @@ async fn main() {
 
                 // --- Render ---
                 // First, render the settings page in the background
+                let choices = ui::metro::SettingsChoices {
+                    themes: &loaded_themes,
+                    sinks: &available_sinks,
+                    bgm: &bgm_choices,
+                    sfx_packs: &sound_pack_choices,
+                    logos: &logo_choices,
+                    backgrounds: &background_choices,
+                    fonts: &font_choices,
+                    legend: metro_state.legend_icon(),
+                };
                 render_settings_page(
                     1, &GENERAL_SETTINGS, &logo_cache, &background_cache, &mut video_cache, &font_cache,
                     &mut config, settings_menu_selection, &animation_state, &mut background_state,
                     &battery_info, &current_time_str, &app_state.gcc_adapter_poll_rate,
-                    scale_factor, system_volume, brightness,
+                    scale_factor, system_volume, brightness, &choices,
                 );
                 // Then, render the dialog box on top
                 render_dialog_box(
@@ -1510,11 +1542,21 @@ async fn main() {
                 }
 
                 // --- Render ---
+                let choices = ui::metro::SettingsChoices {
+                    themes: &loaded_themes,
+                    sinks: &available_sinks,
+                    bgm: &bgm_choices,
+                    sfx_packs: &sound_pack_choices,
+                    logos: &logo_choices,
+                    backgrounds: &background_choices,
+                    fonts: &font_choices,
+                    legend: metro_state.legend_icon(),
+                };
                 render_settings_page(
                     1, &GENERAL_SETTINGS, &logo_cache, &background_cache, &mut video_cache, &font_cache,
                     &mut config, settings_menu_selection, &animation_state, &mut background_state,
                     &battery_info, &current_time_str, &app_state.gcc_adapter_poll_rate,
-                    scale_factor, system_volume, brightness
+                    scale_factor, system_volume, brightness, &choices
                 );
 
                 render_dialog_box(
@@ -1540,13 +1582,20 @@ async fn main() {
                     scale_factor, &copy_op_state
                 ).await;
 
+                // Backing out to the Metro dashboard replays its slide-in.
+                if matches!(current_screen, Screen::MainMenu) {
+                    metro_state.replay_intro();
+                }
+
                 render_background(&background_cache, &mut video_cache, &config, &mut background_state);
 
                 ui::data::draw(
                     selected_memory, &memories, &icon_cache, &font_cache,
                     &config, &storage_state, &placeholder, scroll_offset,
                     &input_state, &animation_state, &mut playtime_cache, &mut size_cache,
-                    scale_factor, &dialog_state
+                    scale_factor, &dialog_state,
+                    &metro_state, &logo_cache, &battery_info, &current_time_str,
+                    &app_state.gcc_adapter_poll_rate,
                 );
 
                 // Draw dialogs on top if they are open
@@ -1555,7 +1604,8 @@ async fn main() {
                         ui::render_dialog(
                             dialog, &memories, selected_memory, &icon_cache, &font_cache,
                             &config, &copy_op_state, &placeholder, scroll_offset,
-                            &animation_state, &mut playtime_cache, &mut size_cache, scale_factor
+                            &animation_state, &mut playtime_cache, &mut size_cache, scale_factor,
+                            &storage_state
                         );
                     }
                 }

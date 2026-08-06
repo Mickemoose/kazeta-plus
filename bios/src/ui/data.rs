@@ -24,6 +24,19 @@ pub async fn update(
     let mut action_dialog_id = String::new();
     let mut action_option_value = String::new();
 
+    // Metro draws the saves as a 5x3 wall of tiles instead of the classic
+    // 13x5 icon grid, so every index computation in this function goes through
+    // these instead of the constants. When the style isn't METRO they ARE the
+    // constants and `idx` is `get_memory_index`, so LIST and BLADES behave
+    // bit-for-bit as before.
+    let is_metro = config.menu_style == "METRO";
+    let (gw, gh) = if is_metro {
+        (crate::ui::metro::SAVE_COLS, crate::ui::metro::SAVE_ROWS)
+    } else {
+        (GRID_WIDTH, GRID_HEIGHT)
+    };
+    let idx = |sel: usize, scroll: usize| sel + gw * scroll;
+
     // Check if memories need to be refreshed due to storage media changes
     if let Ok(mut state) = storage_state.lock() {
         if state.needs_memory_refresh {
@@ -34,6 +47,13 @@ pub async fn update(
             }
             state.needs_memory_refresh = false;
             dialogs.clear();
+            // A hot-plug can land mid-dialog. Dropping the dialog stack without
+            // dropping the state strands DialogState::Open with nothing to
+            // drive it: the Open arm does all its work inside
+            // `if let Some(dialog) = dialogs.last_mut()`, and Back is only
+            // handled in the None arm — so the screen would accept no input at
+            // all until the console was power-cycled.
+            *dialog_state = DialogState::None;
         }
     }
     match dialog_state {
@@ -56,8 +76,10 @@ pub async fn update(
                             sound_effects.play_select(&config);
                         }
                     } else if input_state.next {
-                        // Next stops at end
-                        if state.selected < state.media.len() - 1 {
+                        // Next stops at end. Checked arithmetic: media can be
+                        // empty (no writable storage), and `len() - 1` would
+                        // underflow to usize::MAX and then index out of bounds.
+                        if state.selected + 1 < state.media.len() {
                             state.selected += 1;
                             *memories = load_memories(&state.media[state.selected], icon_cache, icon_queue).await;
                             *scroll_offset = 0;
@@ -84,7 +106,7 @@ pub async fn update(
             match input_state.ui_focus {
                 UIFocus::Grid => {
                     if input_state.select {
-                        let memory_index = get_memory_index(*selected_memory, *scroll_offset);
+                        let memory_index = idx(*selected_memory, *scroll_offset);
                         if let Some(_) = memories.get(memory_index) {
                             let (grid_pos, dialog_pos) = calculate_icon_transition_positions(*selected_memory, scale_factor);
                             animation_state.trigger_dialog_transition(grid_pos, dialog_pos);
@@ -93,7 +115,14 @@ pub async fn update(
                             sound_effects.play_select(&config);
                         }
                     }
-                    if input_state.right && *selected_memory < GRID_WIDTH * GRID_HEIGHT - 1 {
+                    // Metro packs saves densely from slot 0, so the cursor is
+                    // kept off the empty slots — moving right or down into
+                    // nothing would leave the detail bar describing a save
+                    // that isn't there.
+                    if input_state.right
+                        && *selected_memory < gw * gh - 1
+                        && (!is_metro || idx(*selected_memory + 1, *scroll_offset) < memories.len())
+                    {
                         *selected_memory += 1;
                         animation_state.trigger_transition(&config.cursor_transition_speed);
                         sound_effects.play_cursor_move(&config);
@@ -104,13 +133,15 @@ pub async fn update(
                         sound_effects.play_cursor_move(&config);
                     }
                     if input_state.down {
-                        if *selected_memory < GRID_WIDTH * GRID_HEIGHT - GRID_WIDTH {
-                            *selected_memory += GRID_WIDTH;
+                        if *selected_memory < gw * gh - gw
+                            && (!is_metro || idx(*selected_memory + gw, *scroll_offset) < memories.len())
+                        {
+                            *selected_memory += gw;
                             animation_state.trigger_transition(&config.cursor_transition_speed);
                             sound_effects.play_cursor_move(&config);
                         } else {
                             // Check if there are any saves in the next row
-                            let next_row_start = get_memory_index(GRID_WIDTH * GRID_HEIGHT, *scroll_offset);
+                            let next_row_start = idx(gw * gh, *scroll_offset);
                             if next_row_start < memories.len() {
                                 *scroll_offset += 1;
                                 animation_state.trigger_transition(&config.cursor_transition_speed);
@@ -119,8 +150,8 @@ pub async fn update(
                         }
                     }
                     if input_state.up {
-                        if *selected_memory >= GRID_WIDTH {
-                            *selected_memory -= GRID_WIDTH;
+                        if *selected_memory >= gw {
+                            *selected_memory -= gw;
                             animation_state.trigger_transition(&config.cursor_transition_speed);
                             sound_effects.play_cursor_move(&config);
                         } else if *scroll_offset > 0 {
@@ -128,16 +159,65 @@ pub async fn update(
                             animation_state.trigger_transition(&config.cursor_transition_speed);
                             sound_effects.play_cursor_move(&config);
                         } else {
-                            // Allow moving to storage navigation from leftmost or rightmost column
-                            if *selected_memory % GRID_WIDTH == 0 {
+                            // Metro's storage strip is a full-width row directly
+                            // above the wall, so up escapes to it from any
+                            // column. The classic screen keeps its leftmost /
+                            // rightmost rule, untouched.
+                            if is_metro {
                                 input_state.ui_focus = UIFocus::StorageLeft;
                                 animation_state.trigger_transition(&config.cursor_transition_speed);
                                 sound_effects.play_cursor_move(&config);
-                            } else if *selected_memory % GRID_WIDTH == GRID_WIDTH - 1 {
+                            } else if *selected_memory % gw == 0 {
+                                input_state.ui_focus = UIFocus::StorageLeft;
+                                animation_state.trigger_transition(&config.cursor_transition_speed);
+                                sound_effects.play_cursor_move(&config);
+                            } else if *selected_memory % gw == gw - 1 {
                                 input_state.ui_focus = UIFocus::StorageRight;
                                 animation_state.trigger_transition(&config.cursor_transition_speed);
                                 sound_effects.play_cursor_move(&config);
                             }
+                        }
+                    }
+                },
+                UIFocus::StorageLeft if is_metro => {
+                    // Metro's storage strip behaves like the dashboard's tab
+                    // strip: left/right change the medium, down or select drops
+                    // into the wall of saves.
+                    if input_state.left {
+                        if let Ok(mut state) = storage_state.lock() {
+                            if state.selected > 0 {
+                                state.selected -= 1;
+                                *memories = load_memories(&state.media[state.selected], icon_cache, icon_queue).await;
+                                *scroll_offset = 0;
+                                *selected_memory = 0;
+                                sound_effects.play_select(&config);
+                            } else {
+                                animation_state.trigger_shake(true);
+                                sound_effects.play_reject(&config);
+                            }
+                        }
+                    }
+                    if input_state.right {
+                        if let Ok(mut state) = storage_state.lock() {
+                            if state.selected + 1 < state.media.len() {
+                                state.selected += 1;
+                                *memories = load_memories(&state.media[state.selected], icon_cache, icon_queue).await;
+                                *scroll_offset = 0;
+                                *selected_memory = 0;
+                                sound_effects.play_select(&config);
+                            } else {
+                                animation_state.trigger_shake(false);
+                                sound_effects.play_reject(&config);
+                            }
+                        }
+                    }
+                    if input_state.down || input_state.select {
+                        input_state.ui_focus = UIFocus::Grid;
+                        animation_state.trigger_transition(&config.cursor_transition_speed);
+                        if input_state.select {
+                            sound_effects.play_select(&config);
+                        } else {
+                            sound_effects.play_cursor_move(&config);
                         }
                     }
                 },
@@ -168,20 +248,22 @@ pub async fn update(
                     }
                 },
                 UIFocus::StorageRight => {
-                    if input_state.left {
+                    if input_state.left && config.menu_style != "METRO" {
                         input_state.ui_focus = UIFocus::StorageLeft;
                         animation_state.trigger_transition(&config.cursor_transition_speed);
                         sound_effects.play_cursor_move(&config);
                     }
                     if input_state.down {
                         input_state.ui_focus = UIFocus::Grid;
-                        *selected_memory = GRID_WIDTH - 1; // Move to rightmost grid position
+                        // Metro never parks the cursor here, but a live style
+                        // switch can, so land somewhere that always exists.
+                        *selected_memory = if is_metro { 0 } else { gw - 1 };
                         animation_state.trigger_transition(&config.cursor_transition_speed);
                         sound_effects.play_cursor_move(&config);
                     }
                     if input_state.select {
                         if let Ok(mut state) = storage_state.lock() {
-                            if state.selected < state.media.len() - 1 {
+                            if state.selected + 1 < state.media.len() {
                                 state.selected += 1;
                                 *memories = load_memories(&state.media[state.selected], icon_cache, icon_queue).await;
                                 *scroll_offset = 0;
@@ -196,6 +278,11 @@ pub async fn update(
             }
         },
         DialogState::Open => {
+            // Self-heal if the stack emptied out from under us, so this state
+            // can never sit inert with no way back.
+            if dialogs.is_empty() {
+                *dialog_state = DialogState::None;
+            }
             // When dialog is fully open, only render the dialog
             if let Some(dialog) = dialogs.last_mut() {
                 //render_dialog(dialog, &memories, *selected_memory, &icon_cache, &font_cache, &config, &copy_op_state, &placeholder, *scroll_offset, &animation_state, &mut playtime_cache, &mut size_cache, scale_factor);
@@ -266,7 +353,7 @@ pub async fn update(
                 },
                 ("confirm_delete", "DELETE") => {
                     if let Ok(mut state) = storage_state.lock() {
-                        let memory_index = get_memory_index(*selected_memory, *scroll_offset);
+                        let memory_index = idx(*selected_memory, *scroll_offset);
                         if let Some(mem) = memories.get(memory_index) {
                             if let Err(e) = save::delete_save(&mem.id, &state.media[state.selected].id) {
                                 dialogs.push(create_error_dialog(format!("ERROR: {}", e)));
@@ -285,7 +372,7 @@ pub async fn update(
                     //sound_effects.play_back(&config);
                 },
                 ("copy_storage_select", target_id) if target_id != "CANCEL" => {
-                    let memory_index = get_memory_index(*selected_memory, *scroll_offset);
+                    let memory_index = idx(*selected_memory, *scroll_offset);
                     let mem = memories[memory_index].clone();
                     let target_id = target_id.to_string();
                     if let Ok(state) = storage_state.lock() {
@@ -350,6 +437,38 @@ pub async fn update(
         },
         _ => {}
     }
+
+    // Cursor-safety post-pass. Whatever happened above — a reload after a
+    // delete or a hot-plug, a media switch, a scroll onto a short final row,
+    // or a live menu-style switch (the two styles page in different units:
+    // 5 saves per row under Metro, 13 under the classic grid) — the cursor
+    // must end up on a real save, or the list must be empty. Sitting outside
+    // the match covers every mutation path at once, and it guarantees a
+    // confirm-delete can never resolve to a stale index.
+    //
+    // This runs for every menu style, using whichever grid is actually being
+    // drawn. Gating it on Metro would leave a Metro-shaped scroll_offset
+    // behind after a style switch, and the classic grid would open scrolled
+    // past saves the user can see exist.
+    if memories.is_empty() {
+        *selected_memory = 0;
+        *scroll_offset = 0;
+    } else {
+        let last = memories.len() - 1;
+        // Pull the page back to the last row that still fills the grid, not
+        // merely far enough to be in bounds: a shrunken list would otherwise
+        // keep rendering a late page with no rail, no chevron and no page
+        // counter to say there is more above.
+        let max_scroll = ((last / gw) + 1).saturating_sub(gh);
+        if *scroll_offset > max_scroll {
+            *scroll_offset = max_scroll;
+        }
+        let base = gw * *scroll_offset;
+        let max_in_page = (last - base).min(gw * gh - 1);
+        if *selected_memory > max_in_page {
+            *selected_memory = max_in_page;
+        }
+    }
 }
 
 // This function will handle all drawing for the data screen
@@ -366,9 +485,28 @@ pub fn draw(
     animation_state: &AnimationState,
     playtime_cache: &mut PlaytimeCache,
     size_cache: &mut SizeCache,
-    _scale_factor: f32, // we're now ignoring this
+    scale_factor: f32,
     dialog_state: &DialogState,
+    metro: &crate::ui::metro::MetroState,
+    logo_cache: &HashMap<String, Texture2D>,
+    battery_info: &Option<BatteryInfo>,
+    current_time_str: &str,
+    gcc_adapter_poll_rate: &Option<u32>,
 ) {
+    // METRO renders the whole screen — the wall, the storage strip, the detail
+    // bar and the dimming veil under any dialog. LIST and BLADES fall through
+    // to the original body below, unchanged. This sits above the dialog-state
+    // guard on purpose: the Metro wall keeps drawing while a dialog is open,
+    // so the sheet sits over a dimmed grid instead of bare wallpaper.
+    if config.menu_style == "METRO" {
+        crate::ui::metro::draw_save_data(
+            metro, selected_memory, memories, icon_cache, logo_cache, font_cache, config,
+            storage_state, placeholder, scroll_offset, input_state, animation_state,
+            playtime_cache, size_cache, battery_info, current_time_str,
+            gcc_adapter_poll_rate, dialog_state, scale_factor,
+        );
+        return;
+    }
     // Calculate Safe Scale Factor & Centering Offsets
     // We assume the UI was designed for 640x360
     const BASE_W: f32 = 640.0;
