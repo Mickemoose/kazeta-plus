@@ -959,6 +959,11 @@ async fn main() {
         error_message: None,
     }));
 
+    // Idle screensaver: last press time, and when the saver engaged (None =
+    // awake).
+    let mut last_activity: f64 = get_time();
+    let mut screensaver_since: Option<f64> = None;
+
     // BEGINNING OF MAIN LOOP
     loop {
         let scale_factor = screen_height() / BASE_SCREEN_HEIGHT;
@@ -1004,6 +1009,15 @@ async fn main() {
         input_state.reset();
         input_state.update_keyboard();
         input_state.update_controller(&mut gilrs);
+
+        // Screensaver idle clock. The waking press is swallowed so it wakes
+        // the screen without also acting on whatever is underneath.
+        if input_state.any_activity() {
+            last_activity = get_time();
+            if screensaver_since.take().is_some() {
+                input_state.reset();
+            }
+        }
 
         // Update animations
         animation_state.update_shake(get_frame_time());
@@ -1769,6 +1783,45 @@ async fn main() {
             sound_effects = SoundEffects::load(&pack_name);
             // Play a sound from the new pack to confirm it changed
             sound_effects.play_cursor_move(&config);
+        }
+
+        // Idle screensaver, drawn over everything: fade to near-black with a
+        // slowly wandering clock (wandering so a static TV never burns in).
+        // Works in every menu style; "NEVER" disables. Music keeps playing.
+        let ss_minutes: Option<f64> = config
+            .screensaver
+            .split_whitespace()
+            .next()
+            .and_then(|n| n.parse::<f64>().ok());
+        match ss_minutes {
+            Some(mins) if get_time() - last_activity > mins * 60.0 => {
+                if screensaver_since.is_none() {
+                    screensaver_since = Some(get_time());
+                }
+            }
+            Some(_) => {}
+            None => screensaver_since = None,
+        }
+        if let Some(t0) = screensaver_since {
+            let t = (get_time() - t0) as f32;
+            let a = (t / 2.5).min(1.0) * 0.94;
+            draw_rectangle(0.0, 0.0, screen_width(), screen_height(), Color::new(0.0, 0.0, 0.0, a));
+            let ta = ((t - 1.0) / 2.0).clamp(0.0, 1.0) * 0.55;
+            if ta > 0.0 {
+                let font = ui::get_current_font(&font_cache, &config);
+                let size = (64.0 * scale_factor) as u16;
+                let dims = measure_text(&current_time_str, Some(font), size, 1.0);
+                let wander = get_time() as f32;
+                let x = (screen_width() - dims.width) / 2.0
+                    + (wander * 0.13).sin() * screen_width() * 0.18;
+                let y = screen_height() / 2.0 + (wander * 0.089).cos() * screen_height() * 0.22;
+                draw_text_ex(&current_time_str, x, y, TextParams {
+                    font: Some(font),
+                    font_size: size,
+                    color: Color::new(1.0, 1.0, 1.0, ta),
+                    ..Default::default()
+                });
+            }
         }
         next_frame().await
     }

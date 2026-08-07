@@ -145,6 +145,98 @@ fn pad_brand() -> String {
         .unwrap_or_default()
 }
 
+/// Pure LED colors for the lightbar itself (the UI's PLAYER_COLORS are
+/// display-tuned pastels). Same order as the bios's pad_leds painter.
+const LED_COLORS: [(u8, u8, u8); 4] = [(0, 255, 0), (0, 0, 255), (255, 0, 0), (255, 255, 0)];
+
+/// Physical pads in join order — a lean port of the bios's pad_leds scan.
+/// Skips InputPlumber's virtual mirrors so one controller is one slot.
+fn scan_physical_pads() -> Vec<u32> {
+    const PAD_WORDS: [&str; 7] =
+        ["controller", "gamepad", "8bitdo", "joystick", "joy-con", "xbox", "x-box"];
+    const NOT_PAD_WORDS: [&str; 5] = ["motion", "imu", "touchpad", "keyboard", "mouse"];
+    let mut pads = Vec::new();
+    if let Ok(entries) = std::fs::read_dir("/sys/class/input") {
+        for entry in entries.flatten() {
+            let dir = entry.file_name().to_string_lossy().into_owned();
+            let Some(num) = dir.strip_prefix("input").and_then(|s| s.parse::<u32>().ok()) else {
+                continue;
+            };
+            let name = std::fs::read_to_string(entry.path().join("name"))
+                .unwrap_or_default()
+                .trim()
+                .to_lowercase();
+            if !PAD_WORDS.iter().any(|w| name.contains(w))
+                || NOT_PAD_WORDS.iter().any(|w| name.contains(w))
+            {
+                continue;
+            }
+            let virtual_dev = std::fs::canonicalize(entry.path())
+                .map(|p| {
+                    let p = p.to_string_lossy().into_owned();
+                    p.contains("uhid") || p.contains("/virtual/")
+                })
+                .unwrap_or(true);
+            if virtual_dev {
+                continue;
+            }
+            pads.push(num);
+        }
+    }
+    pads.sort_unstable();
+    pads
+}
+
+/// One-shot player-color paint (lightbar + white player dot). The bios's
+/// painter re-asserts continuously on the dashboard but dies with the bios at
+/// game launch — in-game, a reconnected pad would otherwise stay stock blue.
+/// One shot on arrival restores the color without fighting a game that later
+/// sets its own.
+fn paint_pad_leds() {
+    for (slot, num) in scan_physical_pads().into_iter().take(4).enumerate() {
+        let base = format!("/sys/class/leds/input{}:rgb:indicator", num);
+        if std::fs::metadata(&base).is_err() {
+            continue;
+        }
+        let (r, g, b) = LED_COLORS[slot];
+        let _ = std::fs::write(format!("{}/multi_intensity", base), format!("{} {} {}", r, g, b));
+        let _ = std::fs::write(format!("{}/brightness", base), "255");
+        for dot in 1..=5 {
+            let dot_path = format!(
+                "/sys/class/leds/input{}:white:player-{}/brightness",
+                num, dot
+            );
+            let _ = std::fs::write(dot_path, if dot == slot + 1 { "1" } else { "0" });
+        }
+    }
+}
+
+/// Indices of the composite devices InputPlumber currently manages — one per
+/// physical pad, in join order.
+fn list_composites() -> Vec<usize> {
+    let out = Command::new("busctl")
+        .args(["tree", "org.shadowblip.InputPlumber"])
+        .output()
+        .ok()
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    let mut ids: Vec<usize> = out
+        .lines()
+        .filter_map(|l| {
+            let p = l.find("CompositeDevice")?;
+            l[p + 15..]
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect::<String>()
+                .parse()
+                .ok()
+        })
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
 fn dashboard_running() -> bool {
     Command::new("pgrep")
         .args(["-x", "kazeta-bios"])
@@ -751,6 +843,30 @@ impl Overlay {
         self.conn.flush()?;
         Ok(())
     }
+
+    /// Raw canvas upload at an arbitrary spot (toasts).
+    fn put_at(&self, cv: &Canvas, x: i16, y: i16) -> Result<(), Box<dyn std::error::Error>> {
+        self.conn.put_image(
+            ImageFormat::Z_PIXMAP,
+            self.win,
+            self.gc,
+            cv.w as u16,
+            cv.h as u16,
+            x,
+            y,
+            0,
+            32,
+            &cv.to_le_bytes(),
+        )?;
+        self.conn.flush()?;
+        Ok(())
+    }
+
+    fn clear_rect(&self, x: i16, y: i16, w: u16, h: u16) -> Result<(), Box<dyn std::error::Error>> {
+        self.conn.clear_area(false, self.win, x, y, w, h)?;
+        self.conn.flush()?;
+        Ok(())
+    }
 }
 
 // ----------------------------------------------------------------- panel ---
@@ -1126,6 +1242,155 @@ struct App {
     last_pad_idx: usize,
     // Cart hot-plug watch while the menu is open on the dashboard.
     last_cart_scan: Instant,
+    // In-game controller toasts.
+    known_pads: Vec<usize>,
+    pads_initialized: bool,
+    batt_warned: [bool; 4],
+    last_pad_scan: Instant,
+    toast: Option<(Canvas, i16, i16, Instant)>,
+    toast_queue: Vec<Canvas>,
+    // Keep repainting LEDs briefly after a pad change: the LED sysfs node can
+    // register a moment after the composite device appears.
+    repaint_leds_until: Option<Instant>,
+}
+
+impl App {
+    fn make_toast(&self, text: &str, player: usize) -> Canvas {
+        let s = self.overlay.sh as f32 / 1080.0;
+        let f = &self.ui.font;
+        let th = (52.0 * s) as usize;
+        let isz = (28.0 * s) as i32;
+        let dot_r = (7.0 * s) as i32;
+        let gap = (10.0 * s) as i32;
+        let pad = (16.0 * s) as i32;
+        let tmp = Canvas::new(1, 1);
+        let tw_text = tmp.text_width(f, text, 20.0 * s);
+        let tw = (pad + isz + gap + dot_r * 2 + gap + tw_text + pad) as usize;
+        let mut cv = Canvas::new(tw, th);
+        cv.fill(0, 0, tw as i32, th as i32, SLATE, 255);
+        cv.fill(0, th as i32 - 1.max((3.0 * s) as i32), tw as i32, (3.0 * s) as i32, GREEN, 255);
+        let mut cx = pad;
+        if let Some(icon) = &self.ui.controller_icon {
+            cv.blit(icon, cx, (th as i32 - isz) / 2, isz);
+        }
+        cx += isz + gap;
+        let col = PLAYER_COLORS[player.min(3)];
+        let cy = th as i32 / 2;
+        for dy in -dot_r..=dot_r {
+            for dx in -dot_r..=dot_r {
+                if dx * dx + dy * dy <= dot_r * dot_r {
+                    cv.over(cx + dot_r + dx, cy + dy, 255, col.0 as u32, col.1 as u32, col.2 as u32);
+                }
+            }
+        }
+        cx += dot_r * 2 + gap;
+        cv.text(f, text, cx, cy + (7.0 * s) as i32, 20.0 * s, 235);
+        cv
+    }
+
+    /// Show now, or hold until the guide closes (the dim would eat it).
+    fn push_toast(&mut self, cv: Canvas) {
+        if self.open || self.toast.is_some() {
+            self.toast_queue.push(cv);
+        } else {
+            self.show_toast(cv);
+        }
+    }
+
+    fn show_toast(&mut self, cv: Canvas) {
+        let s = self.overlay.sh as f32 / 1080.0;
+        let x = ((self.overlay.sw as i32 - cv.w as i32) / 2) as i16;
+        let y = (self.overlay.sh as i32 - cv.h as i32 - (48.0 * s) as i32) as i16;
+        let _ = self.overlay.ensure_mapped();
+        self.sfx.play("toast.wav");
+        for f in 1..=5 {
+            let a = f as f32 / 5.0;
+            let _ = self.overlay.put_at(&cv.frame_scaled(1.0, a), x, y);
+            std::thread::sleep(Duration::from_millis(16));
+        }
+        let _ = self.overlay.put_at(&cv, x, y);
+        self.toast = Some((cv, x, y, Instant::now() + Duration::from_millis(2800)));
+    }
+
+    /// Expire the active toast and promote the next queued one.
+    fn tick_toast(&mut self) {
+        if let Some((cv, x, y, until)) = &self.toast {
+            if Instant::now() >= *until {
+                for f in (1..4).rev() {
+                    let a = f as f32 / 4.0;
+                    let _ = self.overlay.put_at(&cv.frame_scaled(1.0, a), *x, *y);
+                    std::thread::sleep(Duration::from_millis(16));
+                }
+                let _ = self.overlay.clear_rect(*x, *y, cv.w as u16, cv.h as u16);
+                self.toast = None;
+            }
+        }
+        if self.toast.is_none() && !self.open && !self.toast_queue.is_empty() {
+            let cv = self.toast_queue.remove(0);
+            self.show_toast(cv);
+        }
+    }
+
+    /// Watch InputPlumber's composite devices: connects, disconnects, and
+    /// low batteries become toasts — in-game only, since the bios already
+    /// announces controllers on the dashboard.
+    fn scan_pads(&mut self) {
+        let pads = list_composites();
+        if !self.pads_initialized {
+            self.pads_initialized = true;
+            self.known_pads = pads;
+            return;
+        }
+        if pads != self.known_pads {
+            // A fresh CompositeDevice starts at InterceptMode 0 — without
+            // this re-assert, a replugged pad's Guide button goes to the game
+            // and the daemon never hears it again.
+            if self.open {
+                set_intercept(2);
+            } else if self.defer_intercept.is_none() {
+                set_intercept(1);
+            }
+        }
+        if pads != self.known_pads && !dashboard_running() {
+            // In-game LED restoration (the bios painter is dead during games).
+            self.repaint_leds_until = Some(Instant::now() + Duration::from_secs(6));
+            paint_pad_leds();
+            let added: Vec<usize> =
+                pads.iter().filter(|p| !self.known_pads.contains(p)).cloned().collect();
+            let removed: Vec<usize> =
+                self.known_pads.iter().filter(|p| !pads.contains(p)).cloned().collect();
+            for p in added {
+                let txt = match read_battery(p) {
+                    Some((pct, _)) => format!("Controller {} connected · {}%", p + 1, pct),
+                    None => format!("Controller {} connected", p + 1),
+                };
+                let cv = self.make_toast(&txt, p);
+                self.push_toast(cv);
+            }
+            for p in removed {
+                let cv = self.make_toast(&format!("Controller {} disconnected", p + 1), p);
+                self.push_toast(cv);
+                self.batt_warned[p.min(3)] = false;
+            }
+        }
+        // Low battery: warn once per discharge cycle, rearm on charge/refill.
+        if !dashboard_running() {
+            for &p in &pads.clone() {
+                if let Some((pct, charging)) = read_battery(p) {
+                    let slot = p.min(3);
+                    if charging || pct >= 25 {
+                        self.batt_warned[slot] = false;
+                    } else if pct <= 15 && !self.batt_warned[slot] {
+                        self.batt_warned[slot] = true;
+                        let cv =
+                            self.make_toast(&format!("Controller {} battery low · {}%", p + 1, pct), p);
+                        self.push_toast(cv);
+                    }
+                }
+            }
+        }
+        self.known_pads = pads;
+    }
 }
 
 impl App {
@@ -1162,6 +1427,9 @@ impl App {
         self.open = true;
         self.sel = 0;
         self.defer_intercept = None;
+        // The dim paints over any visible toast; it re-queues implicitly by
+        // simply being dropped (short-lived, not worth restoring).
+        self.toast = None;
         set_intercept(2);
         self.overlay.grab_keyboard();
         self.sfx.play("select.wav");
@@ -1430,6 +1698,13 @@ fn main() {
         defer_intercept: None,
         last_pad_idx: 0,
         last_cart_scan: Instant::now(),
+        known_pads: Vec::new(),
+        pads_initialized: false,
+        batt_warned: [false; 4],
+        last_pad_scan: Instant::now(),
+        toast: None,
+        toast_queue: Vec::new(),
+        repaint_leds_until: None,
     };
 
     loop {
@@ -1505,6 +1780,19 @@ fn main() {
                         app.redraw();
                     }
                 }
+                // Controller watch + toast lifecycle.
+                if app.last_pad_scan.elapsed() > Duration::from_secs(2) {
+                    app.last_pad_scan = Instant::now();
+                    app.scan_pads();
+                    if let Some(until) = app.repaint_leds_until {
+                        if Instant::now() < until {
+                            paint_pad_leds();
+                        } else {
+                            app.repaint_leds_until = None;
+                        }
+                    }
+                }
+                app.tick_toast();
                 continue;
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {

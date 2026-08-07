@@ -32,6 +32,12 @@ pub struct InputState {
 impl InputState {
     const ANALOG_DEADZONE: f32 = 0.5;  // Increased deadzone for less sensitivity
 
+    /// Any press this frame — feeds the screensaver's idle clock.
+    pub fn any_activity(&self) -> bool {
+        self.up || self.down || self.left || self.right || self.select || self.next
+            || self.prev || self.cycle || self.back || self.secondary || self.tertiary
+    }
+
     pub fn new() -> Self {
         InputState {
             up: false,

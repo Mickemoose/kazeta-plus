@@ -53,9 +53,13 @@ pub const GUI_CUSTOMIZATION_SETTINGS: &[&str] = &[
     "BACKGROUND SCROLLING",
     "COLOR GRADIENT SHIFTING",
     "MENU STYLE",
+    "SCREENSAVER",
     "AUDIO SETTINGS",
     "CUSTOM ASSETS SETTINGS",
 ];
+
+/// Idle time before the screen dims. Any input wakes it.
+pub const SCREENSAVER_TIMEOUTS: &[&str] = &["NEVER", "1 MIN", "5 MIN", "10 MIN", "15 MIN", "30 MIN"];
 
 /// Dashboard styles. Applying a theme overwrites `menu_style` (falling back to
 /// LIST when the theme doesn't name one), so this row is the way back — without
@@ -290,8 +294,9 @@ pub fn get_settings_value(page: usize, index: usize, config: &Config, system_vol
             7 => config.background_scroll_speed.clone(), // BACKGROUND SCROLL SPEED
             8 => config.color_shift_speed.clone(), // COLOR SHIFTING GRADIENT SPEED
             9 => config.menu_style.clone(), // MENU STYLE
-            10 => "<-".to_string(),
-            11 => "->".to_string(),
+            10 => config.screensaver.clone(), // SCREENSAVER
+            11 => "<-".to_string(),
+            12 => "->".to_string(),
             _ => "".to_string(),
         },
         // CUSTOM ASSETS
@@ -946,14 +951,30 @@ pub fn update(
                     sound_effects.play_cursor_move(&config);
                 }
             },
-            10 => { // GO TO AUDIO SETTINGS
+            10 => { // SCREENSAVER
+                if input_state.left || input_state.right {
+                    let current_index = SCREENSAVER_TIMEOUTS
+                        .iter()
+                        .position(|&m| m == config.screensaver)
+                        .unwrap_or(0);
+                    let new_index = if input_state.right {
+                        (current_index + 1) % SCREENSAVER_TIMEOUTS.len()
+                    } else {
+                        (current_index + SCREENSAVER_TIMEOUTS.len() - 1) % SCREENSAVER_TIMEOUTS.len()
+                    };
+                    config.screensaver = SCREENSAVER_TIMEOUTS[new_index].to_string();
+                    config.save();
+                    sound_effects.play_cursor_move(&config);
+                }
+            },
+            11 => { // GO TO AUDIO SETTINGS
                 if input_state.select {
                     *current_screen = Screen::AudioSettings;
                     *settings_menu_selection = 0;
                     sound_effects.play_select(&config);
                 }
             },
-            11 => { // GO TO CUSTOM ASSETS
+            12 => { // GO TO CUSTOM ASSETS
                 if input_state.select {
                     *current_screen = Screen::AssetSettings;
                     *settings_menu_selection = 0;

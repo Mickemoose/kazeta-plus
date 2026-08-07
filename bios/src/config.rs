@@ -16,6 +16,10 @@ fn default_background_particles() -> String {
     "OFF".to_string()
 }
 
+fn default_screensaver() -> String {
+    "NEVER".to_string()
+}
+
 /// Gets the full path to the kazeta.toml configuration file.
 fn get_config_path() -> Result<PathBuf, Box<dyn Error>> {
     let mut config_path = get_user_data_dir().ok_or("Could not find user's data directory.")?;
@@ -51,6 +55,10 @@ pub struct Config {
     // config.toml files written before this field existed still parse.
     #[serde(default = "default_background_particles")]
     pub background_particles: String,
+    // Idle screensaver timeout ("NEVER" or "<N> MIN"). serde default keeps
+    // older config.toml files parsing.
+    #[serde(default = "default_screensaver")]
+    pub screensaver: String,
     pub bgm_track: Option<String>,
     pub sfx_pack: String,
     pub logo_selection: String,
@@ -82,6 +90,7 @@ impl Default for Config {
             background_scroll_speed: "NORMAL".to_string(),
             color_shift_speed: "NORMAL".to_string(),
             background_particles: default_background_particles(),
+            screensaver: default_screensaver(),
             bgm_track: None,
             sfx_pack: "Default".to_string(),
             logo_selection: "Kazeta+ (Default)".to_string(),
