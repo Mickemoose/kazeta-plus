@@ -116,6 +116,15 @@ pub struct MetroState {
     // Cart branding for the Play hero (cover art + "Play: NAME" bar).
     pub cover_tex: Option<Texture2D>,
     pub icon_tex: Option<Texture2D>,
+    // Blurred cover used as an ambient background, crossfaded in while the
+    // Play hero is hovered and back out when it isn't.
+    cover_blur: Option<Texture2D>,
+    cover_bg_vis: f32,
+    // Loudness envelope of the cart's theme (built off-thread) plus the clock
+    // it started on, so the dashboard can move to the music while hovering.
+    bgm_env: Arc<Mutex<Option<Vec<f32>>>>,
+    bgm_start: f64,
+    beat: f32,
     pub cart_label: Option<String>,
     pub cart_optical: bool,
     // Media badges (baked-in art) for the hero's corner.
@@ -149,6 +158,9 @@ pub struct MetroState {
     legend_icon: LegendIcon,
     // Queued player connect/disconnect toasts, shown one at a time.
     toasts: Vec<Toast>,
+    // Cart presence last frame. None until the first update, so a cart that
+    // is already in at boot doesn't announce itself.
+    had_cart: Option<bool>,
     // Save icons for the Save Data tile's marquee rows, loaded once at
     // startup from the internal save cache.
     save_icons: Vec<Texture2D>,
@@ -566,6 +578,83 @@ fn make_fade_texture() -> Texture2D {
     tex
 }
 
+/// A heavily blurred copy of the cart's cover, for use as an ambient
+/// background. Box-downsampling to a tiny image and letting the GPU stretch it
+/// back with bilinear filtering IS the blur — the same trick the fade ramp
+/// uses, and far cheaper than a shader pass.
+fn make_blur_texture(bytes: &[u8]) -> Option<Texture2D> {
+    const BW: usize = 32;
+    const BH: usize = 18;
+    let img = Image::from_file_with_format(bytes, Some(ImageFormat::Png)).ok()?;
+    let (w, h) = (img.width() as usize, img.height() as usize);
+    if w == 0 || h == 0 {
+        return None;
+    }
+    let mut out = Image::gen_image_color(BW as u16, BH as u16, WHITE);
+    for by in 0..BH {
+        for bx in 0..BW {
+            let x0 = bx * w / BW;
+            let x1 = (((bx + 1) * w / BW).max(x0 + 1)).min(w);
+            let y0 = by * h / BH;
+            let y1 = (((by + 1) * h / BH).max(y0 + 1)).min(h);
+            let (mut r, mut g, mut b, mut n) = (0.0f32, 0.0f32, 0.0f32, 0.0f32);
+            for y in y0..y1 {
+                for x in x0..x1 {
+                    let c = img.get_pixel(x as u32, y as u32);
+                    r += c.r;
+                    g += c.g;
+                    b += c.b;
+                    n += 1.0;
+                }
+            }
+            if n > 0.0 {
+                out.set_pixel(bx as u32, by as u32, Color::new(r / n, g / n, b / n, 1.0));
+            }
+        }
+    }
+    let tex = Texture2D::from_image(&out);
+    tex.set_filter(FilterMode::Linear);
+    Some(tex)
+}
+
+/// Buckets per second in a track's loudness envelope.
+const ENV_HZ: usize = 30;
+
+/// Decode the cart's theme once on a worker thread and reduce it to an RMS
+/// loudness envelope. Sampling that by playback position gives the dashboard
+/// the beat for free — no realtime analysis, no audio-thread coupling.
+fn spawn_bgm_envelope(path: PathBuf, slot: Arc<Mutex<Option<Vec<f32>>>>) {
+    std::thread::spawn(move || {
+        let Ok(bytes) = std::fs::read(&path) else { return };
+        let Ok(decoder) = Decoder::new(Cursor::new(bytes)) else { return };
+        let rate = decoder.sample_rate() as usize;
+        let channels = decoder.channels() as usize;
+        let per_bucket = (rate * channels / ENV_HZ).max(1);
+        let mut env: Vec<f32> = Vec::new();
+        let (mut acc, mut n) = (0.0f32, 0usize);
+        for sample in decoder {
+            acc += sample * sample;
+            n += 1;
+            if n >= per_bucket {
+                env.push((acc / n as f32).sqrt());
+                acc = 0.0;
+                n = 0;
+            }
+        }
+        // Normalise against the track's own peak, so a quiet theme reacts as
+        // much as a loud one.
+        let peak = env.iter().cloned().fold(0.0f32, f32::max);
+        if peak > 0.0001 {
+            for v in env.iter_mut() {
+                *v /= peak;
+            }
+        }
+        if let Ok(mut guard) = slot.lock() {
+            *guard = Some(env);
+        }
+    });
+}
+
 /// Soft-focus disc texture for the bokeh motes: solid-ish core with a smooth
 /// falloff to nothing at the rim, generated at startup so no asset is needed.
 fn make_bokeh_texture() -> Texture2D {
@@ -636,6 +725,8 @@ impl MetroState {
             tab: DEFAULT_TAB, prev_tab: DEFAULT_TAB, anim: 1.0, dir: 1.0,
             tile: primary_tile(DEFAULT_TAB),
             cover_tex: None, icon_tex: None, cart_label: None, cart_optical: false,
+            cover_blur: None, cover_bg_vis: 0.0,
+            bgm_env: Arc::new(Mutex::new(None)), bgm_start: 0.0, beat: 0.0,
             badge_sd, badge_disc, cover_key: String::new(),
             cart_vis: 0.0, outgoing: None,
             save_icons, cart_console_icons: Vec::new(),
@@ -646,6 +737,7 @@ impl MetroState {
             booting: false,
             legend_icon: LegendIcon::Keyboard,
             toasts: Vec::new(),
+            had_cart: None,
             bokeh, bokeh_tex: make_bokeh_texture(), fade_tex: make_fade_texture(),
             bgm_path: None, bgm_sink: None, bgm_vol: 0.0,
             mounts_fp: String::new(), mounts_polled: -10.0,
@@ -977,6 +1069,7 @@ pub fn update(
         let prev_optical = state.cart_optical;
         state.cart_optical = false;
         state.bgm_path = None;
+        state.cover_blur = None;
         state.stop_bgm();
         // The hover theme may have been ducking the system bgm when the cart
         // vanished — give the system its volume back.
@@ -999,8 +1092,14 @@ pub fn update(
                     if let Some(tex) = load_cart_texture(&bytes) {
                         tex.set_filter(FilterMode::Linear);
                         state.cover_tex = Some(tex);
+                        state.cover_blur = make_blur_texture(&bytes);
                     }
                 }
+            }
+            // Kick off the theme's loudness envelope for the beat reaction.
+            state.bgm_env = Arc::new(Mutex::new(None));
+            if let Some(bgm) = state.bgm_path.clone() {
+                spawn_bgm_envelope(bgm, state.bgm_env.clone());
             }
             if let Some(path) = icon {
                 if let Ok(bytes) = std::fs::read(&path) {
@@ -1128,6 +1227,29 @@ pub fn update(
     let tile_before = state.tile;
     let tab_before = state.tab;
 
+    // A cart appearing takes you to it: jump to home, put the cursor on the
+    // Play hero and say so. Suppressed on the first update so a cart already
+    // inserted at boot doesn't announce itself.
+    match state.had_cart {
+        Some(false) if *play_option_enabled => {
+            let hero = primary_tile(DEFAULT_TAB);
+            if state.tab != DEFAULT_TAB {
+                state.go_tab(DEFAULT_TAB, false, hero);
+            } else {
+                state.tile = hero;
+            }
+            state.toasts.push(Toast {
+                text: "Cart Inserted".to_string(),
+                dot: None,
+                icon: ToastIcon::Cart,
+                t: 0.0,
+            });
+            sound_effects.play_toast(&config);
+        }
+        _ => {}
+    }
+    state.had_cart = Some(*play_option_enabled);
+
     // prev/next (bumpers) hop a whole tab, landing on its primary tile.
     if input_state.prev && state.tab > 0 {
         let to = state.tab - 1;
@@ -1210,6 +1332,7 @@ pub fn update(
                     sink.append(decoder.repeat_infinite());
                     sink.set_volume(0.0);
                     state.bgm_sink = Some(sink);
+                    state.bgm_start = get_time();
                 }
             }
         }
@@ -1265,6 +1388,62 @@ pub fn update(
             sound_effects.play_back(&config);
         }
     }
+
+    // Blurred cover crossfades in over the theme background while the Play
+    // hero holds the cursor, and back out when it doesn't.
+    let hero_focused = *play_option_enabled
+        && TABS[state.tab]
+            .tiles
+            .get(state.tile)
+            .map(|t| t.hero && t.action == BladeAction::Play)
+            .unwrap_or(false);
+    let bg_target = if hero_focused && state.cover_blur.is_some() { 1.0 } else { 0.0 };
+    let bg_step = get_frame_time() / 0.45;
+    if state.cover_bg_vis < bg_target {
+        state.cover_bg_vis = (state.cover_bg_vis + bg_step).min(bg_target);
+    } else if state.cover_bg_vis > bg_target {
+        state.cover_bg_vis = (state.cover_bg_vis - bg_step).max(bg_target);
+    }
+
+    // Beat: sample the theme's loudness envelope at the current playback
+    // position. Only while the hero is hovered and its theme is actually
+    // playing — this is the cart's music, not the room's.
+    // Onset, not loudness: how much louder this instant is than the last
+    // second of the track. Mastered music holds a near-constant RMS, so a raw
+    // level would just sit at an offset and never read as a beat — the ratio
+    // against a moving baseline is what makes hits pop.
+    let punch = if hero_hovered && state.bgm_sink.is_some() {
+        state
+            .bgm_env
+            .try_lock()
+            .ok()
+            .and_then(|g| {
+                g.as_ref().and_then(|env| {
+                    if env.is_empty() {
+                        return None;
+                    }
+                    let t = (get_time() - state.bgm_start).max(0.0);
+                    let i = ((t * ENV_HZ as f64) as usize) % env.len();
+                    let raw = env[i];
+                    // Baseline over the preceding ~1s, wrapping with the loop.
+                    let window = ENV_HZ.min(env.len());
+                    let mut sum = 0.0;
+                    for k in 0..window {
+                        sum += env[(i + env.len() - k) % env.len()];
+                    }
+                    let baseline = (sum / window as f32).max(0.0001);
+                    Some(((raw / baseline - 1.0) * 1.6).clamp(0.0, 1.0))
+                })
+            })
+            .unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    // Envelope follower: snap up on the hit, ease back down, so the room
+    // punches rather than throbs.
+    let dt = get_frame_time();
+    let rate = if punch > state.beat { dt / 0.02 } else { dt / 0.18 };
+    state.beat += (punch - state.beat) * rate.min(1.0);
 
     if input_state.select {
         // Metro press acknowledgment: the tile dips dark for a beat.
@@ -1443,7 +1622,9 @@ fn draw_bokeh(state: &MetroState, intro: f32, s: f32) {
         let mut x = (b.x + (t * b.wobble_hz * std::f32::consts::TAU + b.phase).sin() * b.wobble)
             .rem_euclid(1.0);
         let breath = 0.5 - 0.5 * (t * b.twinkle_hz * std::f32::consts::TAU + b.phase * 1.7).cos();
-        let mut a = b.alpha * breath;
+        // The motes brighten and swell on the cart theme's beat while the
+        // Play hero is hovered; `beat` is zero at every other moment.
+        let mut a = b.alpha * breath * (1.0 + state.beat * 5.0);
         // Boot intro: every mote flies out of a point just below
         // bottom-center, curling as it travels to its resting spot.
         if intro < 1.0 {
@@ -1459,7 +1640,7 @@ fn draw_bokeh(state: &MetroState, intro: f32, s: f32) {
         if a <= 0.003 {
             continue;
         }
-        let r = b.r * s;
+        let r = b.r * s * (1.0 + state.beat * 0.55);
         draw_texture_ex(
             &state.bokeh_tex,
             x * w - r,
@@ -1491,6 +1672,7 @@ fn draw_tab_pane(
     slide_anim: f32,
     slide_dir: f32,
     exiting: bool,
+    beat: f32,
     origin_y: f32,
     _animation_state: &AnimationState,
     font_cache: &HashMap<String, Font>,
@@ -1706,7 +1888,8 @@ fn draw_tab_pane(
                         // on its own phase so they never move in lockstep.
                         let bx = base_x + i as f32 * step
                             + (t * 0.55 + ph * 1.3).sin() * 2.5 * s;
-                        let by = base_y + (t * 0.85 + ph).sin() * 3.5 * s;
+                        // Bubbles ride the beat too, bobbing higher on hits.
+                        let by = base_y + (t * 0.85 + ph).sin() * 3.5 * s - beat * 9.0 * s;
                         let tex = &icons[*idx];
                         let iw = ico * tex.width() / tex.height();
                         draw_texture_ex(
@@ -1795,8 +1978,11 @@ fn draw_tab_pane(
 
         if is_selected {
             // Metro selection: gradient glow halo breathing around the tile.
+            // On the Play hero the halo also swells with the cart theme's
+            // beat, so the selection pulses with the music.
             let border = string_to_color(&config.cursor_color);
-            draw_focus_glow(rx, ry, rw, rh, s, border);
+            let spread = if hero_play { 1.0 + beat * 1.1 } else { 1.0 };
+            draw_focus_glow_ex(rx, ry, rw, rh, s, border, spread, 2.0 + beat * 0.7);
         }
 
         // The Play hero's mockup furniture — translucent "Play: NAME" bar,
@@ -2033,6 +2219,22 @@ pub fn draw(
     draw_rectangle(0.0, 0.0, screen_width(), screen_height(), BG_FALLBACK);
     render_background(background_cache, video_cache, config, background_state);
 
+    // The cart's cover, blurred, fading in over the theme background while
+    // the Play hero is hovered — the room takes on the game's colours.
+    if state.cover_bg_vis > 0.001 {
+        if let Some(tex) = &state.cover_blur {
+            let v = ease_out(state.cover_bg_vis);
+            let (w, h) = (screen_width(), screen_height());
+            draw_texture_ex(tex, 0.0, 0.0, Color::new(1.0, 1.0, 1.0, v), DrawTextureParams {
+                dest_size: Some(vec2(w, h)), ..Default::default()
+            });
+            // Hold it back so tiles and text keep their contrast — but lift
+            // the veil on each hit, so the whole room brightens to the beat.
+            let dim = (0.45 - state.beat * 0.20).max(0.20);
+            draw_rectangle(0.0, 0.0, w, h, Color::new(0.0, 0.0, 0.0, dim * v));
+        }
+    }
+
     let s = scale_factor;
     let current_font = get_current_font(font_cache, config);
     let origin_y = 112.0 * s;
@@ -2094,14 +2296,14 @@ pub fn draw(
             &TABS[state.prev_tab], None, 1.0, None, 0.0, intro,
             play_option_enabled, copy_logs_option_enabled,
             &hero_brands, &state.save_icons, &state.cart_console_icons, &state.badge_sd, &state.badge_disc, &state.fade_tex,
-            state.anim, state.dir, true, origin_y, animation_state, font_cache, config, s,
+            state.anim, state.dir, true, state.beat, origin_y, animation_state, font_cache, config, s,
         );
     }
     draw_tab_pane(
         &TABS[state.tab], Some(state.tile), state.sel_anim, state.prev_sel, state.press_flash, intro,
         play_option_enabled, copy_logs_option_enabled,
         &hero_brands, &state.save_icons, &state.cart_console_icons, &state.badge_sd, &state.badge_disc, &state.fade_tex,
-        state.anim, state.dir, false, origin_y, animation_state, font_cache, config, s,
+        state.anim, state.dir, false, state.beat, origin_y, animation_state, font_cache, config, s,
     );
 
     // --- Button legend, lower right like the real dash; the confirm glyph
