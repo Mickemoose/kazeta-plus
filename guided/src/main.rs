@@ -42,7 +42,15 @@ const RED: (u8, u8, u8) = (140, 30, 30);
 const GREEN_DIM: (u8, u8, u8) = (20, 56, 22);
 const RED_DIM: (u8, u8, u8) = (58, 24, 24);
 
-const OPTIONS: [&str; 3] = ["return to game", "kazeta home", "power off"];
+/// One row of the main guide menu. The dashboard and in-game menus carry
+/// different row sets, so rows are identities, not indices.
+#[derive(PartialEq, Clone, Copy)]
+enum RowKind {
+    Launch,       // dashboard: the cart launcher
+    ReturnToGame, // in-game: close the guide
+    KazetaHome,
+    PowerOff,
+}
 
 const KS_HOME: u32 = 0xff50;
 const KS_UP: u32 = 0xff52;
@@ -50,6 +58,7 @@ const KS_DOWN: u32 = 0xff54;
 const KS_RETURN: u32 = 0xff0d;
 const KS_ESCAPE: u32 = 0xff1b;
 const KS_BACKSPACE: u32 = 0xff08;
+const KS_E: u32 = 0x0065; // eject, matching the dashboard's keyboard binding
 
 #[derive(PartialEq, Clone, Copy)]
 enum Source {
@@ -66,6 +75,11 @@ const GLYPH_SW_A: &[u8] = include_bytes!("../../bios/buttons/switch1_button_a.pn
 const GLYPH_SW_B: &[u8] = include_bytes!("../../bios/buttons/switch1_button_b.png");
 const GLYPH_KB_ENTER: &[u8] = include_bytes!("../../bios/buttons/keyboard_enter.png");
 const GLYPH_KB_BACK: &[u8] = include_bytes!("../../bios/buttons/keyboard_backspace.png");
+// North-face glyphs for the eject legend, same set the bios eject hint uses.
+const GLYPH_XBOX_Y: &[u8] = include_bytes!("../../bios/buttons/xbox_button_color_y.png");
+const GLYPH_PS_TRIANGLE: &[u8] = include_bytes!("../../bios/buttons/playstation_button_color_triangle.png");
+const GLYPH_SW_X: &[u8] = include_bytes!("../../bios/buttons/switch1_button_x.png");
+const GLYPH_KB_E: &[u8] = include_bytes!("../../bios/buttons/keyboard_e.png");
 const ICON_CONTROLLER: &[u8] = include_bytes!("../../bios/CONTROLLER.png");
 const ICON_SDCARD: &[u8] = include_bytes!("../../bios/SDCARD.png");
 
@@ -635,6 +649,13 @@ struct Overlay {
     strip_bot: Vec<u8>,
     top_h: u16,
     bot_h: u16,
+    /// No compositor (the VM: startx, no gamescope). Bare X ignores alpha —
+    /// "transparent" renders as solid black — so the dim is faked instead:
+    /// snapshot the screen at open, darken it in software, paint that as the
+    /// backdrop, and unmap on close.
+    bare_x: bool,
+    /// The darkened screen snapshot (0xFFRRGGBB per pixel), bare X only.
+    snap: Vec<u32>,
 }
 
 /// Shadow border width around the sheet, in 1080p design units.
@@ -660,6 +681,25 @@ impl Overlay {
 
         let colormap = conn.generate_id()?;
         conn.create_colormap(ColormapAlloc::NONE, colormap, root, visual)?;
+
+        // Gamescope acts as the window manager and stamps the EWMH check
+        // window; a session with no WM at all is the VM's bare X server.
+        let wm_check = conn.intern_atom(true, b"_NET_SUPPORTING_WM_CHECK")?.reply()?.atom;
+        let bare_x = wm_check == x11rb::NONE
+            || conn
+                .get_property(false, root, wm_check, AtomEnum::WINDOW, 0, 1)?
+                .reply()
+                .map(|r| r.value_len == 0)
+                .unwrap_or(true);
+        log(&format!("compositor: {}", if bare_x { "none (windowed mode)" } else { "gamescope" }));
+
+        let s = sh as f32 / 1080.0;
+        // Canvas carries a pad border around the sheet for the drop shadow.
+        let pad = (PANEL_PAD_DU * s) as usize;
+        let pw = (560.0 * s) as usize + pad * 2;
+        let ph = (370.0 * s) as usize + pad * 2 + (PANEL_DROP_DU * s) as usize;
+        let px = ((sw as usize - pw) / 2) as i16;
+        let py = ((sh as usize - ph) / 2) as i16;
 
         let win = conn.generate_id()?;
         conn.create_window(
@@ -690,14 +730,6 @@ impl Overlay {
 
         let gc = conn.generate_id()?;
         conn.create_gc(gc, win, &CreateGCAux::new())?;
-
-        let s = sh as f32 / 1080.0;
-        // Canvas carries a pad border around the sheet for the drop shadow.
-        let pad = (PANEL_PAD_DU * s) as usize;
-        let pw = (560.0 * s) as usize + pad * 2;
-        let ph = (370.0 * s) as usize + pad * 2 + (PANEL_DROP_DU * s) as usize;
-        let px = ((sw as usize - pw) / 2) as i16;
-        let py = ((sh as usize - ph) / 2) as i16;
 
         // Screen-edge fade strips: the dim behind the panel deepens toward
         // the top and bottom edges, the way Metro screens frame themselves.
@@ -733,7 +765,8 @@ impl Overlay {
 
         Ok(Self {
             conn, win, root, gc, sw, sh, pw, ph, px, py,
-            mapped: false, keymap, strip_top, strip_bot, top_h, bot_h,
+            mapped: false, keymap, strip_top, strip_bot, top_h, bot_h, bare_x,
+            snap: Vec::new(),
         })
     }
 
@@ -781,6 +814,11 @@ impl Overlay {
     }
 
     fn ensure_mapped(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.bare_x {
+            // Mapping happens inside backdrop(), after the screen capture —
+            // capturing a mapped overlay would photograph itself.
+            return Ok(());
+        }
         if !self.mapped {
             self.conn.map_window(self.win)?;
             self.conn.flush()?;
@@ -788,8 +826,69 @@ impl Overlay {
         }
         Ok(())
     }
+
+    /// Bare X: photograph the root window and darken it, edge strips baked
+    /// in, so the guide gets its dim even with no compositor to blend one.
+    /// The background freezes while the guide is open — the honest trade.
+    fn capture_dim(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        self.snap.clear();
+        let img = self
+            .conn
+            .get_image(ImageFormat::Z_PIXMAP, self.root, 0, 0, self.sw, self.sh, !0u32)?
+            .reply()?;
+        let w = self.sw as usize;
+        let n = w * self.sh as usize;
+        if img.data.len() < n * 4 {
+            // Odd root depth; put_panel falls back to the flat-dim composite.
+            return Ok(());
+        }
+        let mut snap = vec![0u32; n];
+        for i in 0..n {
+            let b = (img.data[i * 4] as u32) * 45 / 100;
+            let g = (img.data[i * 4 + 1] as u32) * 45 / 100;
+            let r = (img.data[i * 4 + 2] as u32) * 45 / 100;
+            snap[i] = 0xff00_0000 | (r << 16) | (g << 8) | b;
+        }
+        // Edge strips, same curve the gamescope backdrop bakes.
+        let mut strip = |snap: &mut Vec<u32>, rows: usize, flip: bool| {
+            for y in 0..rows {
+                let t = y as f32 / rows.max(1) as f32;
+                let t = if flip { t } else { 1.0 - t };
+                let keep = 1.0 - (0.55 + 0.30 * t.powf(1.5));
+                let row = if flip { self.sh as usize - rows + y } else { y };
+                for x in 0..w {
+                    let i = row * w + x;
+                    let b = ((img.data[i * 4] as f32) * keep) as u32;
+                    let g = ((img.data[i * 4 + 1] as f32) * keep) as u32;
+                    let r = ((img.data[i * 4 + 2] as f32) * keep) as u32;
+                    snap[i] = 0xff00_0000 | (r << 16) | (g << 8) | b;
+                }
+            }
+        };
+        strip(&mut snap, self.top_h as usize, false);
+        strip(&mut snap, self.bot_h as usize, true);
+        self.snap = snap;
+        Ok(())
+    }
     /// Flat dim plus the baked edge gradients.
-    fn backdrop(&self) -> Result<(), Box<dyn std::error::Error>> {
+    fn backdrop(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.bare_x {
+            if !self.mapped {
+                let _ = self.capture_dim();
+                self.conn.map_window(self.win)?;
+                self.conn.flush()?;
+                self.mapped = true;
+            }
+            if !self.snap.is_empty() {
+                let bytes: Vec<u8> = self.snap.iter().flat_map(|v| v.to_le_bytes()).collect();
+                self.conn.put_image(
+                    ImageFormat::Z_PIXMAP, self.win, self.gc,
+                    self.sw, self.sh, 0, 0, 0, 32, &bytes,
+                )?;
+                self.conn.flush()?;
+            }
+            return Ok(());
+        }
         self.conn.change_gc(self.gc, &ChangeGCAux::new().foreground(0x8C000000))?;
         self.conn.poly_fill_rectangle(
             self.win,
@@ -813,13 +912,35 @@ impl Overlay {
         // frame over the dim here so the panel region stays as dark as the
         // rest of the screen.
         const DIM_A: u32 = 0x8C;
+        let use_snap = self.bare_x && self.snap.len() == self.sw as usize * self.sh as usize;
         let mut bytes = Vec::with_capacity(cv.px.len() * 4);
-        for v in &cv.px {
-            let a = v >> 24;
-            let out_a = a + DIM_A * (255 - a) / 255;
-            // Dim is black: premultiplied color channels gain nothing.
-            let out = (out_a << 24) | (v & 0x00ff_ffff);
-            bytes.extend_from_slice(&out.to_le_bytes());
+        if use_snap {
+            // Bare X: composite the panel over the darkened snapshot region,
+            // since there is no compositor to blend the shadow border for us.
+            let w = self.sw as usize;
+            for row in 0..self.ph {
+                let base = (self.py as usize + row) * w + self.px as usize;
+                for col in 0..self.pw {
+                    let v = cv.px[row * self.pw + col];
+                    let a = v >> 24;
+                    let s = self.snap[base + col];
+                    let inv = 255 - a;
+                    let r = ((v >> 16) & 0xff) + ((s >> 16) & 0xff) * inv / 255;
+                    let g = ((v >> 8) & 0xff) + ((s >> 8) & 0xff) * inv / 255;
+                    let b = (v & 0xff) + (s & 0xff) * inv / 255;
+                    bytes.extend_from_slice(
+                        &(0xff00_0000 | (r << 16) | (g << 8) | b).to_le_bytes(),
+                    );
+                }
+            }
+        } else {
+            for v in &cv.px {
+                let a = v >> 24;
+                let out_a = a + DIM_A * (255 - a) / 255;
+                // Dim is black: premultiplied color channels gain nothing.
+                let out = (out_a << 24) | (v & 0x00ff_ffff);
+                bytes.extend_from_slice(&out.to_le_bytes());
+            }
         }
         self.conn.put_image(
             ImageFormat::Z_PIXMAP,
@@ -837,8 +958,15 @@ impl Overlay {
         Ok(())
     }
     /// "Hide": clear to transparent. The window STAYS mapped — gamescope
-    /// latches the last frame of an unmapped overlay on screen.
-    fn clear(&self) -> Result<(), Box<dyn std::error::Error>> {
+    /// latches the last frame of an unmapped overlay on screen. (Bare X has
+    /// no latch bug and a mapped window is opaque there, so it unmaps.)
+    fn clear(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.bare_x {
+            self.conn.unmap_window(self.win)?;
+            self.conn.flush()?;
+            self.mapped = false;
+            return Ok(());
+        }
         self.conn.clear_area(false, self.win, 0, 0, self.sw, self.sh)?;
         self.conn.flush()?;
         Ok(())
@@ -846,6 +974,10 @@ impl Overlay {
 
     /// Raw canvas upload at an arbitrary spot (toasts).
     fn put_at(&self, cv: &Canvas, x: i16, y: i16) -> Result<(), Box<dyn std::error::Error>> {
+        if self.bare_x {
+            // Toasts are in-game furniture; games never run on bare X.
+            return Ok(());
+        }
         self.conn.put_image(
             ImageFormat::Z_PIXMAP,
             self.win,
@@ -863,6 +995,9 @@ impl Overlay {
     }
 
     fn clear_rect(&self, x: i16, y: i16, w: u16, h: u16) -> Result<(), Box<dyn std::error::Error>> {
+        if self.bare_x {
+            return Ok(());
+        }
         self.conn.clear_area(false, self.win, x, y, w, h)?;
         self.conn.flush()?;
         Ok(())
@@ -881,8 +1016,10 @@ struct Ui {
     font: fontdue::Font,
     pad_a: Option<Rgba>,
     pad_b: Option<Rgba>,
+    pad_y: Option<Rgba>,
     kb_a: Option<Rgba>,
     kb_b: Option<Rgba>,
+    kb_y: Option<Rgba>,
     controller_icon: Option<Rgba>,
     sd_icon: Option<Rgba>,
     source: Source,
@@ -898,20 +1035,39 @@ struct Ui {
 }
 
 impl Ui {
-    fn enabled(&self, i: usize) -> bool {
-        if !self.dashboard {
-            return true;
+    /// The main menu's rows for the current context.
+    fn rows(&self) -> &'static [RowKind] {
+        if self.dashboard {
+            &[RowKind::Launch, RowKind::KazetaHome, RowKind::PowerOff]
+        } else {
+            &[RowKind::ReturnToGame, RowKind::KazetaHome, RowKind::PowerOff]
         }
-        // Dashboard: row 0 is the cart launcher (needs a cart), row 1 has no
-        // game to quit.
-        match i {
-            0 => self.cart.is_some(),
-            1 => false,
+    }
+    fn enabled(&self, kind: RowKind) -> bool {
+        match kind {
+            // The launcher needs a cart in the slot.
+            RowKind::Launch => self.cart.is_some(),
+            // Already home on the dashboard.
+            RowKind::KazetaHome => !self.dashboard,
             _ => true,
         }
     }
-    fn label(&self, i: usize) -> &str {
-        OPTIONS[i]
+    fn label(&self, kind: RowKind) -> &'static str {
+        match kind {
+            RowKind::Launch => "insert cartridge", // replaced by the cart's name
+            RowKind::ReturnToGame => "return to game",
+            RowKind::KazetaHome => "kazeta home",
+            RowKind::PowerOff => "power off",
+        }
+    }
+
+    /// Eject rides the legend, not the row list: it lights up only while the
+    /// cursor rests on the launcher row with a cart actually inserted.
+    fn eject_available(&self, sel: usize) -> bool {
+        self.mode == UiMode::Menu
+            && self.dashboard
+            && self.cart.is_some()
+            && self.rows().get(sel) == Some(&RowKind::Launch)
     }
 
     fn render(&self, pw: usize, ph: usize, sh: u16, sel: usize, flash: Option<usize>) -> Canvas {
@@ -997,17 +1153,24 @@ impl Ui {
 
         let rw = inner_r - margin;
         if self.mode == UiMode::Menu {
-            let row_h = (56.0 * s) as i32;
-            let row_gap = (10.0 * s) as i32;
-            let top = oy + (112.0 * s) as i32;
-            for i in 0..OPTIONS.len() {
+            let rows = self.rows();
+            // Four dashboard rows sit tighter than the in-game three so the
+            // legend row keeps its clearance.
+            let (row_h, row_gap, top) = if rows.len() > 3 {
+                ((46.0 * s) as i32, (7.0 * s) as i32, oy + (106.0 * s) as i32)
+            } else {
+                ((56.0 * s) as i32, (10.0 * s) as i32, oy + (112.0 * s) as i32)
+            };
+            for (i, kind) in rows.iter().enumerate() {
+                let kind = *kind;
                 let ry = top + i as i32 * (row_h + row_gap);
                 let focused = i == sel;
-                let enabled = self.enabled(i);
+                let enabled = self.enabled(kind);
+                let red = kind == RowKind::PowerOff;
                 let fill = if !enabled {
-                    if i == 2 { RED_DIM } else { GREEN_DIM }
+                    if red { RED_DIM } else { GREEN_DIM }
                 } else if focused {
-                    if i == 2 { RED } else { GREEN }
+                    if red { RED } else { GREEN }
                 } else {
                     SLATE_ROW
                 };
@@ -1031,11 +1194,11 @@ impl Ui {
                 } else {
                     205
                 };
-                // Dashboard row 0 is the cart launcher: cart icon + name, or
-                // the SD badge + a nudge when the slot is empty.
+                // The cart launcher row: cart icon + name, or the SD badge +
+                // a nudge when the slot is empty.
                 let mut tx2 = margin + (18.0 * s) as i32;
-                let mut label = self.label(i).to_string();
-                if self.dashboard && i == 0 {
+                let mut label = self.label(kind).to_string();
+                if kind == RowKind::Launch {
                     let isz = (32.0 * s) as i32;
                     let row_icon = match &self.cart {
                         Some(c) => {
@@ -1125,12 +1288,17 @@ impl Ui {
             cv.text(&self.font, label, *lx, ly, 19.0 * s, 150);
             *lx += cv.text_width(&self.font, label, 19.0 * s) + (26.0 * s) as i32;
         };
-        let (ga, gb) = match self.source {
-            Source::Pad => (&self.pad_a, &self.pad_b),
-            Source::Keyboard => (&self.kb_a, &self.kb_b),
+        let (ga, gb, gy) = match self.source {
+            Source::Pad => (&self.pad_a, &self.pad_b, &self.pad_y),
+            Source::Keyboard => (&self.kb_a, &self.kb_b, &self.kb_y),
         };
         item(&mut cv, &mut lx, ga, "select");
         item(&mut cv, &mut lx, gb, "close");
+        // Eject joins the legend only while the launcher row is hovered with
+        // a cart inserted — the guide's mirror of the dashboard gesture.
+        if self.eject_available(sel) {
+            item(&mut cv, &mut lx, gy, "eject");
+        }
         // Bottom-right of the legend row: who summoned the guide — controller
         // icon, player-color dot, battery. Keyboard opener gets the key hint
         // there instead.
@@ -1288,6 +1456,29 @@ impl App {
         cv
     }
 
+    /// Cart toast: the SD badge + text, no player dot.
+    fn make_cart_toast(&self, text: &str) -> Canvas {
+        let s = self.overlay.sh as f32 / 1080.0;
+        let f = &self.ui.font;
+        let th = (52.0 * s) as usize;
+        let isz = (28.0 * s) as i32;
+        let gap = (10.0 * s) as i32;
+        let pad = (16.0 * s) as i32;
+        let tmp = Canvas::new(1, 1);
+        let tw_text = tmp.text_width(f, text, 20.0 * s);
+        let tw = (pad + isz + gap + tw_text + pad) as usize;
+        let mut cv = Canvas::new(tw, th);
+        cv.fill(0, 0, tw as i32, th as i32, SLATE, 255);
+        cv.fill(0, th as i32 - 1.max((3.0 * s) as i32), tw as i32, (3.0 * s) as i32, GREEN, 255);
+        let mut cx = pad;
+        if let Some(icon) = &self.ui.sd_icon {
+            cv.blit(icon, cx, (th as i32 - isz) / 2, isz);
+        }
+        cx += isz + gap;
+        cv.text(f, text, cx, th as i32 / 2 + (7.0 * s) as i32, 20.0 * s, 235);
+        cv
+    }
+
     /// Show now, or hold until the guide closes (the dim would eat it).
     fn push_toast(&mut self, cv: Canvas) {
         if self.open || self.toast.is_some() {
@@ -1409,15 +1600,16 @@ impl App {
             })
         };
         let brand = pad_brand();
-        let (a, b) = if brand.contains("DualSense") || brand.contains("Sony") || brand.contains("PlayStation") {
-            (GLYPH_PS_CROSS, GLYPH_PS_CIRCLE)
+        let (a, b, y) = if brand.contains("DualSense") || brand.contains("Sony") || brand.contains("PlayStation") {
+            (GLYPH_PS_CROSS, GLYPH_PS_CIRCLE, GLYPH_PS_TRIANGLE)
         } else if brand.contains("Switch") || brand.contains("Nintendo") {
-            (GLYPH_SW_A, GLYPH_SW_B)
+            (GLYPH_SW_A, GLYPH_SW_B, GLYPH_SW_X)
         } else {
-            (GLYPH_XBOX_A, GLYPH_XBOX_B)
+            (GLYPH_XBOX_A, GLYPH_XBOX_B, GLYPH_XBOX_Y)
         };
         self.ui.pad_a = decode_png(a);
         self.ui.pad_b = decode_png(b);
+        self.ui.pad_y = decode_png(y);
         self.ui.opener = if self.ui.source == Source::Pad {
             Some((self.last_pad_idx, read_battery(self.last_pad_idx)))
         } else {
@@ -1516,7 +1708,7 @@ impl App {
 
     fn step_sel(&mut self, dir: i32) {
         // Disabled rows still take the cursor — they reject on press instead.
-        let n = OPTIONS.len() as i32;
+        let n = self.ui.rows().len() as i32;
         self.sel = ((self.sel as i32 + dir + n) % n) as usize;
         self.sfx.play("move.wav");
         self.redraw();
@@ -1589,13 +1781,31 @@ impl App {
             }
             "up" => self.step_sel(-1),
             "down" => self.step_sel(1),
-            "accept" if !self.ui.enabled(self.sel) => {
+            // North face (Y / Triangle) or keyboard E — the dashboard's own
+            // eject gesture, honored while the launcher row holds a cart.
+            "eject" if self.ui.eject_available(self.sel) => {
+                log("action: eject cart");
+                self.sfx.play("back.wav");
+                self.flash_row();
+                let _ = Command::new("sudo")
+                    .args(["-n", "/usr/bin/kazeta-eject"])
+                    .spawn();
+                // The 1s cart watch flips the launcher row to "insert
+                // cartridge" once the mount actually disappears; the toast
+                // queues until the guide closes.
+                self.last_cart_scan = Instant::now();
+                let cv = self.make_cart_toast("Cart Ejected - Safe to Remove");
+                self.push_toast(cv);
+                self.redraw();
+            }
+            "eject" => {}
+            "accept" if !self.ui.enabled(self.ui.rows()[self.sel]) => {
                 self.sfx.play("reject.wav");
                 self.flash_row();
                 self.redraw();
             }
-            "accept" => match self.sel {
-                0 if self.ui.dashboard => {
+            "accept" => match self.ui.rows()[self.sel] {
+                RowKind::Launch => {
                     // The cart launcher: single game launches, a collection
                     // opens the game list.
                     let games: Vec<PathBuf> = self
@@ -1616,12 +1826,12 @@ impl App {
                         }
                     }
                 }
-                0 => {
+                RowKind::ReturnToGame => {
                     self.flash_row();
                     let r = self.pad_release("accept");
                     self.close_menu(r);
                 }
-                1 => {
+                RowKind::KazetaHome => {
                     log("action: kazeta home");
                     self.sfx.play("select.wav");
                     self.flash_row();
@@ -1630,14 +1840,13 @@ impl App {
                     kill_game();
                     return false;
                 }
-                2 => {
+                RowKind::PowerOff => {
                     log("action: power off");
                     self.flash_row();
                     set_intercept(0);
                     let _ = Command::new("systemctl").arg("poweroff").status();
                     return false;
                 }
-                _ => unreachable!(),
             },
             _ => {}
         }
@@ -1677,8 +1886,10 @@ fn main() {
         font,
         pad_a: None,
         pad_b: None,
+        pad_y: None,
         kb_a: decode_png(GLYPH_KB_ENTER),
         kb_b: decode_png(GLYPH_KB_BACK),
+        kb_y: decode_png(GLYPH_KB_E),
         controller_icon: decode_png(ICON_CONTROLLER),
         sd_icon: decode_png(ICON_SDCARD),
         source: Source::Pad,
@@ -1725,9 +1936,11 @@ fn main() {
                         KS_DOWN => Some("down"),
                         KS_RETURN => Some("accept"),
                         KS_ESCAPE | KS_BACKSPACE => Some("back"),
+                        KS_E => Some("eject"),
                         _ => None,
                     };
                     if let Some(a) = action {
+                        log(&format!("key {} kc={} (open={})", a, k.detail, app.open));
                         app.note_source(Source::Keyboard);
                         // Keyboard closes are never guide-held closes.
                         let a = if a == "toggle" && app.open { "back" } else { a };
@@ -1824,6 +2037,9 @@ fn main() {
                     "ui_up" => "up",
                     "ui_down" => "down",
                     "ui_accept" => "accept",
+                    // The north face arrives under different names across
+                    // InputPlumber versions; none of these are used elsewhere.
+                    "ui_context" | "ui_osk" | "ui_action" => "eject",
                     _ => continue,
                 };
                 if !app.act(action) {

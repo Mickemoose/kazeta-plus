@@ -21,6 +21,7 @@ pub struct InputState {
     pub back: bool,
     pub secondary: bool,
     pub tertiary: bool, // North button (Y/Triangle/C-Up) / keyboard E
+    pub start: bool,    // Start/Menu/Options/+ — "confirm all" style actions
     pub analog_was_neutral: bool,
     pub ui_focus: UIFocus,
     pub last_source: InputSource,
@@ -36,6 +37,7 @@ impl InputState {
     pub fn any_activity(&self) -> bool {
         self.up || self.down || self.left || self.right || self.select || self.next
             || self.prev || self.cycle || self.back || self.secondary || self.tertiary
+            || self.start
     }
 
     pub fn new() -> Self {
@@ -51,6 +53,7 @@ impl InputState {
             back: false,
             secondary: false,
             tertiary: false,
+            start: false,
             analog_was_neutral: true,
             ui_focus: UIFocus::Grid,
             last_source: InputSource::Keyboard,
@@ -71,6 +74,7 @@ impl InputState {
         self.back = false;
         self.secondary = false;
         self.tertiary = false;
+        self.start = false;
         // Note: We do NOT reset analog_was_neutral or ui_focus
     }
 
@@ -122,6 +126,7 @@ impl InputState {
                 gilrs::EventType::ButtonPressed(Button::North, _) => self.tertiary = true,
                 gilrs::EventType::ButtonPressed(Button::RightTrigger, _) => self.next = true,
                 gilrs::EventType::ButtonPressed(Button::LeftTrigger, _) => self.prev = true,
+                gilrs::EventType::ButtonPressed(Button::Start, _) => self.start = true,
                 _ => {}
             }
         }

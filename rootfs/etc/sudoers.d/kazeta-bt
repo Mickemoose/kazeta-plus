@@ -1,0 +1,4 @@
+## Lets the BIOS repair a poisoned Bluetooth pairing: bluetoothd's wedged
+## browse state only clears on a daemon restart (bond survives on disk).
+## Exactly this one command, nothing else. Must be installed mode 0440.
+gamer ALL=(root) NOPASSWD: /usr/bin/systemctl restart bluetooth.service

@@ -15,7 +15,9 @@ use crate::{
     types::{AnimationState, BackgroundState, BatteryInfo, DialogState, ShakeTarget, UIFocus},
     ui::text_with_color,
     ui::blades::BladeAction,
+    ui::bluetooth::{BluetoothScreenState, BluetoothState, BtKind},
     ui::main_menu::{activate_copy_logs, activate_play, activate_save_data},
+    ui::wifi::{AccessPoint, WifiScreenState, WifiState, OSK_COLS, OSK_SPECIALS},
 };
 use crate::audio::AUDIO;
 use crate::input::InputSource;
@@ -278,6 +280,97 @@ thread_local! {
         legend_tex(include_bytes!("../../buttons/steam_button_color_y.png")),
         legend_tex(include_bytes!("../../buttons/n64_button_cup.png")),
     ];
+    // West-face glyphs (X / Square / Y / C-Left / keyboard X) — the secondary
+    // action, e.g. backspace on the on-screen keyboard.
+    static LEGEND_ICONS_WEST: [Texture2D; 7] = [
+        legend_tex(include_bytes!("../../buttons/keyboard_x.png")),
+        legend_tex(include_bytes!("../../buttons/xbox_button_color_x.png")),
+        legend_tex(include_bytes!("../../buttons/playstation_button_color_square.png")),
+        legend_tex(include_bytes!("../../buttons/switch1_button_y.png")),
+        legend_tex(include_bytes!("../../buttons/switch2_button_y.png")),
+        legend_tex(include_bytes!("../../buttons/steam_button_color_x.png")),
+        legend_tex(include_bytes!("../../buttons/n64_button_cleft.png")),
+    ];
+    // Start-family glyphs (Menu / Options / + / N64 Start), for "confirm all".
+    static LEGEND_ICONS_START: [Texture2D; 7] = [
+        legend_tex(include_bytes!("../../buttons/keyboard_enter.png")),
+        legend_tex(include_bytes!("../../buttons/xbox_button_menu.png")),
+        legend_tex(include_bytes!("../../buttons/playstation_button_options.png")),
+        legend_tex(include_bytes!("../../buttons/switch1_button_plus.png")),
+        legend_tex(include_bytes!("../../buttons/switch2_button_plus.png")),
+        legend_tex(include_bytes!("../../buttons/steam_button_start.png")),
+        legend_tex(include_bytes!("../../buttons/n64_button_start.png")),
+    ];
+    // Shoulder glyphs (brackets on keyboard, L1/R1 on PlayStation, L/R on
+    // Nintendo pads) — page flips, rescans, OSK shift/symbols.
+    static LEGEND_ICONS_LB: [Texture2D; 7] = [
+        legend_tex(include_bytes!("../../buttons/keyboard_bracket_open.png")),
+        legend_tex(include_bytes!("../../buttons/xbox_lb.png")),
+        legend_tex(include_bytes!("../../buttons/playstation_trigger_l1.png")),
+        legend_tex(include_bytes!("../../buttons/switch1_button_l.png")),
+        legend_tex(include_bytes!("../../buttons/switch2_button_l.png")),
+        legend_tex(include_bytes!("../../buttons/steam_lb.png")),
+        legend_tex(include_bytes!("../../buttons/n64_button_l.png")),
+    ];
+    static LEGEND_ICONS_RB: [Texture2D; 7] = [
+        legend_tex(include_bytes!("../../buttons/keyboard_bracket_close.png")),
+        legend_tex(include_bytes!("../../buttons/xbox_rb.png")),
+        legend_tex(include_bytes!("../../buttons/playstation_trigger_r1.png")),
+        legend_tex(include_bytes!("../../buttons/switch1_button_r.png")),
+        legend_tex(include_bytes!("../../buttons/switch2_button_r.png")),
+        legend_tex(include_bytes!("../../buttons/steam_rb.png")),
+        legend_tex(include_bytes!("../../buttons/n64_button_r.png")),
+    ];
+    // D-pad / arrow-cluster glyphs for "move" legends.
+    static LEGEND_ICONS_DPAD: [Texture2D; 7] = [
+        legend_tex(include_bytes!("../../buttons/keyboard_arrows_all.png")),
+        legend_tex(include_bytes!("../../buttons/xbox_dpad_all.png")),
+        legend_tex(include_bytes!("../../buttons/playstation_dpad_all.png")),
+        legend_tex(include_bytes!("../../buttons/switch1_dpad_all.png")),
+        legend_tex(include_bytes!("../../buttons/switch2_dpad_all.png")),
+        legend_tex(include_bytes!("../../buttons/steam_dpad_all.png")),
+        legend_tex(include_bytes!("../../buttons/n64_dpad.png")),
+    ];
+}
+
+/// Bottom-left shoulder hint: real LB/RB glyphs plus a label, replacing the
+/// old abbreviation chips ("LB", "R1", "]") that guessed at the brand.
+fn draw_shoulder_hint(
+    font: &Font,
+    legend: LegendIcon,
+    label: &str,
+    show_lb: bool,
+    show_rb: bool,
+    s: f32,
+    a: f32,
+) {
+    let icon_h = 14.0 * s;
+    let cy = 323.5 * s; // vertical center of the old chip row
+    let mut x = ORIGIN_X * s;
+    let mut icon = |tex: &Texture2D, x: &mut f32| {
+        draw_texture_ex(tex, *x, cy - icon_h / 2.0, Color::new(1.0, 1.0, 1.0, a),
+            DrawTextureParams { dest_size: Some(vec2(icon_h, icon_h)), ..Default::default() });
+        *x += icon_h + 3.0 * s;
+    };
+    if show_lb {
+        LEGEND_ICONS_LB.with(|i| icon(&i[legend as usize], &mut x));
+    }
+    if show_rb {
+        LEGEND_ICONS_RB.with(|i| icon(&i[legend as usize], &mut x));
+    }
+    x += 3.0 * s;
+    let size = ((FONT_SIZE as f32 * s * 0.68) as u16).max(9);
+    let d = measure_text(label, Some(font), size, 1.0);
+    let ty = cy + d.offset_y * 0.5;
+    let so = 1.0 * (size as f32 / FONT_SIZE as f32);
+    draw_text_ex(label, x + so, ty + so, TextParams {
+        font: Some(font), font_size: size,
+        color: Color::new(0.0, 0.0, 0.0, 0.85 * 0.55 * a), ..Default::default()
+    });
+    draw_text_ex(label, x, ty, TextParams {
+        font: Some(font), font_size: size,
+        color: Color::new(1.0, 1.0, 1.0, 0.55 * a), ..Default::default()
+    });
 }
 
 fn legend_tex(bytes: &[u8]) -> Texture2D {
@@ -3610,30 +3703,9 @@ pub fn draw_settings(
         }
     }
 
-    // --- Bottom left: the shoulder buttons change page. Names follow the
-    // controller brand rather than assuming Xbox. ---
-    {
-        let (lb, rb) = match choices.legend {
-            LegendIcon::Keyboard => ("[", "]"),
-            LegendIcon::PlayStation => ("L1", "R1"),
-            LegendIcon::Switch | LegendIcon::Switch2 | LegendIcon::N64 => ("L", "R"),
-            _ => ("LB", "RB"),
-        };
-        let a = overlay_a;
-        let size = fs(0.62);
-        let cw = 15.0 * s;
-        let chh = 11.0 * s;
-        let cy = 318.0 * s;
-        for (i, name) in [lb, rb].iter().enumerate() {
-            let bx = (m + i as f32 * 18.0) * s;
-            draw_rectangle(bx, cy, cw, chh, Color::new(0.24, 0.25, 0.26, 0.85 * a));
-            let d = measure_text(name, Some(font), size, 1.0);
-            txt(name, bx + (cw - d.width) / 2.0, cy + chh / 2.0 + d.offset_y * 0.5, size,
-                Color::new(1.0, 1.0, 1.0, 0.85 * a));
-        }
-        txt("Page", (m + 38.0) * s, cy + chh / 2.0 + 3.0 * s, fs(0.68),
-            Color::new(1.0, 1.0, 1.0, 0.55 * a));
-    }
+    // --- Bottom left: the shoulder buttons change page, shown with the
+    // brand's real glyphs. ---
+    draw_shoulder_hint(font, choices.legend, "Page", true, true, s, overlay_a);
 
     // The dashboard's own status furniture, minus the logo — a tall custom
     // logo would otherwise land on the detail pane.
@@ -4257,25 +4329,7 @@ pub fn draw_save_data(
 
         // Shoulder hint, same geometry as the settings screen so the two line up.
         if media_ids.len() > 1 {
-            let (lb, rb) = match legend_now {
-                LegendIcon::Keyboard => ("[", "]"),
-                LegendIcon::PlayStation => ("L1", "R1"),
-                LegendIcon::Switch | LegendIcon::Switch2 | LegendIcon::N64 => ("L", "R"),
-                _ => ("LB", "RB"),
-            };
-            let psize = fs(0.62);
-            let cw = 15.0 * s;
-            let chh = 11.0 * s;
-            let pcy = 318.0 * s;
-            for (i, name) in [lb, rb].iter().enumerate() {
-                let px2 = (m + i as f32 * 18.0) * s;
-                draw_rectangle(px2, pcy, cw, chh, Color::new(0.24, 0.25, 0.26, 0.85 * overlay_a));
-                let d = measure_text(name, Some(font), psize, 1.0);
-                txt(name, px2 + (cw - d.width) / 2.0, pcy + chh / 2.0 + d.offset_y * 0.5, psize,
-                    Color::new(1.0, 1.0, 1.0, 0.85 * overlay_a));
-            }
-            txt("Storage", (m + 38.0) * s, pcy + chh / 2.0 + 3.0 * s, fs(0.68),
-                Color::new(1.0, 1.0, 1.0, 0.55 * overlay_a));
+            draw_shoulder_hint(font, legend_now, "Storage", true, true, s, overlay_a);
         }
     }
 
@@ -4772,4 +4826,1426 @@ pub fn guide_overlay(
     }
 
     action
+}
+
+// ===================================
+// METRO BLUETOOTH SCREEN
+// ===================================
+
+// Same frame as settings: a list on the left, a detail pane on the right.
+const BT_LIST_TOP: f32 = 84.0;
+const BT_LIST_H: f32 = 178.0;
+const BT_ROW_PITCH: f32 = 21.0;
+const BT_HEAD_H: f32 = 13.0;
+const BT_INTRO_TIME: f32 = 0.45;
+
+/// One line of the left-hand list. Section headings are rows too, so the
+/// window that decides what fits can measure them.
+enum BtSlot {
+    Head(&'static str),
+    Dev(usize),
+}
+
+struct BtAnim {
+    last_draw: f64,
+    intro: f32,
+    sel: usize,
+    prev_sel: Option<usize>,
+    sel_anim: f32,
+    top: usize,
+    len: usize,
+}
+
+thread_local! {
+    static BT_ANIM: RefCell<BtAnim> = RefCell::new(BtAnim {
+        last_draw: -10.0, intro: 1.0, sel: usize::MAX, prev_sel: None,
+        sel_anim: 1.0, top: 0, len: 0,
+    });
+}
+
+/// Device-family pictograms. Only the gamepad has real art — the rest are
+/// small enough that primitives read better than scaled-down icons would.
+fn bt_kind_glyph(kind: BtKind, x: f32, y: f32, d: f32, color: Color) {
+    let cx = x + d * 0.5;
+    let cy = y + d * 0.5;
+    match kind {
+        BtKind::Gamepad => TOAST_PAD_ICON.with(|t| {
+            draw_texture_ex(t, x, y, color, DrawTextureParams {
+                dest_size: Some(vec2(d, d)), ..Default::default()
+            })
+        }),
+        BtKind::Audio => {
+            // Headband as a run of squares along an arc, then the two cups.
+            let th = d * 0.11;
+            let r = d * 0.32;
+            for i in 0..11 {
+                let a = std::f32::consts::PI * (1.05 + 0.9 * (i as f32 / 10.0));
+                draw_rectangle(cx + a.cos() * r - th * 0.5, cy + a.sin() * r - th * 0.5 + d * 0.06,
+                    th, th, color);
+            }
+            let cw = d * 0.17;
+            let ch = d * 0.30;
+            draw_rectangle(cx - r - cw * 0.5, cy + d * 0.02, cw, ch, color);
+            draw_rectangle(cx + r - cw * 0.5, cy + d * 0.02, cw, ch, color);
+        }
+        BtKind::Keyboard => {
+            draw_rectangle_lines(x + d * 0.04, y + d * 0.24, d * 0.92, d * 0.52, d * 0.09, color);
+            let k = d * 0.09;
+            for row in 0..2 {
+                for col in 0..4 {
+                    draw_rectangle(x + d * (0.16 + col as f32 * 0.19),
+                        y + d * (0.36 + row as f32 * 0.19), k, k, color);
+                }
+            }
+            draw_rectangle(x + d * 0.30, y + d * 0.60, d * 0.40, k, color);
+        }
+        BtKind::Mouse => {
+            draw_rectangle_lines(x + d * 0.26, y + d * 0.08, d * 0.48, d * 0.84, d * 0.09, color);
+            draw_rectangle(cx - d * 0.04, y + d * 0.16, d * 0.08, d * 0.20, color);
+        }
+        BtKind::Phone => {
+            draw_rectangle_lines(x + d * 0.26, y + d * 0.06, d * 0.48, d * 0.88, d * 0.09, color);
+            draw_rectangle(cx - d * 0.10, y + d * 0.16, d * 0.20, d * 0.05, color);
+        }
+        _ => TILE_BLUETOOTH.with(|t| {
+            draw_texture_ex(t, x, y, color, DrawTextureParams {
+                dest_size: Some(vec2(d, d)), ..Default::default()
+            })
+        }),
+    }
+}
+
+/// Four rising bars, the filled ones lit.
+fn bt_signal_bars(right: f32, cy: f32, s: f32, bars: u8, color: Color) {
+    let bw = 3.0 * s;
+    let gap = 1.6 * s;
+    for i in 0..4 {
+        let bh = (3.0 + i as f32 * 2.4) * s;
+        let x = right - (4.0 - i as f32) * (bw + gap);
+        let c = if (i as u8) < bars { color } else { Color::new(1.0, 1.0, 1.0, 0.16) };
+        draw_rectangle(x, cy + 5.0 * s - bh, bw, bh, c);
+    }
+}
+
+fn bt_battery_pill(right: f32, cy: f32, s: f32, pct: u8, alpha: f32) {
+    let w = 18.0 * s;
+    let h = 9.0 * s;
+    let x = right - w;
+    let y = cy - h / 2.0;
+    let col = if pct <= 15 {
+        Color::new(0.90, 0.30, 0.26, alpha)
+    } else {
+        Color::new(1.0, 1.0, 1.0, 0.92 * alpha)
+    };
+    draw_rectangle_lines(x, y, w, h, 1.2 * s, Color::new(1.0, 1.0, 1.0, 0.45 * alpha));
+    draw_rectangle(x + w, cy - 2.0 * s, 2.0 * s, 4.0 * s, Color::new(1.0, 1.0, 1.0, 0.45 * alpha));
+    let inner = (w - 4.0 * s) * (pct as f32 / 100.0).clamp(0.0, 1.0);
+    draw_rectangle(x + 2.0 * s, y + 2.0 * s, inner, h - 4.0 * s, col);
+}
+
+pub fn draw_bluetooth(
+    state: &BluetoothState,
+    logo_cache: &HashMap<String, Texture2D>,
+    background_cache: &HashMap<String, Texture2D>,
+    video_cache: &mut HashMap<String, VideoPlayer>,
+    font_cache: &HashMap<String, Font>,
+    config: &Config,
+    background_state: &mut BackgroundState,
+    battery_info: &Option<BatteryInfo>,
+    current_time_str: &str,
+    gcc_adapter_poll_rate: &Option<u32>,
+    input_state: &InputState,
+    s: f32,
+) {
+    let font = get_current_font(font_cache, config);
+    let w = screen_width();
+    let h = screen_height();
+    let w_du = w / s;
+    let t = get_time() as f32;
+
+    // --- Frame, matching settings and the save wall ---
+    let m = ORIGIN_X;
+    let small_w = 80.0 * (185.0 / 131.0);
+    let grid_right = m + 4.0 * small_w + 3.0 * 2.0;
+    let content_r = grid_right.min(w_du - m);
+    let content_w = content_r - m;
+    let col_gap = 8.0;
+    let list_w = (2.0 * small_w + 2.0).min((content_w - col_gap) * 0.55);
+    let pane_w = content_w - col_gap - list_w;
+    let list_x = m;
+    let pane_x = m + list_w + col_gap;
+
+    let legend = match input_state.last_source {
+        InputSource::Keyboard => LegendIcon::Keyboard,
+        InputSource::Pad => pad_legend_icon(input_state.pad_vendor, &input_state.pad_name),
+    };
+
+    // --- Slots: two labelled sections over one flat device list ---
+    let mut slots: Vec<BtSlot> = Vec::new();
+    if state.paired_count > 0 {
+        slots.push(BtSlot::Head("my devices"));
+    }
+    for i in 0..state.paired_count {
+        slots.push(BtSlot::Dev(i));
+    }
+    if state.devices.len() > state.paired_count {
+        slots.push(BtSlot::Head("available"));
+    }
+    for i in state.paired_count..state.devices.len() {
+        slots.push(BtSlot::Dev(i));
+    }
+    let slot_h = |sl: &BtSlot| match sl {
+        BtSlot::Head(_) => BT_HEAD_H,
+        BtSlot::Dev(_) => BT_ROW_PITCH,
+    };
+    let sel_slot = slots
+        .iter()
+        .position(|sl| matches!(sl, BtSlot::Dev(i) if *i == state.selected_index));
+
+    // --- Clocks ---
+    let (intro, sel_anim, prev_sel, top) = BT_ANIM.with(|cell| {
+        let mut a = cell.borrow_mut();
+        let now = get_time();
+        let dt = get_frame_time();
+        if now - a.last_draw > 0.25 {
+            a.intro = 0.0;
+            a.sel = state.selected_index;
+            a.prev_sel = None;
+            a.sel_anim = 1.0;
+            a.top = 0;
+            a.len = state.devices.len();
+        }
+        a.last_draw = now;
+        if state.selected_index != a.sel {
+            a.prev_sel = Some(a.sel);
+            a.sel = state.selected_index;
+            a.sel_anim = 0.0;
+        }
+        if state.devices.len() != a.len {
+            a.len = state.devices.len();
+        }
+
+        // Window the list without a scissor: slide the top slot down until the
+        // cursor's row fits whole inside the box.
+        if let Some(sel) = sel_slot {
+            if a.top > sel {
+                a.top = sel;
+            }
+            loop {
+                let mut y = 0.0;
+                let mut fits = false;
+                for i in a.top..slots.len() {
+                    let sh = slot_h(&slots[i]);
+                    if y + sh > BT_LIST_H {
+                        break;
+                    }
+                    if i == sel {
+                        fits = true;
+                        break;
+                    }
+                    y += sh;
+                }
+                if fits || a.top + 1 >= slots.len() {
+                    break;
+                }
+                a.top += 1;
+            }
+            // Never strand a section heading above the fold on its own.
+            if a.top > 0 && a.top == sel && matches!(slots[a.top - 1], BtSlot::Head(_)) {
+                a.top -= 1;
+            }
+        } else {
+            a.top = 0;
+        }
+        if a.top >= slots.len() {
+            a.top = 0;
+        }
+
+        let step = dt.min(0.05);
+        a.intro = (a.intro + step / BT_INTRO_TIME).min(1.0);
+        a.sel_anim = (a.sel_anim + step).min(1.0);
+        (a.intro, a.sel_anim, a.prev_sel, a.top)
+    });
+
+    let overlay_a = ease_out_sine(((intro - 0.18) / 0.25).clamp(0.0, 1.0));
+    let header_drop = (1.0 - ease_out(intro)) * 120.0 * s;
+
+    let txt = |text: &str, x: f32, y: f32, size: u16, color: Color| {
+        let so = 1.0 * (size as f32 / FONT_SIZE as f32);
+        draw_text_ex(text, x + so, y + so, TextParams {
+            font: Some(font), font_size: size,
+            color: Color::new(0.0, 0.0, 0.0, 0.85 * color.a), ..Default::default()
+        });
+        draw_text_ex(text, x, y, TextParams {
+            font: Some(font), font_size: size, color, ..Default::default()
+        });
+    };
+    let fs = |k: f32| ((FONT_SIZE as f32 * s * k) as u16).max(9);
+    let fit = |text: &str, k: f32, max_w: f32| -> (String, u16) {
+        let mut size = fs(k);
+        let d = measure_text(text, Some(font), size, 1.0);
+        if d.width > max_w && d.width > 0.0 {
+            size = (((size as f32) * max_w / d.width).floor() as u16).max(9);
+        }
+        let mut out = text.to_string();
+        if measure_text(&out, Some(font), size, 1.0).width > max_w {
+            while out.chars().count() > 1
+                && measure_text(&format!("{}…", out), Some(font), size, 1.0).width > max_w
+            {
+                out.pop();
+            }
+            out.push('…');
+        }
+        (out, size)
+    };
+    let right_txt = |text: &str, right: f32, y: f32, size: u16, color: Color| -> f32 {
+        let d = measure_text(text, Some(font), size, 1.0);
+        txt(text, right - d.width, y, size, color);
+        right - d.width
+    };
+
+    // --- Background ---
+    draw_rectangle(0.0, 0.0, w, h, BG_FALLBACK);
+    render_background(background_cache, video_cache, config, background_state);
+    draw_rectangle(0.0, 0.0, w, h, Color::new(0.0, 0.0, 0.0, 0.35));
+    FADE_TEX.with(|tex| {
+        draw_texture_ex(tex, 0.0, 0.0, Color::new(0.0, 0.0, 0.0, 0.35), DrawTextureParams {
+            dest_size: Some(vec2(w, 100.0 * s)), flip_y: true, ..Default::default()
+        });
+    });
+
+    let selected = state.selected();
+
+    // --- Detail pane (under the rows, so a focused row's glow spills over it) ---
+    let pane_slide = (1.0 - ease_out((intro / 0.34).min(1.0))) * w * 0.60;
+    let px = pane_x * s + pane_slide;
+    let py = BT_LIST_TOP * s;
+    let pw = pane_w * s;
+    let ph = 132.0 * s;
+    {
+        let connected = selected.map(|d| d.connected).unwrap_or(false);
+        draw_rectangle(px, py, pw, ph, if connected { XBOX_GREEN } else { TILE_SLATE_ALT });
+        FADE_TEX.with(|tex| {
+            draw_texture_ex(tex, px, py, Color::new(1.0, 1.0, 1.0, 0.28), DrawTextureParams {
+                dest_size: Some(vec2(pw, ph * 0.16)), flip_y: true, ..Default::default()
+            });
+            draw_texture_ex(tex, px, py + ph * 0.74, Color::new(0.0, 0.0, 0.0, 0.55), DrawTextureParams {
+                dest_size: Some(vec2(pw, ph * 0.26)), ..Default::default()
+            });
+        });
+
+        let ix = px + 14.0 * s;
+        let iy = py + 14.0 * s;
+        let icon_d = 40.0 * s;
+        match selected {
+            Some(d) => {
+                bt_kind_glyph(d.kind(), ix, iy, icon_d, Color::new(1.0, 1.0, 1.0, 0.92));
+
+                let (name, nsize) = fit(&d.name, 1.20, pw - 28.0 * s);
+                txt(&name, px + 14.0 * s, py + 74.0 * s, nsize, WHITE);
+                txt(&d.mac_address, px + 14.0 * s, py + 88.0 * s, fs(0.66),
+                    Color::new(1.0, 1.0, 1.0, 0.45));
+
+                // Status line, and whichever meter actually means something:
+                // battery once we are talking to it, signal while we are not.
+                let status = if d.connected {
+                    "Connected"
+                } else if d.paired {
+                    "Paired · not connected"
+                } else {
+                    match d.kind() {
+                        BtKind::Gamepad => "New controller",
+                        BtKind::Audio => "New audio device",
+                        _ => "New device",
+                    }
+                };
+                txt(status, px + 14.0 * s, py + 106.0 * s, fs(0.76),
+                    Color::new(1.0, 1.0, 1.0, 0.88));
+
+                if let Some(pct) = d.battery {
+                    bt_battery_pill(px + pw - 14.0 * s, py + 102.0 * s, s, pct, 1.0);
+                    right_txt(&format!("{}%", pct), px + pw - 36.0 * s, py + 106.0 * s, fs(0.76),
+                        Color::new(1.0, 1.0, 1.0, 0.88));
+                } else if let Some(bars) = d.bars() {
+                    bt_signal_bars(px + pw - 14.0 * s, py + 102.0 * s, s, bars,
+                        Color::new(1.0, 1.0, 1.0, 0.92));
+                }
+
+                // What Select will do, spelled out.
+                let hint = match (d.connected, d.paired, d.kind()) {
+                    (true, _, _) => "Already in use. Select to disconnect.",
+                    (false, true, BtKind::Gamepad) => "Select to connect, or press its home button.",
+                    (false, true, _) => "Select to connect.",
+                    (false, false, _) => "Select to pair with this console.",
+                };
+                let (hint, hsize) = fit(hint, 0.66, pw - 28.0 * s);
+                txt(&hint, px + 14.0 * s, py + 122.0 * s, hsize, Color::new(1.0, 1.0, 1.0, 0.55));
+            }
+            None => {
+                TILE_BLUETOOTH.with(|tex| {
+                    draw_texture_ex(tex, ix, iy, Color::new(1.0, 1.0, 1.0, 0.35), DrawTextureParams {
+                        dest_size: Some(vec2(icon_d, icon_d)), ..Default::default()
+                    })
+                });
+                let head = if state.fatal.is_some() { "Unavailable" } else { "Nothing yet" };
+                txt(head, px + 14.0 * s, py + 74.0 * s, fs(1.20), Color::new(1.0, 1.0, 1.0, 0.75));
+                let body = match &state.fatal {
+                    Some(e) => e.clone(),
+                    None => "Put your device into pairing mode and it will appear here.".to_string(),
+                };
+                let (body, bsize) = fit(&body, 0.72, pw - 28.0 * s);
+                txt(&body, px + 14.0 * s, py + 92.0 * s, bsize, Color::new(1.0, 1.0, 1.0, 0.55));
+                if state.fatal.is_none() {
+                    txt("DualSense: hold PS + Create.", px + 14.0 * s, py + 108.0 * s, fs(0.66),
+                        Color::new(1.0, 1.0, 1.0, 0.45));
+                    txt("Xbox: hold the pair button on the back.", px + 14.0 * s, py + 122.0 * s,
+                        fs(0.66), Color::new(1.0, 1.0, 1.0, 0.45));
+                }
+            }
+        }
+    }
+
+    // --- List ---
+    let row_slide = |i: usize| -> f32 {
+        if intro >= 1.0 {
+            return 0.0;
+        }
+        let p = ease_out(((intro - i as f32 * 0.03) / 0.40).clamp(0.0, 1.0));
+        -(1.0 - p) * 70.0 * s
+    };
+
+    // Pre-compute where every visible slot lands, so the draw passes agree
+    // without walking the list again.
+    let mut placed: Vec<(usize, f32)> = Vec::new(); // (slot index, y in design units)
+    {
+        let mut y = 0.0;
+        for i in top..slots.len() {
+            let sh = slot_h(&slots[i]);
+            if y + sh > BT_LIST_H {
+                break;
+            }
+            placed.push((i, BT_LIST_TOP + y));
+            y += sh;
+        }
+    }
+
+    let draw_dev_row = |dev_i: usize, order: usize, y_du: f32, focused: bool, shrinking: bool| {
+        let Some(d) = state.devices.get(dev_i) else { return };
+        let k = if focused {
+            ease_out((sel_anim / SEL_GROW_TIME).min(1.0))
+        } else if shrinking {
+            1.0 - ease_out_sine((sel_anim / SEL_SHRINK_TIME).min(1.0))
+        } else {
+            0.0
+        };
+        let g = k * 2.0 * s;
+        let rx = list_x * s - g + row_slide(order);
+        let ry = y_du * s - g;
+        let rw = list_w * s + g * 2.0;
+        let rh = (BT_ROW_PITCH - 2.0) * s + g * 2.0;
+
+        if k > 0.01 {
+            draw_tile_shadow(rx, ry, rw, rh, s, k);
+        }
+        let fill = if focused {
+            TILE_FOCUS
+        } else if order % 2 == 0 {
+            TILE_SLATE
+        } else {
+            TILE_SLATE_ALT
+        };
+        draw_rectangle(rx, ry, rw, rh, fill);
+        FADE_TEX.with(|tex| {
+            draw_texture_ex(tex, rx, ry, Color::new(1.0, 1.0, 1.0, 0.05), DrawTextureParams {
+                dest_size: Some(vec2(rw, rh * 0.40)), flip_y: true, ..Default::default()
+            });
+            draw_texture_ex(tex, rx, ry + rh * 0.60, Color::new(0.0, 0.0, 0.0, 0.40), DrawTextureParams {
+                dest_size: Some(vec2(rw, rh * 0.40)), ..Default::default()
+            });
+        });
+        // A live device carries a green spine, the same mark the dashboard
+        // uses for "this one is doing something".
+        if d.connected {
+            draw_rectangle(rx, ry, 3.0 * s, rh, XBOX_GREEN);
+        }
+
+        let cy = ry + rh / 2.0;
+        let gd = 13.0 * s;
+        bt_kind_glyph(d.kind(), rx + 8.0 * s, cy - gd / 2.0, gd,
+            Color::new(1.0, 1.0, 1.0, if focused { 0.95 } else { 0.72 }));
+
+        let name_x = rx + 8.0 * s + gd + 7.0 * s;
+        let (name, nsize) = fit(&d.name, 0.80, rw * 0.52);
+        let nd = measure_text(&name, Some(font), nsize, 1.0);
+        let base_y = cy + nd.offset_y * 0.5;
+        txt(&name, name_x, base_y, nsize,
+            if focused { WHITE } else { Color::new(1.0, 1.0, 1.0, 0.82) });
+
+        // Right edge: status word, then whichever meter fits behind it.
+        let mut right = rx + rw - 8.0 * s;
+        if let Some(pct) = d.battery {
+            bt_battery_pill(right, cy, s, pct, 1.0);
+            right -= 24.0 * s;
+        }
+        if d.connected {
+            right = right_txt("Connected", right, base_y, fs(0.70), Color::new(1.0, 1.0, 1.0, 0.92))
+                - 6.0 * s;
+            TOAST_DOT.with(|dot| {
+                let r = 3.0 * s;
+                draw_texture_ex(dot, right - r * 2.0, cy - r, Color::new(0.30, 0.85, 0.35, 1.0),
+                    DrawTextureParams { dest_size: Some(vec2(r * 2.0, r * 2.0)), ..Default::default() });
+            });
+        } else if d.paired {
+            right_txt("Paired", right, base_y, fs(0.70), Color::new(1.0, 1.0, 1.0, 0.50));
+        } else if let Some(bars) = d.bars() {
+            bt_signal_bars(right, cy, s, bars, Color::new(1.0, 1.0, 1.0, 0.80));
+        }
+
+        if focused {
+            draw_focus_glow_ex(rx, ry, rw, rh, s, string_to_color(&config.cursor_color), 0.45, 1.0);
+        }
+    };
+
+    if state.devices.is_empty() {
+        // Nothing to list yet: say so where the rows would have been.
+        let cx = list_x * s + 8.0 * s;
+        let cy = (BT_LIST_TOP + 40.0) * s;
+        let dots = ".".repeat((t * 2.0) as usize % 4);
+        let head = if state.fatal.is_some() {
+            "Bluetooth is unavailable".to_string()
+        } else {
+            format!("Searching{}", dots)
+        };
+        txt(&head, cx, cy, fs(1.10), Color::new(1.0, 1.0, 1.0, 0.75 * overlay_a));
+        if state.fatal.is_none() {
+            txt("Nothing has answered yet.", cx, cy + 20.0 * s, fs(0.74),
+                Color::new(1.0, 1.0, 1.0, 0.45 * overlay_a));
+            // A sweeping bar, so the screen never looks frozen.
+            let bw = list_w * s * 0.30;
+            let travel = list_w * s - bw;
+            let p = ((t * 0.6).sin() * 0.5 + 0.5) * travel;
+            draw_rectangle(list_x * s + p, cy + 30.0 * s, bw, 2.0 * s,
+                Color::new(1.0, 1.0, 1.0, 0.22 * overlay_a));
+        }
+    } else {
+        // Headings first, then rows at rest, then the one shrinking back, then
+        // the focused row on top — the settings screen's pass order.
+        for (order, (slot_i, y_du)) in placed.iter().enumerate() {
+            if let BtSlot::Head(label) = &slots[*slot_i] {
+                txt(label, list_x * s + row_slide(order), (*y_du + 9.0) * s, fs(0.68),
+                    Color::new(1.0, 1.0, 1.0, 0.42 * overlay_a));
+            }
+        }
+        for (order, (slot_i, y_du)) in placed.iter().enumerate() {
+            if let BtSlot::Dev(i) = slots[*slot_i] {
+                if i != state.selected_index && Some(i) != prev_sel {
+                    draw_dev_row(i, order, *y_du, false, false);
+                }
+            }
+        }
+        for (order, (slot_i, y_du)) in placed.iter().enumerate() {
+            if let BtSlot::Dev(i) = slots[*slot_i] {
+                if Some(i) == prev_sel && i != state.selected_index {
+                    draw_dev_row(i, order, *y_du, false, true);
+                }
+            }
+        }
+        for (order, (slot_i, y_du)) in placed.iter().enumerate() {
+            if let BtSlot::Dev(i) = slots[*slot_i] {
+                if i == state.selected_index {
+                    draw_dev_row(i, order, *y_du, true, false);
+                }
+            }
+        }
+
+        // More above / below.
+        let chev = Color::new(1.0, 1.0, 1.0, 0.35 * overlay_a);
+        let cxx = list_x * s + list_w * s / 2.0;
+        if top > 0 {
+            let ty = (BT_LIST_TOP - 5.0) * s;
+            draw_triangle(vec2(cxx, ty - 3.5 * s), vec2(cxx - 5.0 * s, ty + 1.5 * s),
+                vec2(cxx + 5.0 * s, ty + 1.5 * s), chev);
+        }
+        if placed.last().map(|(i, _)| *i + 1 < slots.len()).unwrap_or(false) {
+            let by = (BT_LIST_TOP + BT_LIST_H + 3.0) * s;
+            draw_triangle(vec2(cxx, by + 3.5 * s), vec2(cxx - 5.0 * s, by - 1.5 * s),
+                vec2(cxx + 5.0 * s, by - 1.5 * s), chev);
+        }
+    }
+
+    // --- Header: eyebrow, title, live scan state ---
+    txt("bluetooth", m * s, 36.0 * s - header_drop, fs(0.80), Color::new(1.0, 1.0, 1.0, 0.45));
+    {
+        let strip_y = 62.0 * s - header_drop;
+        txt("devices", m * s, strip_y, fs(1.45), WHITE);
+        let after = m * s + measure_text("devices", Some(font), fs(1.45), 1.0).width + 14.0 * s;
+        if state.fatal.is_none() {
+            // Breathing dot while the radio is actually searching; a still,
+            // dim one when it has settled down after a connect.
+            let (dot_col, label) = if state.scanning {
+                let pulse = 0.35 + 0.45 * ((t * 3.0).sin() * 0.5 + 0.5);
+                let label = if state.devices.is_empty() {
+                    "scanning".to_string()
+                } else {
+                    format!("scanning · {} found", state.devices.len())
+                };
+                (Color::new(0.35, 0.75, 1.0, pulse), label)
+            } else {
+                (Color::new(1.0, 1.0, 1.0, 0.25), format!("{} found", state.devices.len()))
+            };
+            TOAST_DOT.with(|dot| {
+                let r = 3.2 * s;
+                draw_texture_ex(dot, after, strip_y - 6.0 * s - r, dot_col,
+                    DrawTextureParams { dest_size: Some(vec2(r * 2.0, r * 2.0)), ..Default::default() });
+            });
+            txt(&label, after + 11.0 * s, strip_y - 3.0 * s, fs(0.80),
+                Color::new(1.0, 1.0, 1.0, 0.42));
+        }
+    }
+
+    // --- Legend, bottom right ---
+    {
+        let cy = 324.0 * s;
+        let icon_h = 18.0 * s;
+        let size = fs(0.80);
+        let a = overlay_a;
+        let leg = |text: &str, x: f32| {
+            let d = measure_text(text, Some(font), size, 1.0);
+            txt(text, x - d.width, cy + d.offset_y * 0.5, size, Color::new(1.0, 1.0, 1.0, 0.75 * a));
+            x - d.width
+        };
+        let back_x = leg("Back", w - 24.0 * s);
+        LEGEND_ICONS_BACK.with(|icons| {
+            draw_texture_ex(&icons[legend as usize], back_x - 4.0 * s - icon_h, cy - icon_h / 2.0,
+                Color::new(1.0, 1.0, 1.0, a),
+                DrawTextureParams { dest_size: Some(vec2(icon_h, icon_h)), ..Default::default() });
+        });
+        let mut group_x = back_x - 4.0 * s - icon_h - 16.0 * s;
+
+        if let Some(d) = selected {
+            if d.paired {
+                let x = leg("Forget", group_x);
+                LEGEND_ICONS_EJECT.with(|icons| {
+                    draw_texture_ex(&icons[legend as usize], x - 4.0 * s - icon_h, cy - icon_h / 2.0,
+                        Color::new(1.0, 1.0, 1.0, a),
+                        DrawTextureParams { dest_size: Some(vec2(icon_h, icon_h)), ..Default::default() });
+                });
+                group_x = x - 4.0 * s - icon_h - 16.0 * s;
+            }
+            let x = leg(d.action_verb(), group_x);
+            LEGEND_ICONS.with(|icons| {
+                draw_texture_ex(&icons[legend as usize], x - 4.0 * s - icon_h, cy - icon_h / 2.0,
+                    Color::new(1.0, 1.0, 1.0, a),
+                    DrawTextureParams { dest_size: Some(vec2(icon_h, icon_h)), ..Default::default() });
+            });
+        }
+    }
+
+    // --- Bottom left: the shoulder button rescans ---
+    draw_shoulder_hint(font, legend, "Search again", false, true, s, overlay_a);
+
+    // --- Cards: waiting, outcome, confirm removal ---
+    let card_w = (320.0 * s).min(w - 40.0 * s);
+    let card_h = 104.0 * s;
+    let card_x = (w - card_w) / 2.0;
+    let card_y = (h - card_h) / 2.0;
+    let card = |title: &str, body: &str, accent: Color, spinner: bool| {
+        draw_rectangle(0.0, 0.0, w, h, Color::new(0.0, 0.0, 0.0, 0.60));
+        draw_tile_shadow(card_x, card_y, card_w, card_h, s, 1.0);
+        draw_rectangle(card_x, card_y, card_w, card_h, TILE_SLATE_ALT);
+        draw_rectangle(card_x, card_y, card_w, 3.0 * s, accent);
+        FADE_TEX.with(|tex| {
+            draw_texture_ex(tex, card_x, card_y + card_h * 0.72, Color::new(0.0, 0.0, 0.0, 0.45),
+                DrawTextureParams {
+                    dest_size: Some(vec2(card_w, card_h * 0.28)), ..Default::default()
+                });
+        });
+        let (title_s, tsize) = fit(title, 1.10, card_w - 60.0 * s);
+        txt(&title_s, card_x + 18.0 * s, card_y + 42.0 * s, tsize, WHITE);
+        let (body_s, bsize) = fit(body, 0.76, card_w - 60.0 * s);
+        txt(&body_s, card_x + 18.0 * s, card_y + 66.0 * s, bsize, Color::new(1.0, 1.0, 1.0, 0.70));
+        if spinner {
+            // Eight dots chasing each other, so a long BlueZ call still looks
+            // like something is happening.
+            TOAST_DOT.with(|dot| {
+                let r = 2.6 * s;
+                let orbit = 11.0 * s;
+                let ox = card_x + card_w - 30.0 * s;
+                let oy = card_y + card_h / 2.0;
+                for i in 0..8 {
+                    let ang = i as f32 / 8.0 * std::f32::consts::TAU;
+                    let phase = (t * 1.6 - i as f32 / 8.0).fract();
+                    let alpha = 0.15 + 0.75 * (1.0 - phase);
+                    draw_texture_ex(dot, ox + ang.cos() * orbit - r, oy + ang.sin() * orbit - r,
+                        Color::new(1.0, 1.0, 1.0, alpha),
+                        DrawTextureParams { dest_size: Some(vec2(r * 2.0, r * 2.0)), ..Default::default() });
+                }
+            });
+        }
+    };
+
+    match &state.screen_state {
+        BluetoothScreenState::Working { verb, name } => {
+            card(&format!("{} {}", verb, name), "This can take a few seconds.",
+                Color::new(0.35, 0.75, 1.0, 1.0), true);
+        }
+        BluetoothScreenState::Outcome { ok, text, .. } => {
+            card(if *ok { "Done" } else { "Didn't work" }, text,
+                if *ok { XBOX_GREEN } else { TILE_RED }, false);
+        }
+        BluetoothScreenState::ForgetConfirm(d) => {
+            card(&format!("Remove {}?", d.name),
+                "You will have to pair it again to use it here.", TILE_RED, false);
+            // Yes / no, spelled out with the real glyphs.
+            let icon_h = 15.0 * s;
+            let size = fs(0.74);
+            let yy = card_y + card_h - 14.0 * s;
+            LEGEND_ICONS.with(|icons| {
+                draw_texture_ex(&icons[legend as usize], card_x + 18.0 * s, yy - icon_h + 3.0 * s,
+                    WHITE,
+                    DrawTextureParams { dest_size: Some(vec2(icon_h, icon_h)), ..Default::default() });
+            });
+            txt("Remove", card_x + 18.0 * s + icon_h + 5.0 * s, yy, size,
+                Color::new(1.0, 1.0, 1.0, 0.85));
+            let keep_x = card_x + 18.0 * s + icon_h + 5.0 * s
+                + measure_text("Remove", Some(font), size, 1.0).width + 18.0 * s;
+            LEGEND_ICONS_BACK.with(|icons| {
+                draw_texture_ex(&icons[legend as usize], keep_x, yy - icon_h + 3.0 * s, WHITE,
+                    DrawTextureParams { dest_size: Some(vec2(icon_h, icon_h)), ..Default::default() });
+            });
+            txt("Keep", keep_x + icon_h + 5.0 * s, yy, size, Color::new(1.0, 1.0, 1.0, 0.85));
+        }
+        BluetoothScreenState::DeviceList => {}
+    }
+
+    render_ui_overlay_alpha(logo_cache, font_cache, config, battery_info, current_time_str,
+        gcc_adapter_poll_rate, s, overlay_a, true, true);
+}
+
+// ===================================
+// METRO WI-FI SCREEN
+// ===================================
+
+// Same frame as bluetooth: network list on the left, detail pane on the
+// right, cards over the top for waits and outcomes, and a full Metro
+// on-screen keyboard sheet for password entry.
+const WF_LIST_TOP: f32 = 84.0;
+const WF_LIST_H: f32 = 178.0;
+const WF_ROW_PITCH: f32 = 21.0;
+const WF_INTRO_TIME: f32 = 0.45;
+
+struct WfAnim {
+    last_draw: f64,
+    intro: f32,
+    sel: usize,
+    prev_sel: Option<usize>,
+    sel_anim: f32,
+    top: usize,
+}
+
+thread_local! {
+    static WF_ANIM: RefCell<WfAnim> = RefCell::new(WfAnim {
+        last_draw: -10.0, intro: 1.0, sel: usize::MAX, prev_sel: None,
+        sel_anim: 1.0, top: 0,
+    });
+}
+
+/// Small padlock: a ring for the shackle, an opaque body over its lower half.
+fn wf_lock_glyph(x: f32, y: f32, d: f32, color: Color) {
+    let cx = x + d * 0.5;
+    draw_circle_lines(cx, y + d * 0.34, d * 0.20, d * 0.10, color);
+    draw_rectangle(x + d * 0.16, y + d * 0.42, d * 0.68, d * 0.48, color);
+}
+
+/// Signal strength 0-100 to the 4-bar meter bluetooth uses.
+fn wf_bars(level: u8) -> u8 {
+    ((level as u16 + 24) / 25).clamp(1, 4) as u8
+}
+
+pub fn draw_wifi(
+    state: &WifiState,
+    logo_cache: &HashMap<String, Texture2D>,
+    background_cache: &HashMap<String, Texture2D>,
+    video_cache: &mut HashMap<String, VideoPlayer>,
+    font_cache: &HashMap<String, Font>,
+    config: &Config,
+    background_state: &mut BackgroundState,
+    battery_info: &Option<BatteryInfo>,
+    current_time_str: &str,
+    gcc_adapter_poll_rate: &Option<u32>,
+    input_state: &InputState,
+    s: f32,
+) {
+    let font = get_current_font(font_cache, config);
+    let w = screen_width();
+    let h = screen_height();
+    let w_du = w / s;
+    let t = get_time() as f32;
+
+    // --- Frame, matching bluetooth/settings ---
+    let m = ORIGIN_X;
+    let small_w = 80.0 * (185.0 / 131.0);
+    let grid_right = m + 4.0 * small_w + 3.0 * 2.0;
+    let content_r = grid_right.min(w_du - m);
+    let content_w = content_r - m;
+    let col_gap = 8.0;
+    let list_w = (2.0 * small_w + 2.0).min((content_w - col_gap) * 0.55);
+    let pane_w = content_w - col_gap - list_w;
+    let list_x = m;
+    let pane_x = m + list_w + col_gap;
+
+    let legend = match input_state.last_source {
+        InputSource::Keyboard => LegendIcon::Keyboard,
+        InputSource::Pad => pad_legend_icon(input_state.pad_vendor, &input_state.pad_name),
+    };
+
+    let nets: &[AccessPoint] = state.networks.as_ref().map(|v| v.as_slice()).unwrap_or(&[]);
+    let net_err: Option<&String> = state.networks.as_ref().err();
+    let connected_ssid = crate::wifi_status::current_ssid();
+    let scanning = matches!(state.screen_state, WifiScreenState::Scanning | WifiScreenState::Preparing);
+
+    // --- Clocks ---
+    let rows_fit = (WF_LIST_H / WF_ROW_PITCH) as usize;
+    let (intro, sel_anim, prev_sel, top) = WF_ANIM.with(|cell| {
+        let mut a = cell.borrow_mut();
+        let now = get_time();
+        let dt = get_frame_time();
+        if now - a.last_draw > 0.25 {
+            a.intro = 0.0;
+            a.sel = state.selected_index;
+            a.prev_sel = None;
+            a.sel_anim = 1.0;
+            a.top = 0;
+        }
+        a.last_draw = now;
+        if state.selected_index != a.sel {
+            a.prev_sel = Some(a.sel);
+            a.sel = state.selected_index;
+            a.sel_anim = 0.0;
+        }
+        if a.top > state.selected_index {
+            a.top = state.selected_index;
+        }
+        if state.selected_index + 1 > a.top + rows_fit {
+            a.top = state.selected_index + 1 - rows_fit;
+        }
+        if a.top >= nets.len() {
+            a.top = 0;
+        }
+        let step = dt.min(0.05);
+        a.intro = (a.intro + step / WF_INTRO_TIME).min(1.0);
+        a.sel_anim = (a.sel_anim + step).min(1.0);
+        (a.intro, a.sel_anim, a.prev_sel, a.top)
+    });
+
+    let overlay_a = ease_out_sine(((intro - 0.18) / 0.25).clamp(0.0, 1.0));
+    let header_drop = (1.0 - ease_out(intro)) * 120.0 * s;
+
+    let txt = |text: &str, x: f32, y: f32, size: u16, color: Color| {
+        let so = 1.0 * (size as f32 / FONT_SIZE as f32);
+        draw_text_ex(text, x + so, y + so, TextParams {
+            font: Some(font), font_size: size,
+            color: Color::new(0.0, 0.0, 0.0, 0.85 * color.a), ..Default::default()
+        });
+        draw_text_ex(text, x, y, TextParams {
+            font: Some(font), font_size: size, color, ..Default::default()
+        });
+    };
+    let fs = |k: f32| ((FONT_SIZE as f32 * s * k) as u16).max(9);
+    let fit = |text: &str, k: f32, max_w: f32| -> (String, u16) {
+        let mut size = fs(k);
+        let d = measure_text(text, Some(font), size, 1.0);
+        if d.width > max_w && d.width > 0.0 {
+            size = (((size as f32) * max_w / d.width).floor() as u16).max(9);
+        }
+        let mut out = text.to_string();
+        if measure_text(&out, Some(font), size, 1.0).width > max_w {
+            while out.chars().count() > 1
+                && measure_text(&format!("{}…", out), Some(font), size, 1.0).width > max_w
+            {
+                out.pop();
+            }
+            out.push('…');
+        }
+        (out, size)
+    };
+
+    // --- Background ---
+    draw_rectangle(0.0, 0.0, w, h, BG_FALLBACK);
+    render_background(background_cache, video_cache, config, background_state);
+    draw_rectangle(0.0, 0.0, w, h, Color::new(0.0, 0.0, 0.0, 0.35));
+    FADE_TEX.with(|tex| {
+        draw_texture_ex(tex, 0.0, 0.0, Color::new(0.0, 0.0, 0.0, 0.35), DrawTextureParams {
+            dest_size: Some(vec2(w, 100.0 * s)), flip_y: true, ..Default::default()
+        });
+    });
+
+    let selected = state.selected();
+    let is_connected = |ap: &AccessPoint| connected_ssid.as_deref() == Some(ap.ssid.as_str());
+
+    // --- Detail pane ---
+    let pane_slide = (1.0 - ease_out((intro / 0.34).min(1.0))) * w * 0.60;
+    let px = pane_x * s + pane_slide;
+    let py = WF_LIST_TOP * s;
+    let pw = pane_w * s;
+    let ph = 132.0 * s;
+    {
+        let connected = selected.map(|ap| is_connected(ap)).unwrap_or(false);
+        draw_rectangle(px, py, pw, ph, if connected { XBOX_GREEN } else { TILE_SLATE_ALT });
+        FADE_TEX.with(|tex| {
+            draw_texture_ex(tex, px, py, Color::new(1.0, 1.0, 1.0, 0.28), DrawTextureParams {
+                dest_size: Some(vec2(pw, ph * 0.16)), flip_y: true, ..Default::default()
+            });
+            draw_texture_ex(tex, px, py + ph * 0.74, Color::new(0.0, 0.0, 0.0, 0.55), DrawTextureParams {
+                dest_size: Some(vec2(pw, ph * 0.26)), ..Default::default()
+            });
+        });
+
+        let ix = px + 14.0 * s;
+        let iy = py + 14.0 * s;
+        let icon_d = 40.0 * s;
+        match selected {
+            Some(ap) => {
+                TILE_WIFI.with(|tex| {
+                    draw_texture_ex(tex, ix, iy, Color::new(1.0, 1.0, 1.0, 0.92), DrawTextureParams {
+                        dest_size: Some(vec2(icon_d, icon_d)), ..Default::default()
+                    })
+                });
+
+                let (name, nsize) = fit(&ap.ssid, 1.20, pw - 28.0 * s);
+                txt(&name, px + 14.0 * s, py + 74.0 * s, nsize, WHITE);
+                let sec_line = if ap.security.is_empty() {
+                    "Open network".to_string()
+                } else {
+                    format!("{} · secured", ap.security)
+                };
+                let (sec_line, ssize) = fit(&sec_line, 0.66, pw - 28.0 * s);
+                txt(&sec_line, px + 14.0 * s, py + 88.0 * s, ssize,
+                    Color::new(1.0, 1.0, 1.0, 0.45));
+
+                let status = if is_connected(ap) {
+                    "Connected".to_string()
+                } else {
+                    format!("Signal {}%", ap.signal_level)
+                };
+                txt(&status, px + 14.0 * s, py + 106.0 * s, fs(0.76),
+                    Color::new(1.0, 1.0, 1.0, 0.88));
+                bt_signal_bars(px + pw - 14.0 * s, py + 102.0 * s, s, wf_bars(ap.signal_level),
+                    Color::new(1.0, 1.0, 1.0, 0.92));
+
+                let hint = if is_connected(ap) {
+                    "You're already connected to this network."
+                } else if ap.security.is_empty() {
+                    "Open network. Select to connect."
+                } else {
+                    "Select to enter the password."
+                };
+                let (hint, hsize) = fit(hint, 0.66, pw - 28.0 * s);
+                txt(&hint, px + 14.0 * s, py + 122.0 * s, hsize, Color::new(1.0, 1.0, 1.0, 0.55));
+            }
+            None => {
+                TILE_WIFI.with(|tex| {
+                    draw_texture_ex(tex, ix, iy, Color::new(1.0, 1.0, 1.0, 0.35), DrawTextureParams {
+                        dest_size: Some(vec2(icon_d, icon_d)), ..Default::default()
+                    })
+                });
+                let head = if net_err.is_some() { "Unavailable" } else { "Nothing yet" };
+                txt(head, px + 14.0 * s, py + 74.0 * s, fs(1.20), Color::new(1.0, 1.0, 1.0, 0.75));
+                let body = match net_err {
+                    Some(e) => e.clone(),
+                    None => "Networks in range will appear here.".to_string(),
+                };
+                let (body, bsize) = fit(&body, 0.72, pw - 28.0 * s);
+                txt(&body, px + 14.0 * s, py + 92.0 * s, bsize, Color::new(1.0, 1.0, 1.0, 0.55));
+            }
+        }
+    }
+
+    // --- List ---
+    let row_slide = |i: usize| -> f32 {
+        if intro >= 1.0 {
+            return 0.0;
+        }
+        let p = ease_out(((intro - i as f32 * 0.03) / 0.40).clamp(0.0, 1.0));
+        -(1.0 - p) * 70.0 * s
+    };
+
+    let draw_net_row = |net_i: usize, order: usize, y_du: f32, focused: bool, shrinking: bool| {
+        let Some(ap) = nets.get(net_i) else { return };
+        let k = if focused {
+            ease_out((sel_anim / SEL_GROW_TIME).min(1.0))
+        } else if shrinking {
+            1.0 - ease_out_sine((sel_anim / SEL_SHRINK_TIME).min(1.0))
+        } else {
+            0.0
+        };
+        let g = k * 2.0 * s;
+        let rx = list_x * s - g + row_slide(order);
+        let ry = y_du * s - g;
+        let rw = list_w * s + g * 2.0;
+        let rh = (WF_ROW_PITCH - 2.0) * s + g * 2.0;
+
+        if k > 0.01 {
+            draw_tile_shadow(rx, ry, rw, rh, s, k);
+        }
+        let fill = if focused {
+            TILE_FOCUS
+        } else if order % 2 == 0 {
+            TILE_SLATE
+        } else {
+            TILE_SLATE_ALT
+        };
+        draw_rectangle(rx, ry, rw, rh, fill);
+        FADE_TEX.with(|tex| {
+            draw_texture_ex(tex, rx, ry, Color::new(1.0, 1.0, 1.0, 0.05), DrawTextureParams {
+                dest_size: Some(vec2(rw, rh * 0.40)), flip_y: true, ..Default::default()
+            });
+            draw_texture_ex(tex, rx, ry + rh * 0.60, Color::new(0.0, 0.0, 0.0, 0.40), DrawTextureParams {
+                dest_size: Some(vec2(rw, rh * 0.40)), ..Default::default()
+            });
+        });
+        // The joined network carries the dashboard's green "live" spine.
+        if is_connected(ap) {
+            draw_rectangle(rx, ry, 3.0 * s, rh, XBOX_GREEN);
+        }
+
+        let cy = ry + rh / 2.0;
+        let (name, nsize) = fit(&ap.ssid, 0.80, rw * 0.52);
+        let nd = measure_text(&name, Some(font), nsize, 1.0);
+        let base_y = cy + nd.offset_y * 0.5;
+        txt(&name, rx + 8.0 * s, base_y, nsize,
+            if focused { WHITE } else { Color::new(1.0, 1.0, 1.0, 0.82) });
+
+        // Right edge: signal bars, then the padlock for secured networks,
+        // then the green dot for the joined one.
+        let mut right = rx + rw - 8.0 * s;
+        bt_signal_bars(right, cy, s, wf_bars(ap.signal_level),
+            Color::new(1.0, 1.0, 1.0, if focused { 0.92 } else { 0.70 }));
+        right -= 22.0 * s;
+        if !ap.security.is_empty() {
+            let d = 10.0 * s;
+            wf_lock_glyph(right - d, cy - d / 2.0, d,
+                Color::new(1.0, 1.0, 1.0, if focused { 0.85 } else { 0.55 }));
+            right -= d + 6.0 * s;
+        }
+        if is_connected(ap) {
+            TOAST_DOT.with(|dot| {
+                let r = 3.0 * s;
+                draw_texture_ex(dot, right - r * 2.0, cy - r, Color::new(0.30, 0.85, 0.35, 1.0),
+                    DrawTextureParams { dest_size: Some(vec2(r * 2.0, r * 2.0)), ..Default::default() });
+            });
+        }
+
+        if focused {
+            draw_focus_glow_ex(rx, ry, rw, rh, s, string_to_color(&config.cursor_color), 0.45, 1.0);
+        }
+    };
+
+    if nets.is_empty() {
+        let cx = list_x * s + 8.0 * s;
+        let cy = (WF_LIST_TOP + 40.0) * s;
+        if let Some(e) = net_err {
+            txt("Wi-Fi is unavailable", cx, cy, fs(1.10), Color::new(1.0, 1.0, 1.0, 0.75 * overlay_a));
+            let (e, esize) = fit(e, 0.74, list_w * s - 16.0 * s);
+            txt(&e, cx, cy + 20.0 * s, esize, Color::new(1.0, 1.0, 1.0, 0.45 * overlay_a));
+        } else if scanning {
+            let dots = ".".repeat((t * 2.0) as usize % 4);
+            txt(&format!("Searching{}", dots), cx, cy, fs(1.10),
+                Color::new(1.0, 1.0, 1.0, 0.75 * overlay_a));
+            txt("Looking for networks in range.", cx, cy + 20.0 * s, fs(0.74),
+                Color::new(1.0, 1.0, 1.0, 0.45 * overlay_a));
+            // The sweep bar, so the screen never looks frozen.
+            let bw = list_w * s * 0.30;
+            let travel = list_w * s - bw;
+            let p = ((t * 0.6).sin() * 0.5 + 0.5) * travel;
+            draw_rectangle(list_x * s + p, cy + 30.0 * s, bw, 2.0 * s,
+                Color::new(1.0, 1.0, 1.0, 0.22 * overlay_a));
+        } else {
+            txt("No networks found", cx, cy, fs(1.10), Color::new(1.0, 1.0, 1.0, 0.75 * overlay_a));
+            txt("Search again to sweep once more.", cx, cy + 20.0 * s, fs(0.74),
+                Color::new(1.0, 1.0, 1.0, 0.45 * overlay_a));
+        }
+    } else {
+        // Rows at rest, then the one shrinking back, then the focused row on
+        // top — the settings screen's pass order.
+        let end = (top + rows_fit).min(nets.len());
+        for (order, i) in (top..end).enumerate() {
+            let y_du = WF_LIST_TOP + order as f32 * WF_ROW_PITCH;
+            if i != state.selected_index && Some(i) != prev_sel {
+                draw_net_row(i, order, y_du, false, false);
+            }
+        }
+        for (order, i) in (top..end).enumerate() {
+            let y_du = WF_LIST_TOP + order as f32 * WF_ROW_PITCH;
+            if Some(i) == prev_sel && i != state.selected_index {
+                draw_net_row(i, order, y_du, false, true);
+            }
+        }
+        for (order, i) in (top..end).enumerate() {
+            let y_du = WF_LIST_TOP + order as f32 * WF_ROW_PITCH;
+            if i == state.selected_index {
+                draw_net_row(i, order, y_du, true, false);
+            }
+        }
+
+        // More above / below.
+        let chev = Color::new(1.0, 1.0, 1.0, 0.35 * overlay_a);
+        let cxx = list_x * s + list_w * s / 2.0;
+        if top > 0 {
+            let ty = (WF_LIST_TOP - 5.0) * s;
+            draw_triangle(vec2(cxx, ty - 3.5 * s), vec2(cxx - 5.0 * s, ty + 1.5 * s),
+                vec2(cxx + 5.0 * s, ty + 1.5 * s), chev);
+        }
+        if end < nets.len() {
+            let by = (WF_LIST_TOP + WF_LIST_H + 3.0) * s;
+            draw_triangle(vec2(cxx, by + 3.5 * s), vec2(cxx - 5.0 * s, by - 1.5 * s),
+                vec2(cxx + 5.0 * s, by - 1.5 * s), chev);
+        }
+    }
+
+    // --- Header ---
+    txt("network", m * s, 36.0 * s - header_drop, fs(0.80), Color::new(1.0, 1.0, 1.0, 0.45));
+    {
+        let strip_y = 62.0 * s - header_drop;
+        txt("wi-fi", m * s, strip_y, fs(1.45), WHITE);
+        let after = m * s + measure_text("wi-fi", Some(font), fs(1.45), 1.0).width + 14.0 * s;
+        let (dot_col, label) = if scanning {
+            let pulse = 0.35 + 0.45 * ((t * 3.0).sin() * 0.5 + 0.5);
+            (Color::new(0.35, 0.75, 1.0, pulse), "scanning".to_string())
+        } else if let Some(ssid) = &connected_ssid {
+            (Color::new(0.30, 0.85, 0.35, 0.9), format!("connected · {}", ssid))
+        } else {
+            (Color::new(1.0, 1.0, 1.0, 0.25), format!("{} found", nets.len()))
+        };
+        TOAST_DOT.with(|dot| {
+            let r = 3.2 * s;
+            draw_texture_ex(dot, after, strip_y - 6.0 * s - r, dot_col,
+                DrawTextureParams { dest_size: Some(vec2(r * 2.0, r * 2.0)), ..Default::default() });
+        });
+        let (label, lsize) = fit(&label, 0.80, w - after - 60.0 * s);
+        txt(&label, after + 11.0 * s, strip_y - 3.0 * s, lsize,
+            Color::new(1.0, 1.0, 1.0, 0.42));
+    }
+
+    let in_osk = matches!(state.screen_state, WifiScreenState::PasswordInput);
+
+    // --- Legend, bottom right (hidden under the keyboard sheet) ---
+    if !in_osk {
+        let cy = 324.0 * s;
+        let icon_h = 18.0 * s;
+        let size = fs(0.80);
+        let a = overlay_a;
+        let leg = |text: &str, x: f32| {
+            let d = measure_text(text, Some(font), size, 1.0);
+            txt(text, x - d.width, cy + d.offset_y * 0.5, size, Color::new(1.0, 1.0, 1.0, 0.75 * a));
+            x - d.width
+        };
+        let back_x = leg("Back", w - 24.0 * s);
+        LEGEND_ICONS_BACK.with(|icons| {
+            draw_texture_ex(&icons[legend as usize], back_x - 4.0 * s - icon_h, cy - icon_h / 2.0,
+                Color::new(1.0, 1.0, 1.0, a),
+                DrawTextureParams { dest_size: Some(vec2(icon_h, icon_h)), ..Default::default() });
+        });
+        let group_x = back_x - 4.0 * s - icon_h - 16.0 * s;
+
+        if let Some(ap) = selected {
+            let verb = if is_connected(ap) { "Reconnect" } else { "Connect" };
+            let x = leg(verb, group_x);
+            LEGEND_ICONS.with(|icons| {
+                draw_texture_ex(&icons[legend as usize], x - 4.0 * s - icon_h, cy - icon_h / 2.0,
+                    Color::new(1.0, 1.0, 1.0, a),
+                    DrawTextureParams { dest_size: Some(vec2(icon_h, icon_h)), ..Default::default() });
+            });
+        }
+
+        // Bottom left: the shoulder button rescans.
+        draw_shoulder_hint(font, legend, "Search again", false, true, s, overlay_a);
+    }
+
+    // --- Cards: waits and outcomes ---
+    let card_w = (320.0 * s).min(w - 40.0 * s);
+    let card_h = 104.0 * s;
+    let card_x = (w - card_w) / 2.0;
+    let card_y = (h - card_h) / 2.0;
+    let card = |title: &str, body: &str, accent: Color, spinner: bool| {
+        draw_rectangle(0.0, 0.0, w, h, Color::new(0.0, 0.0, 0.0, 0.60));
+        draw_tile_shadow(card_x, card_y, card_w, card_h, s, 1.0);
+        draw_rectangle(card_x, card_y, card_w, card_h, TILE_SLATE_ALT);
+        draw_rectangle(card_x, card_y, card_w, 3.0 * s, accent);
+        FADE_TEX.with(|tex| {
+            draw_texture_ex(tex, card_x, card_y + card_h * 0.72, Color::new(0.0, 0.0, 0.0, 0.45),
+                DrawTextureParams {
+                    dest_size: Some(vec2(card_w, card_h * 0.28)), ..Default::default()
+                });
+        });
+        let (title_s, tsize) = fit(title, 1.10, card_w - 60.0 * s);
+        txt(&title_s, card_x + 18.0 * s, card_y + 42.0 * s, tsize, WHITE);
+        // Body wraps to at most two lines before the ellipsis takes over —
+        // nmcli errors run long.
+        let max_bw = card_w - 60.0 * s;
+        let mut lines: Vec<String> = Vec::new();
+        let mut cur = String::new();
+        for word in body.split_whitespace() {
+            let probe = if cur.is_empty() { word.to_string() } else { format!("{} {}", cur, word) };
+            if measure_text(&probe, Some(font), fs(0.76), 1.0).width > max_bw && !cur.is_empty() {
+                lines.push(cur);
+                cur = word.to_string();
+                if lines.len() == 2 {
+                    break;
+                }
+            } else {
+                cur = probe;
+            }
+        }
+        if !cur.is_empty() && lines.len() < 2 {
+            lines.push(cur);
+        }
+        for (i, line) in lines.iter().enumerate() {
+            let (line, bsize) = fit(line, 0.76, max_bw);
+            txt(&line, card_x + 18.0 * s, card_y + 64.0 * s + i as f32 * 14.0 * s, bsize,
+                Color::new(1.0, 1.0, 1.0, 0.70));
+        }
+        if spinner {
+            TOAST_DOT.with(|dot| {
+                let r = 2.6 * s;
+                let orbit = 11.0 * s;
+                let ox = card_x + card_w - 30.0 * s;
+                let oy = card_y + card_h / 2.0;
+                for i in 0..8 {
+                    let ang = i as f32 / 8.0 * std::f32::consts::TAU;
+                    let phase = (t * 1.6 - i as f32 / 8.0).fract();
+                    let alpha = 0.15 + 0.75 * (1.0 - phase);
+                    draw_texture_ex(dot, ox + ang.cos() * orbit - r, oy + ang.sin() * orbit - r,
+                        Color::new(1.0, 1.0, 1.0, alpha),
+                        DrawTextureParams { dest_size: Some(vec2(r * 2.0, r * 2.0)), ..Default::default() });
+                }
+            });
+        }
+    };
+
+    match &state.screen_state {
+        WifiScreenState::Preparing => {
+            card("Getting ready", "Starting network services…",
+                Color::new(0.35, 0.75, 1.0, 1.0), true);
+        }
+        WifiScreenState::Connecting => {
+            let name = selected.map(|ap| ap.ssid.as_str()).unwrap_or("network");
+            card(&format!("Joining {}", name), "This can take a few seconds.",
+                Color::new(0.35, 0.75, 1.0, 1.0), true);
+        }
+        WifiScreenState::Connected => {
+            let name = selected.map(|ap| ap.ssid.as_str()).unwrap_or("network");
+            card("Connected", &format!("You're online through {}.", name), XBOX_GREEN, false);
+        }
+        WifiScreenState::Error(e) => {
+            card("Didn't work", e, TILE_RED, false);
+        }
+        WifiScreenState::PasswordInput => {
+            draw_wifi_osk(state, font, config, legend, input_state, s);
+        }
+        WifiScreenState::List | WifiScreenState::Scanning => {}
+    }
+
+    render_ui_overlay_alpha(logo_cache, font_cache, config, battery_info, current_time_str,
+        gcc_adapter_poll_rate, s, overlay_a, true, true);
+}
+
+/// The Metro password sheet: prompt, input line with a blinking caret, a
+/// 10-column key grid, the special row, and a live hotkey legend drawn with
+/// the pad's real glyphs.
+fn draw_wifi_osk(
+    state: &WifiState,
+    font: &Font,
+    config: &Config,
+    legend: LegendIcon,
+    input_state: &InputState,
+    s: f32,
+) {
+    let w = screen_width();
+    let h = screen_height();
+    let t = get_time() as f32;
+    let w_du = w / s;
+
+    let txt = |text: &str, x: f32, y: f32, size: u16, color: Color| {
+        let so = 1.0 * (size as f32 / FONT_SIZE as f32);
+        draw_text_ex(text, x + so, y + so, TextParams {
+            font: Some(font), font_size: size,
+            color: Color::new(0.0, 0.0, 0.0, 0.85 * color.a), ..Default::default()
+        });
+        draw_text_ex(text, x, y, TextParams {
+            font: Some(font), font_size: size, color, ..Default::default()
+        });
+    };
+    let fs = |k: f32| ((FONT_SIZE as f32 * s * k) as u16).max(9);
+    let fit = |text: &str, k: f32, max_w: f32| -> (String, u16) {
+        let mut size = fs(k);
+        let d = measure_text(text, Some(font), size, 1.0);
+        if d.width > max_w && d.width > 0.0 {
+            size = (((size as f32) * max_w / d.width).floor() as u16).max(9);
+        }
+        let mut out = text.to_string();
+        if measure_text(&out, Some(font), size, 1.0).width > max_w {
+            while out.chars().count() > 1
+                && measure_text(&format!("{}…", out), Some(font), size, 1.0).width > max_w
+            {
+                out.pop();
+            }
+            out.push('…');
+        }
+        (out, size)
+    };
+
+    draw_rectangle(0.0, 0.0, w, h, Color::new(0.0, 0.0, 0.0, 0.60));
+
+    // --- Sheet ---
+    let m = ORIGIN_X;
+    let sheet_w_du = (w_du - 2.0 * m).min(470.0);
+    let sx = (w - sheet_w_du * s) / 2.0;
+    let sy = 38.0 * s;
+    let sw = sheet_w_du * s;
+    let sh = 288.0 * s;
+    draw_tile_shadow(sx, sy, sw, sh, s, 1.0);
+    draw_rectangle(sx, sy, sw, sh, TILE_SLATE);
+    FADE_TEX.with(|tex| {
+        draw_texture_ex(tex, sx, sy, Color::new(1.0, 1.0, 1.0, 0.20), DrawTextureParams {
+            dest_size: Some(vec2(sw, sh * 0.10)), flip_y: true, ..Default::default()
+        });
+        draw_texture_ex(tex, sx, sy + sh * 0.78, Color::new(0.0, 0.0, 0.0, 0.45), DrawTextureParams {
+            dest_size: Some(vec2(sw, sh * 0.22)), ..Default::default()
+        });
+    });
+    draw_rectangle(sx, sy, 3.0 * s, sh, XBOX_GREEN);
+
+    let inner_x = sx + 16.0 * s;
+    let inner_w = sw - 32.0 * s;
+
+    // --- Prompt ---
+    txt("wi-fi password", inner_x, sy + 16.0 * s, fs(0.72), Color::new(1.0, 1.0, 1.0, 0.45));
+    let ssid = state.selected().map(|ap| ap.ssid.as_str()).unwrap_or("");
+    let (ssid_fit, ssize) = fit(ssid, 1.15, inner_w - 40.0 * s);
+    txt(&ssid_fit, inner_x, sy + 34.0 * s, ssize, WHITE);
+
+    // --- Input line ---
+    let ib_y = sy + 44.0 * s;
+    let ib_h = 22.0 * s;
+    draw_rectangle(inner_x, ib_y, inner_w, ib_h, Color::new(0.0, 0.0, 0.0, 0.55));
+    draw_rectangle(inner_x, ib_y + ib_h - 1.5 * s, inner_w, 1.5 * s, Color::new(1.0, 1.0, 1.0, 0.25));
+    let shown: String = if state.show_password {
+        state.password_buffer.clone()
+    } else {
+        state.password_buffer.chars().map(|_| '•').collect()
+    };
+    // Keep the tail visible when the password outgrows the box.
+    let tsize = fs(0.90);
+    let mut shown_fit = shown.clone();
+    while shown_fit.chars().count() > 1
+        && measure_text(&shown_fit, Some(font), tsize, 1.0).width > inner_w - 20.0 * s
+    {
+        shown_fit.remove(0);
+    }
+    let tw = measure_text(&shown_fit, Some(font), tsize, 1.0).width;
+    let ty = ib_y + ib_h / 2.0 + tsize as f32 * 0.34;
+    txt(&shown_fit, inner_x + 8.0 * s, ty, tsize, WHITE);
+    if (t * 1.6).fract() < 0.55 {
+        draw_rectangle(inner_x + 10.0 * s + tw, ib_y + 4.0 * s, 1.6 * s, ib_h - 8.0 * s,
+            Color::new(1.0, 1.0, 1.0, 0.9));
+    }
+
+    // --- Key grid ---
+    let rows = state.osk_rows();
+    let gap = 3.0 * s;
+    let grid_top = ib_y + ib_h + 12.0 * s;
+    let cell_w = (inner_w - (OSK_COLS as f32 - 1.0) * gap) / OSK_COLS as f32;
+    let cell_h = 26.0 * s;
+    let key_fs = fs(0.92);
+    let cursor = string_to_color(&config.cursor_color);
+
+    let draw_key = |x: f32, y: f32, kw: f32, kh: f32, label: &str, focused: bool, active: bool| {
+        let fill = if focused {
+            TILE_FOCUS
+        } else if active {
+            XBOX_GREEN
+        } else {
+            TILE_SLATE_ALT
+        };
+        draw_rectangle(x, y, kw, kh, fill);
+        FADE_TEX.with(|tex| {
+            draw_texture_ex(tex, x, y, Color::new(1.0, 1.0, 1.0, 0.07), DrawTextureParams {
+                dest_size: Some(vec2(kw, kh * 0.45)), flip_y: true, ..Default::default()
+            });
+            draw_texture_ex(tex, x, y + kh * 0.60, Color::new(0.0, 0.0, 0.0, 0.35), DrawTextureParams {
+                dest_size: Some(vec2(kw, kh * 0.40)), ..Default::default()
+            });
+        });
+        let size = if label.chars().count() > 1 { fs(0.70) } else { key_fs };
+        let d = measure_text(label, Some(font), size, 1.0);
+        let color = if focused || active { WHITE } else { Color::new(1.0, 1.0, 1.0, 0.85) };
+        txt(label, x + (kw - d.width) / 2.0, y + kh / 2.0 + d.offset_y * 0.5, size, color);
+        if focused {
+            draw_focus_glow_ex(x, y, kw, kh, s, cursor, 0.45, 1.0);
+        }
+    };
+
+    // Character rows first, then the focused key again on top so its glow
+    // rides over the neighbours.
+    let mut focus_redraw: Option<(f32, f32, f32, f32, String, bool)> = None;
+    for (r, row_str) in rows.iter().enumerate() {
+        for (c, key) in row_str.chars().enumerate() {
+            let x = inner_x + c as f32 * (cell_w + gap);
+            let y = grid_top + r as f32 * (cell_h + gap);
+            let focused = (r, c) == state.osk_coords;
+            if focused {
+                focus_redraw = Some((x, y, cell_w, cell_h, key.to_string(), false));
+            } else {
+                draw_key(x, y, cell_w, cell_h, &key.to_string(), false, false);
+            }
+        }
+    }
+
+    // Special row spans the same width in five cells.
+    let sp_y = grid_top + 4.0 * (cell_h + gap);
+    let sp_w = (inner_w - (OSK_SPECIALS as f32 - 1.0) * gap) / OSK_SPECIALS as f32;
+    for i in 0..OSK_SPECIALS {
+        let x = inner_x + i as f32 * (sp_w + gap);
+        let focused = (4, i) == state.osk_coords;
+        let active = state.special_active(i);
+        if focused {
+            focus_redraw = Some((x, sp_y, sp_w, cell_h, state.special_label(i).to_string(), active));
+        } else {
+            draw_key(x, sp_y, sp_w, cell_h, state.special_label(i), false, active);
+        }
+    }
+    if let Some((x, y, kw, kh, label, active)) = focus_redraw {
+        draw_key(x, y, kw, kh, &label, true, active);
+    }
+
+    // --- Hotkey legend along the sheet's foot ---
+    let ly = sp_y + cell_h + 16.0 * s;
+    if input_state.last_source == InputSource::Pad {
+        let icon_h = 13.0 * s;
+        let size = fs(0.62);
+        let mut x = inner_x;
+        let item = |tex: &Texture2D, label: &str, x: &mut f32| {
+            draw_texture_ex(tex, *x, ly - icon_h / 2.0, WHITE,
+                DrawTextureParams { dest_size: Some(vec2(icon_h, icon_h)), ..Default::default() });
+            *x += icon_h + 3.0 * s;
+            let d = measure_text(label, Some(font), size, 1.0);
+            txt(label, *x, ly + d.offset_y * 0.5, size, Color::new(1.0, 1.0, 1.0, 0.62));
+            *x += d.width + 10.0 * s;
+        };
+        LEGEND_ICONS.with(|i| item(&i[legend as usize], "Type", &mut x));
+        LEGEND_ICONS_WEST.with(|i| item(&i[legend as usize], "Delete", &mut x));
+        LEGEND_ICONS_EJECT.with(|i| item(&i[legend as usize], "Space", &mut x));
+        LEGEND_ICONS_LB.with(|i| item(&i[legend as usize], "Shift", &mut x));
+        let page_label = if state.special_active(0) { "abc" } else { "&123" };
+        LEGEND_ICONS_RB.with(|i| item(&i[legend as usize], page_label, &mut x));
+        LEGEND_ICONS_START.with(|i| item(&i[legend as usize], "Connect", &mut x));
+        LEGEND_ICONS_BACK.with(|i| item(&i[legend as usize], "Cancel", &mut x));
+    } else {
+        let hint = "Type on your keyboard · Enter connects · Esc cancels";
+        let (hint, hsize) = fit(hint, 0.68, inner_w);
+        let d = measure_text(&hint, Some(font), hsize, 1.0);
+        txt(&hint, inner_x + (inner_w - d.width) / 2.0, ly + d.offset_y * 0.5, hsize,
+            Color::new(1.0, 1.0, 1.0, 0.55));
+    }
 }

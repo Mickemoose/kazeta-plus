@@ -115,7 +115,7 @@ pub fn update(
 
     if input_state.back {
         backend.stop(); // Stop music on exit
-        *current_screen = Screen::Extras;
+        *current_screen = crate::ui::extras_return(config);
         sound_effects.play_back(config);
 
         // Resume BGM from theme

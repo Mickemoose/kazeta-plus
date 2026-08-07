@@ -99,7 +99,7 @@ pub fn update(
     config: &Config,
 ) {
     if input_state.back {
-        *current_screen = Screen::Extras;
+        *current_screen = crate::ui::extras_return(config);
         state.screen_state = UpdateCheckerScreenState::Idle; // <-- RESET STATE
         sound_effects.play_back(config);
         return;

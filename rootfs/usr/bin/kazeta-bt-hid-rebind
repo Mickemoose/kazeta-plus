@@ -1,0 +1,16 @@
+#!/bin/bash
+# Rebind a Bluetooth HID device whose driver probe failed.
+#
+# hid-playstation (and friends) demand feature reports the instant bluetoothd
+# creates the uhid device; a response lost on the radio, or a pad still waking
+# up, fails that one-and-only probe and the kernel never tries again. Each
+# write to drivers_probe is a complete fresh probe. Give the link a beat
+# first — that also lets the normal probe win when nothing went wrong.
+dev="$1"
+[ -n "$dev" ] || exit 0
+for _ in 1 2 3 4; do
+    sleep 4
+    [ -e "/sys/bus/hid/devices/$dev" ] || exit 0        # link went away
+    [ -e "/sys/bus/hid/devices/$dev/driver" ] && exit 0 # a probe succeeded
+    echo "$dev" > /sys/bus/hid/drivers_probe 2>/dev/null
+done

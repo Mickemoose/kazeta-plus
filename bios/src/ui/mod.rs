@@ -24,6 +24,19 @@ pub mod theme_downloader;
 pub mod update_checker;
 pub mod wifi;
 
+/// Where Back lands from a screen that lives behind the Extras menu.
+///
+/// Metro puts these on the dashboard as tiles and has no extras list at all,
+/// so backing out has to return to the dashboard — otherwise the user is
+/// dropped into a menu they never went through, in a style they aren't using.
+pub fn extras_return(config: &Config) -> crate::Screen {
+    if config.menu_style == "METRO" {
+        crate::Screen::MainMenu
+    } else {
+        crate::Screen::Extras
+    }
+}
+
 // ===================================
 // SCREEN RENDERING
 // ===================================

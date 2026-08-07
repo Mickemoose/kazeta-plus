@@ -62,6 +62,10 @@ pub fn start_led_painter() {
                 continue;
             }
             let pads = scan_pads();
+            // The startup grace must end with the first SCAN, not the first
+            // change — otherwise a console that boots with no pads swallows
+            // the toast for the first controller that ever joins.
+            let startup = std::mem::replace(&mut first_scan, false);
             if pads != last_pads {
                 println!(
                     "[INFO] Controller join order: {:?}",
@@ -69,7 +73,7 @@ pub fn start_led_painter() {
                 );
                 // Toast events for changes — but not for the pads already
                 // present when the dashboard starts.
-                if !first_scan {
+                if !startup {
                     if let Ok(mut events) = PAD_EVENTS.lock() {
                         for (slot, (num, name, vendor)) in pads.iter().enumerate() {
                             if !last_pads.iter().any(|(n, _, _)| n == num) {
@@ -94,7 +98,6 @@ pub fn start_led_painter() {
                     }
                 }
                 last_pads = pads.clone();
-                first_scan = false;
             }
             for (slot, (num, _, _)) in pads.into_iter().take(PLAYER_COLORS.len()).enumerate() {
                 let rgb = format!("input{}:rgb:indicator", num);
@@ -137,13 +140,27 @@ fn scan_pads() -> Vec<(u32, String, Option<u16>)> {
             {
                 continue;
             }
-            let virtual_dev = fs::canonicalize(entry.path())
-                .map(|p| {
-                    let p = p.to_string_lossy().into_owned();
-                    p.contains("uhid") || p.contains("/virtual/")
-                })
-                .unwrap_or(true);
-            if virtual_dev {
+            // uhid is ambiguous: BlueZ creates the REAL kernel device for a
+            // Bluetooth pad there (bus 0005), and InputPlumber creates its
+            // USB-shaped mirrors there too (bus 0003) — the bus type is what
+            // separates a Bluetooth controller from a fake. Everything else
+            // under /virtual/ (uinput keyboards, mice) stays excluded.
+            const BUS_BLUETOOTH: u16 = 0x0005;
+            let sys_path = fs::canonicalize(entry.path())
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let bustype = fs::read_to_string(entry.path().join("id/bustype"))
+                .ok()
+                .and_then(|s| u16::from_str_radix(s.trim(), 16).ok())
+                .unwrap_or(0);
+            let mirror = if sys_path.is_empty() {
+                true
+            } else if sys_path.contains("uhid") {
+                bustype != BUS_BLUETOOTH
+            } else {
+                sys_path.contains("/virtual/")
+            };
+            if mirror {
                 continue;
             }
             let vendor = fs::read_to_string(entry.path().join("id/vendor"))

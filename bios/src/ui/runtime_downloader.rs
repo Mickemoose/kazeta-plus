@@ -156,7 +156,7 @@ pub fn update(
         sound_effects.play_back(config);
         match &state.screen_state {
             DownloaderState::DisplayingList => {
-                *current_screen = Screen::Extras;
+                *current_screen = crate::ui::extras_return(config);
                 state.screen_state = DownloaderState::Idle; // Reset for next time
             }
             DownloaderState::Downloading { .. } => {
@@ -164,7 +164,7 @@ pub fn update(
                 // The thread will error when it tries to send its next message.
                 // This is acceptable for this use case.
                 state.screen_state = DownloaderState::Idle; // Go to Idle to force a list refresh
-                *current_screen = Screen::Extras;
+                *current_screen = crate::ui::extras_return(config);
             }
             _ => { // For any sub-menu, go back to the list
                 state.screen_state = DownloaderState::DisplayingList;

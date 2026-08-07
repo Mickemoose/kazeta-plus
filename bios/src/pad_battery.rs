@@ -47,12 +47,15 @@ fn scan() -> Vec<u8> {
                 continue;
             }
             // InputPlumber's virtual DualSense registers a duplicate battery
-            // node (under /devices/virtual/misc/uhid/) for the same physical
-            // pad — skip it or every DualSense shows twice.
-            if fs::canonicalize(&path)
-                .map(|p| p.to_string_lossy().contains("uhid"))
-                .unwrap_or(false)
-            {
+            // node for the same physical pad — skip it or every DualSense
+            // shows twice. Both it and a REAL Bluetooth pad live under uhid,
+            // so uhid alone can't be the filter: the HID device directory in
+            // the path starts with the bus ("0005:" Bluetooth = real pad,
+            // "0003:" USB-shaped = InputPlumber's fake).
+            let canon = fs::canonicalize(&path)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if canon.contains("uhid") && !canon.contains("/0005:") {
                 continue;
             }
             // Exact percentage when the driver gives one; hid-nintendo can

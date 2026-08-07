@@ -1,0 +1,54 @@
+# yaml-language-server: $schema=https://raw.githubusercontent.com/ShadowBlip/InputPlumber/main/rootfs/usr/share/inputplumber/schema/composite_device_v1.json
+# Schema version number
+version: 1
+
+# The type of configuration schema
+kind: CompositeDevice
+
+# Name of the composite device mapping
+name: Sony Interactive Entertainment DualSense Wireless Controller
+
+# Maximum number of source devices per CompositeDevice.
+maximum_sources: 4
+
+# Only use this profile if *any* of the given matches matches. If this list is
+# empty then the source devices will *always* be checked.
+# /sys/class/dmi/id/product_name
+matches: []
+
+source_devices:
+  # Source the gamepad from the kernel driver's evdev, not hidraw.
+  # hid-playstation parses both the USB and Bluetooth report formats, so
+  # evdev input is identical on either transport; InputPlumber's own hidraw
+  # DualSense driver forwards nothing over Bluetooth (0x31 report framing),
+  # which left a connected pad with a dead mirror — buttons lost, LED fine.
+  # Cost of evdev sourcing: no adaptive-trigger/lightbar control through
+  # InputPlumber; kazeta drives the lightbar through LED sysfs anyway.
+  - group: gamepad
+    evdev:
+      name: "*Wireless Controller"
+      vendor_id: 054c
+      product_id: 0ce6
+      handler: event*
+
+  # Block the auxiliary evdev nodes so they don't double up as mouse/joystick
+  - group: gamepad
+    blocked: true
+    evdev:
+      name: "*Wireless Controller Touchpad"
+      vendor_id: 054c
+      product_id: 0ce6
+      handler: event*
+  - group: gamepad
+    blocked: true
+    evdev:
+      name: "*Wireless Controller Motion Sensors"
+      vendor_id: 054c
+      product_id: 0ce6
+      handler: event*
+
+# The target input device(s) to emulate by default
+target_devices:
+  - ds5
+  - mouse
+  - keyboard

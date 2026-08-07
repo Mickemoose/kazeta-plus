@@ -1,0 +1,6 @@
+# A Bluetooth HID probe is single-shot: the driver's first feature-report
+# read races the pad settling onto a lossy link, BlueZ answers each request
+# with one fixed 3s window, and a single lost response fails the probe with
+# no retry anywhere — the pad stays "connected" but never becomes an input
+# device. Retry the bind out-of-band until the driver sticks.
+ACTION=="add", SUBSYSTEM=="hid", ENV{HID_ID}=="0005:*", RUN+="/usr/bin/systemd-run --no-block --collect /usr/bin/kazeta-bt-hid-rebind %k"

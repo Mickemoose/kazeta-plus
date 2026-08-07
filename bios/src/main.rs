@@ -1633,15 +1633,19 @@ async fn main() {
                     &config,
                 );
 
-                // Tell the about module to draw itself
                 ui::wifi::draw(
                     &wifi_state,
                     &mut animation_state,
+                    &logo_cache,
                     &background_cache,
                     &mut video_cache,
                     &font_cache,
                     &config,
                     &mut background_state,
+                    &battery_info,
+                    &current_time_str,
+                    &app_state.gcc_adapter_poll_rate,
+                    &input_state,
                     scale_factor,
                 );
             }
@@ -1666,6 +1670,7 @@ async fn main() {
                     &battery_info,
                     &current_time_str,
                     &app_state.gcc_adapter_poll_rate,
+                    &input_state,
                     scale_factor,
                 );
             }
