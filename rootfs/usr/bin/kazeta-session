@@ -2,9 +2,13 @@
 
 LAUNCH_CMD_FILE="/var/kazeta/state/.LAUNCH_CMD"
 
-# NOTE: the in-game guide daemon (kazeta-guided) is backburned — see
-# WORKFLOW.md. If it is ever restarted here, keep `wait "$BIOS_PID"` below:
-# a bare `wait` also waits on the daemon and hangs game launches.
+# The guide daemon (kazeta-guided) runs in BOTH session types: over a game it
+# offers return/home/power-off, over the dashboard the game rows grey out. It
+# owns the Guide button via InputPlumber intercept + an X grab on Home, so the
+# bios's built-in guide modal never fires while it runs. It waits for X itself
+# and exits on its own when the session's compositor dies.
+# NOTE: keep `wait "$BIOS_PID"` below — a bare `wait` would also wait on the
+# daemon and hang game launches.
 
 # If a game was selected from the BIOS, launch it in this self-contained block.
 if [ -f "$LAUNCH_CMD_FILE" ]; then
@@ -17,15 +21,24 @@ if [ -f "$LAUNCH_CMD_FILE" ]; then
     # device" in session.log) - starting the game's gamescope into that
     # half-released display wedges it on a black screen. Wait for the old
     # compositor to be fully gone, then give the kernel a moment.
+    # (The compositor's process name is gamescope-wl, NOT gamescope.)
     for i in $(seq 1 25); do
-        pgrep -x gamescope >/dev/null || break
+        pgrep -x gamescope-wl >/dev/null || break
         sleep 0.2
     done
     sleep 1
 
+    pkill -x kazeta-guided 2>/dev/null
+    if [ -x /usr/bin/kazeta-guided ]; then
+        DISPLAY=:0 /usr/bin/kazeta-guided >/dev/null 2>&1 &
+        GUIDED_PID=$!
+    fi
+
     # Run the game session script (logged - gamescope/game errors were
     # previously invisible because this ran outside any redirect).
     eval "$LAUNCH_CMD" >> /var/kazeta/launch.log 2>&1
+
+    kill "$GUIDED_PID" 2>/dev/null
 
     # IMPORTANT: After the game quits, restart the entire session.
     # This will cause the script to run again from the top, where it will
@@ -54,6 +67,12 @@ fi
 # Launch the BIOS application in the background.
 /usr/bin/kazeta > /var/kazeta/session.log 2>&1 &
 BIOS_PID=$!
+
+# Guide daemon for the dashboard session (kazeta home / return rows greyed).
+pkill -x kazeta-guided 2>/dev/null
+if [ -x /usr/bin/kazeta-guided ]; then
+    DISPLAY=:0 /usr/bin/kazeta-guided >/dev/null 2>&1 &
+fi
 
 # Set default HDMI audio only if the user hasn't set a preference.
 if [ ! -e /var/kazeta/state/.AUDIO_PREFERENCE_SET ]; then

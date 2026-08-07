@@ -1,0 +1,16 @@
+[package]
+name = "kazeta-guided"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "kazeta-guided"
+path = "src/main.rs"
+
+[dependencies]
+x11rb = "0.13"
+fontdue = "0.9"
+png = "0.17"
+
+[profile.release]
+strip = true
