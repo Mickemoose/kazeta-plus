@@ -46,6 +46,8 @@ mod cd_player_backend;
 mod config;
 mod gcc_adapter;
 mod wifi_status;
+mod dualsense;
+mod haptics;
 mod pad_leds;
 mod pad_battery;
 mod pad_brand;
@@ -875,6 +877,7 @@ async fn main() {
 
     // CONTROLLER PLAYER LEDS (DualSense lightbar colors by join order)
     pad_leds::start_led_painter();
+    haptics::init();
 
     // CONTROLLER BATTERY LEVELS (icon + % row in the overlay)
     pad_battery::start_polling();

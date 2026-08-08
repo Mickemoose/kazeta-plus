@@ -25,6 +25,9 @@ source_devices:
   # Cost of evdev sourcing: no adaptive-trigger/lightbar control through
   # InputPlumber; kazeta drives the lightbar through LED sysfs anyway.
   - group: gamepad
+    # Corrects the Triangle/Square swap the evdev source otherwise
+    # introduces — see the map file.
+    capability_map_id: ps5dspos
     evdev:
       name: "*Wireless Controller"
       vendor_id: 054c

@@ -24,6 +24,160 @@ pub static AUDIO: Lazy<AudioSystem> = Lazy::new(|| {
     AudioSystem { stream }
 });
 
+// --- DualSense pad speaker stream (hover theme through the controller) ---
+//
+// A USB-docked DualSense is a plain 4-channel audio card: FL/FR feed the
+// 3.5mm jack (and the mono speaker, once the kernel's path selection routes
+// it — automatic from Linux 6.18), RL/RR drive the rumble voice-coils, which
+// are literal speaker drivers and audibly play music — confirmed on this
+// hardware by ear. Over Bluetooth Sony's pad audio is a proprietary
+// compressed protocol with no Linux support at all, so no sink exists and
+// this whole path silently stands down. PipeWire owns the card, so the
+// stream is pinned to the pad's sink via the pipewire ALSA bridge and the
+// PIPEWIRE_NODE env var read at PCM-open.
+
+use std::sync::Mutex;
+
+pub static PAD_STREAM: Mutex<Option<OutputStream>> = Mutex::new(None);
+
+/// The pad's PipeWire sink, as (wpctl id, node name) — None when the pad is
+/// wireless or absent.
+fn find_pad_sink() -> Option<(String, String)> {
+    let out = std::process::Command::new("wpctl").arg("status").output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let mut in_sinks = false;
+    let mut id = None;
+    for line in text.lines() {
+        if line.contains("Sinks:") {
+            in_sinks = true;
+            continue;
+        }
+        if in_sinks {
+            if line.trim_end().ends_with(':') || line.contains("Sources:") {
+                break;
+            }
+            if line.contains("DualSense") {
+                id = line
+                    .split(|c: char| !c.is_ascii_digit())
+                    .find(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+                break;
+            }
+        }
+    }
+    let id = id?;
+    let inspect = std::process::Command::new("wpctl").args(["inspect", &id]).output().ok()?;
+    let itext = String::from_utf8_lossy(&inspect.stdout).into_owned();
+    let name = itext
+        .lines()
+        .find(|l| l.contains("node.name"))
+        .and_then(|l| l.split('"').nth(1))
+        .map(|s| s.to_string())?;
+    Some((id, name))
+}
+
+/// A Sink on the second output stream pinned to the pad, or None when the
+/// pad is absent/wireless/unopenable. The stream persists across hovers;
+/// failure never panics — absence is the pad's normal state.
+pub fn pad_sink_new() -> Option<Sink> {
+    // Re-asserted every hover: the pad forgets its audio path on replug.
+    crate::dualsense::enable_speaker();
+    {
+        let guard = PAD_STREAM.lock().ok()?;
+        if let Some(stream) = guard.as_ref() {
+            return Some(Sink::connect_new(stream.mixer()));
+        }
+    }
+    let (id, node) = find_pad_sink()?;
+    // The sink ships muted at the server level; wake it once.
+    let _ = std::process::Command::new("wpctl").args(["set-mute", &id, "0"]).output();
+    let _ = std::process::Command::new("wpctl").args(["set-volume", &id, "1.0"]).output();
+    use rodio::cpal::traits::{DeviceTrait, HostTrait};
+    let device = rodio::cpal::default_host()
+        .output_devices()
+        .ok()?
+        .find(|d| d.name().map(|n| n == "pipewire").unwrap_or(false))?;
+    // pipewire-alsa reads PIPEWIRE_NODE at PCM open — the clean way to pin
+    // an ALSA-side stream to one sink. Process-global only for the moment
+    // around open; nothing else opens streams mid-session.
+    std::env::set_var("PIPEWIRE_NODE", &node);
+    let opened = OutputStreamBuilder::from_device(device)
+        .and_then(|b| b.with_channels(4).with_sample_rate(48000).open_stream());
+    std::env::remove_var("PIPEWIRE_NODE");
+    let stream = match opened {
+        Ok(s) => s,
+        Err(e) => {
+            println!("[PAD_AUDIO] Could not open pad stream: {}", e);
+            return None;
+        }
+    };
+    let mut guard = PAD_STREAM.lock().ok()?;
+    *guard = Some(stream);
+    guard.as_ref().map(|s| Sink::connect_new(s.mixer()))
+}
+
+/// Any source, refolded into the pad's 4-channel frame: nothing to the
+/// jack's left, the mono mix toward the jack-right/speaker feed, and a
+/// slightly attenuated copy into the voice-coils — the channels this pad
+/// audibly plays today.
+pub struct PadSource<S: Source<Item = f32>> {
+    inner: S,
+    frame: [f32; 4],
+    pos: usize,
+}
+
+impl<S: Source<Item = f32>> PadSource<S> {
+    pub fn new(inner: S) -> Self {
+        PadSource { inner, frame: [0.0; 4], pos: 4 }
+    }
+}
+
+impl<S: Source<Item = f32>> Iterator for PadSource<S> {
+    type Item = f32;
+    fn next(&mut self) -> Option<f32> {
+        if self.pos >= 4 {
+            let ch = self.inner.channels().max(1) as usize;
+            let mut acc = 0.0f32;
+            let mut n = 0usize;
+            for _ in 0..ch {
+                match self.inner.next() {
+                    Some(s) => {
+                        acc += s;
+                        n += 1;
+                    }
+                    None => break,
+                }
+            }
+            if n == 0 {
+                return None;
+            }
+            let s = acc / n as f32;
+            // FR carries the music to the real speaker (path-selected by
+            // dualsense::enable_speaker); the coils get a whisper of body.
+            self.frame = [0.0, s, s * 0.4, s * 0.4];
+            self.pos = 0;
+        }
+        let v = self.frame[self.pos];
+        self.pos += 1;
+        Some(v)
+    }
+}
+
+impl<S: Source<Item = f32>> Source for PadSource<S> {
+    fn current_span_len(&self) -> Option<usize> {
+        None
+    }
+    fn channels(&self) -> u16 {
+        4
+    }
+    fn sample_rate(&self) -> u32 {
+        self.inner.sample_rate()
+    }
+    fn total_duration(&self) -> Option<std::time::Duration> {
+        None
+    }
+}
+
 // --- Helper functions for loading audio into rodio buffers ---
 
 pub fn load_sound_from_bytes(bytes: &[u8]) -> SamplesBuffer {
@@ -125,7 +279,12 @@ impl SoundEffects {
     // [!] FIX: We manually create the Sink using .mixer() instead of .play_once()
     // because play_once requires OutputStreamHandle which you don't have.
 
+    // Every UI sound carries a matching haptic tick — the pad whispers what
+    // the speakers say. Strengths sit well under game rumble so the motor
+    // reads as texture, not feedback.
+
     pub fn play_cursor_move(&self, config: &Config) {
+        crate::haptics::tick(0.12, 14);
         let source = self.cursor_move.clone().amplify(config.sfx_volume);
         let sink = Sink::connect_new(&AUDIO.stream.mixer());
         sink.append(source);
@@ -133,6 +292,7 @@ impl SoundEffects {
     }
 
     pub fn play_select(&self, config: &Config) {
+        crate::haptics::tick(0.35, 22);
         let source = self.select.clone().amplify(config.sfx_volume);
         let sink = Sink::connect_new(&AUDIO.stream.mixer());
         sink.append(source);
@@ -140,6 +300,7 @@ impl SoundEffects {
     }
 
     pub fn play_reject(&self, config: &Config) {
+        crate::haptics::tick(0.55, 34);
         let source = self.reject.clone().amplify(config.sfx_volume);
         let sink = Sink::connect_new(&AUDIO.stream.mixer());
         sink.append(source);
@@ -147,6 +308,7 @@ impl SoundEffects {
     }
 
     pub fn play_back(&self, config: &Config) {
+        crate::haptics::tick(0.20, 16);
         let source = self.back.clone().amplify(config.sfx_volume);
         let sink = Sink::connect_new(&AUDIO.stream.mixer());
         sink.append(source);

@@ -1,0 +1,5 @@
+# The BIOS (running as the seated user) writes one vendor report to a USB
+# DualSense to route audio to its internal speaker and set its amp volume.
+# uaccess grants the active seat an ACL on the hidraw node so that write
+# doesn't need root.
+KERNEL=="hidraw*", SUBSYSTEMS=="usb", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="0ce6", TAG+="uaccess"

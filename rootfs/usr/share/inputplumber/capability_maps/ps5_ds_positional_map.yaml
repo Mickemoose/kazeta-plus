@@ -1,0 +1,35 @@
+# hid-playstation names face-button codes by physical POSITION (Triangle is
+# BTN_NORTH, Square is BTN_WEST); InputPlumber's evdev source assumes the
+# xpad LETTER convention, where those same codes sit swapped. Sourced via
+# evdev (which we need — IP's own hidraw DualSense driver is dead over
+# Bluetooth), Triangle and Square trade places end to end: proven by
+# capture, Triangle left the mirror as the Square bit. Pin the two codes to
+# their positional meaning. Cross/Circle agree in both conventions.
+version: 2
+kind: CapabilityMap
+name: DualSense positional face buttons (evdev source)
+id: ps5dspos
+mapping:
+  # Deliberately CROSSED, derived empirically: with the identity mapping the
+  # mirror still emitted Triangle as the Square bit (captured), so the swap
+  # happens downstream of source translation — crossing here makes the two
+  # inversions cancel. If InputPlumber ever fixes its side, flip these back.
+  - name: Triangle
+    source_events:
+      - evdev:
+          event_type: KEY
+          event_code: BTN_NORTH
+          value_type: button
+    target_event:
+      gamepad:
+        button: West
+
+  - name: Square
+    source_events:
+      - evdev:
+          event_type: KEY
+          event_code: BTN_WEST
+          value_type: button
+    target_event:
+      gamepad:
+        button: North

@@ -128,6 +128,9 @@ pub struct MetroState {
     bgm_start: f64,
     beat: f32,
     pub cart_label: Option<String>,
+    // "12h 40m · played today" for the inserted cart, from the launcher's
+    // playtime stamps. Refreshed with the branding.
+    playtime_line: Option<String>,
     pub cart_optical: bool,
     // Media badges (baked-in art) for the hero's corner.
     badge_sd: Texture2D,
@@ -173,11 +176,19 @@ pub struct MetroState {
     // are rolled once at startup, positions are pure functions of time.
     bokeh: Vec<Bokeh>,
     bokeh_tex: Texture2D,
+    sparkle_tex: Texture2D,
+    // Tiled film grain over the blurred cover background: smooth gradients
+    // in 8-bit WILL band, and grain is what hides it.
+    grain_tex: Texture2D,
     fade_tex: Texture2D, // vertical alpha ramp for smooth tile gradients
     // Hover bgm (cartinfo.yaml `bgm:`): loops while the Play hero is selected,
     // fading in on hover and out on unhover.
     bgm_path: Option<PathBuf>,
     bgm_sink: Option<Sink>,
+    // Second copy of the hover theme through a USB-docked DualSense's own
+    // speaker/coils (wireless pads have no Linux audio path — silently
+    // TV-only there).
+    bgm_pad_sink: Option<Sink>,
     bgm_vol: f32,
     // Mount fingerprint so cart swaps invalidate branding even while the
     // game list is stale (it only rebuilds when the Play screen opens).
@@ -206,12 +217,18 @@ struct Bokeh {
     wobble_hz: f32,
     twinkle_hz: f32, // how fast the mote breathes in and out
     phase: f32,      // personal offset so motes never sync up
-    alpha: f32,      // peak alpha, well under 0.15 — these are ambience
+    alpha: f32,      // peak alpha — discs stay faint, sparkles run brighter
+    /// 0 = the dash's green-white, 1 = champagne gold. A lens sees warm
+    /// lights; an all-cool field reads as fog instead of bokeh.
+    warm: f32,
+    /// A small in-focus glint instead of a defocused disc — the depth mix
+    /// (many soft discs, a few crisp points) is what sells depth of field.
+    sparkle: bool,
 }
 
 const BGM_FADE_TIME: f32 = 0.7; // seconds for a full fade in or out
 const CART_ANIM_TIME: f32 = 0.4; // seconds for cart branding to fade in or out
-const BOKEH_COUNT: usize = 30;
+const BOKEH_COUNT: usize = 45;
 const INTRO_TIME: f32 = 1.0; // boot choreography after the splash video
 const OUTRO_TIME: f32 = 0.7; // reverse choreography when Play is chosen
 const TOAST_TIME: f32 = 2.8; // player connect/disconnect pill lifetime
@@ -672,18 +689,24 @@ fn make_fade_texture() -> Texture2D {
 }
 
 /// A heavily blurred copy of the cart's cover, for use as an ambient
-/// background. Box-downsampling to a tiny image and letting the GPU stretch it
-/// back with bilinear filtering IS the blur — the same trick the fade ramp
-/// uses, and far cheaper than a shader pass.
+/// background. Blur small, then blow up: box-average to a working buffer,
+/// boost saturation (blurring averages colours toward mud — the push is what
+/// makes the room glow in the game's palette), then run a real separable
+/// Gaussian over the small buffer. A blurred image survives bilinear
+/// upscaling perfectly — no edges left to artifact — which is why this costs
+/// microseconds yet looks like a shader pass. The old single-step 32x18
+/// version left tent-filter diamonds all over the screen.
 fn make_blur_texture(bytes: &[u8]) -> Option<Texture2D> {
-    const BW: usize = 32;
-    const BH: usize = 18;
+    const BW: usize = 96;
+    const BH: usize = 54;
+    const SAT: f32 = 1.35;
     let img = Image::from_file_with_format(bytes, Some(ImageFormat::Png)).ok()?;
     let (w, h) = (img.width() as usize, img.height() as usize);
     if w == 0 || h == 0 {
         return None;
     }
-    let mut out = Image::gen_image_color(BW as u16, BH as u16, WHITE);
+    // Box-average into a small float buffer, saturating as we go.
+    let mut buf = vec![[0.0f32; 3]; BW * BH];
     for by in 0..BH {
         for bx in 0..BW {
             let x0 = bx * w / BW;
@@ -701,8 +724,53 @@ fn make_blur_texture(bytes: &[u8]) -> Option<Texture2D> {
                 }
             }
             if n > 0.0 {
-                out.set_pixel(bx as u32, by as u32, Color::new(r / n, g / n, b / n, 1.0));
+                let (r, g, b) = (r / n, g / n, b / n);
+                let luma = 0.299 * r + 0.587 * g + 0.114 * b;
+                buf[by * BW + bx] = [
+                    (luma + (r - luma) * SAT).clamp(0.0, 1.0),
+                    (luma + (g - luma) * SAT).clamp(0.0, 1.0),
+                    (luma + (b - luma) * SAT).clamp(0.0, 1.0),
+                ];
             }
+        }
+    }
+    // Separable Gaussian, two 1D passes over the small buffer.
+    const RADIUS: i32 = 9;
+    let sigma = 4.5f32;
+    let kernel: Vec<f32> = (-RADIUS..=RADIUS)
+        .map(|i| (-(i * i) as f32 / (2.0 * sigma * sigma)).exp())
+        .collect();
+    let ksum: f32 = kernel.iter().sum();
+    let mut tmp = vec![[0.0f32; 3]; BW * BH];
+    for y in 0..BH {
+        for x in 0..BW {
+            let mut acc = [0.0f32; 3];
+            for (k, kw) in kernel.iter().enumerate() {
+                let sx = (x as i32 + k as i32 - RADIUS).clamp(0, BW as i32 - 1) as usize;
+                let p = buf[y * BW + sx];
+                acc[0] += p[0] * kw;
+                acc[1] += p[1] * kw;
+                acc[2] += p[2] * kw;
+            }
+            tmp[y * BW + x] = [acc[0] / ksum, acc[1] / ksum, acc[2] / ksum];
+        }
+    }
+    let mut out = Image::gen_image_color(BW as u16, BH as u16, WHITE);
+    for y in 0..BH {
+        for x in 0..BW {
+            let mut acc = [0.0f32; 3];
+            for (k, kw) in kernel.iter().enumerate() {
+                let sy = (y as i32 + k as i32 - RADIUS).clamp(0, BH as i32 - 1) as usize;
+                let p = tmp[sy * BW + x];
+                acc[0] += p[0] * kw;
+                acc[1] += p[1] * kw;
+                acc[2] += p[2] * kw;
+            }
+            out.set_pixel(
+                x as u32,
+                y as u32,
+                Color::new(acc[0] / ksum, acc[1] / ksum, acc[2] / ksum, 1.0),
+            );
         }
     }
     let tex = Texture2D::from_image(&out);
@@ -748,10 +816,17 @@ fn spawn_bgm_envelope(path: PathBuf, slot: Arc<Mutex<Option<Vec<f32>>>>) {
     });
 }
 
-/// Soft-focus disc texture for the bokeh motes: solid-ish core with a smooth
-/// falloff to nothing at the rim, generated at startup so no asset is needed.
+/// Out-of-focus disc for the bokeh motes, generated at startup. Real lens
+/// bokeh is BRIGHTER AT THE RIM than in the middle — that luminous ring is
+/// the entire difference between "defocused light" and "glow blob" — so the
+/// profile is a translucent core rising to full strength near the edge, then
+/// a fast smooth falloff to nothing.
 fn make_bokeh_texture() -> Texture2D {
-    const SIZE: u16 = 64;
+    const SIZE: u16 = 96;
+    let smoothstep = |lo: f32, hi: f32, x: f32| {
+        let t = ((x - lo) / (hi - lo)).clamp(0.0, 1.0);
+        t * t * (3.0 - 2.0 * t)
+    };
     let mut img = Image::gen_image_color(SIZE, SIZE, Color::new(0.0, 0.0, 0.0, 0.0));
     let c = (SIZE as f32 - 1.0) / 2.0;
     for py in 0..SIZE as u32 {
@@ -759,12 +834,51 @@ fn make_bokeh_texture() -> Texture2D {
             let dx = px as f32 - c;
             let dy = py as f32 - c;
             let d = (dx * dx + dy * dy).sqrt() / c;
-            let a = (1.0 - d).clamp(0.0, 1.0).powf(1.6);
+            let core = 0.55;
+            let rim = core + (1.0 - core) * smoothstep(0.50, 0.84, d);
+            let edge = 1.0 - smoothstep(0.86, 1.0, d);
+            let a = (rim * edge).clamp(0.0, 1.0);
             img.set_pixel(px, py, Color::new(1.0, 1.0, 1.0, a));
         }
     }
     let tex = Texture2D::from_image(&img);
     tex.set_filter(FilterMode::Linear);
+    tex
+}
+
+/// In-focus glint: a tight hot core falling off fast — the handful of sharp
+/// points scattered among the soft discs.
+fn make_sparkle_texture() -> Texture2D {
+    const SIZE: u16 = 64;
+    let mut img = Image::gen_image_color(SIZE, SIZE, Color::new(0.0, 0.0, 0.0, 0.0));
+    let c = (SIZE as f32 - 1.0) / 2.0;
+    for py in 0..SIZE as u32 {
+        for px in 0..SIZE as u32 {
+            let dx = px as f32 - c;
+            let dy = py as f32 - c;
+            let d = ((dx * dx + dy * dy).sqrt() / c).min(1.0);
+            let a = (1.0 - d).powf(3.5);
+            img.set_pixel(px, py, Color::new(1.0, 1.0, 1.0, a));
+        }
+    }
+    let tex = Texture2D::from_image(&img);
+    tex.set_filter(FilterMode::Linear);
+    tex
+}
+
+/// Static white-noise tile; drawn at whisper alpha with a per-frame jitter it
+/// reads as living film grain.
+fn make_grain_texture() -> Texture2D {
+    const SIZE: u16 = 128;
+    let mut img = Image::gen_image_color(SIZE, SIZE, Color::new(0.0, 0.0, 0.0, 0.0));
+    for py in 0..SIZE as u32 {
+        for px in 0..SIZE as u32 {
+            let a = macroquad::rand::gen_range(0.0f32, 1.0);
+            img.set_pixel(px, py, Color::new(1.0, 1.0, 1.0, a));
+        }
+    }
+    let tex = Texture2D::from_image(&img);
+    tex.set_filter(FilterMode::Nearest);
     tex
 }
 
@@ -783,18 +897,40 @@ impl MetroState {
             .unwrap_or(42);
         macroquad::rand::srand(seed);
         let bokeh = (0..BOKEH_COUNT)
-            .map(|_| {
+            .map(|i| {
                 use macroquad::rand::gen_range;
-                Bokeh {
-                    x: gen_range(0.0, 1.0),
-                    y: gen_range(0.0, 1.0),
-                    r: gen_range(10.0, 42.0),
-                    speed: gen_range(0.006, 0.020),
-                    wobble: gen_range(0.002, 0.012),
-                    wobble_hz: gen_range(0.05, 0.20),
-                    twinkle_hz: gen_range(0.04, 0.12),
-                    phase: gen_range(0.0, std::f32::consts::TAU),
-                    alpha: gen_range(0.04, 0.11),
+                // Every third mote is an in-focus glint; the rest are big
+                // defocused discs. The two populations at once are what read
+                // as depth of field instead of drifting fog.
+                let sparkle = i % 3 == 2;
+                if sparkle {
+                    Bokeh {
+                        x: gen_range(0.0, 1.0),
+                        y: gen_range(0.0, 1.0),
+                        r: gen_range(2.5, 7.0),
+                        speed: gen_range(0.006, 0.020),
+                        wobble: gen_range(0.002, 0.010),
+                        wobble_hz: gen_range(0.05, 0.20),
+                        twinkle_hz: gen_range(0.15, 0.45),
+                        phase: gen_range(0.0, std::f32::consts::TAU),
+                        alpha: gen_range(0.30, 0.65),
+                        warm: gen_range(0.4, 1.0),
+                        sparkle,
+                    }
+                } else {
+                    Bokeh {
+                        x: gen_range(0.0, 1.0),
+                        y: gen_range(0.0, 1.0),
+                        r: gen_range(16.0, 56.0),
+                        speed: gen_range(0.006, 0.020),
+                        wobble: gen_range(0.002, 0.012),
+                        wobble_hz: gen_range(0.05, 0.20),
+                        twinkle_hz: gen_range(0.04, 0.12),
+                        phase: gen_range(0.0, std::f32::consts::TAU),
+                        alpha: gen_range(0.05, 0.13),
+                        warm: gen_range(0.25, 1.0),
+                        sparkle,
+                    }
                 }
             })
             .collect();
@@ -817,7 +953,8 @@ impl MetroState {
         Self {
             tab: DEFAULT_TAB, prev_tab: DEFAULT_TAB, anim: 1.0, dir: 1.0,
             tile: primary_tile(DEFAULT_TAB),
-            cover_tex: None, icon_tex: None, cart_label: None, cart_optical: false,
+            cover_tex: None, icon_tex: None, cart_label: None, playtime_line: None,
+            cart_optical: false,
             cover_blur: None, cover_bg_vis: 0.0,
             bgm_env: Arc::new(Mutex::new(None)), bgm_start: 0.0, beat: 0.0,
             badge_sd, badge_disc, cover_key: String::new(),
@@ -831,8 +968,9 @@ impl MetroState {
             legend_icon: LegendIcon::Keyboard,
             toasts: Vec::new(),
             had_cart: None,
-            bokeh, bokeh_tex: make_bokeh_texture(), fade_tex: make_fade_texture(),
-            bgm_path: None, bgm_sink: None, bgm_vol: 0.0,
+            bokeh, bokeh_tex: make_bokeh_texture(), sparkle_tex: make_sparkle_texture(),
+            grain_tex: make_grain_texture(), fade_tex: make_fade_texture(),
+            bgm_path: None, bgm_sink: None, bgm_pad_sink: None, bgm_vol: 0.0,
             mounts_fp: String::new(), mounts_polled: -10.0,
         }
     }
@@ -851,6 +989,11 @@ impl MetroState {
 
     pub fn stop_bgm(&mut self) {
         if let Some(sink) = self.bgm_sink.take() {
+            sink.stop();
+        }
+        // The pad copy dies with the TV copy — every stop path (unmount,
+        // fade-out, eject, launch) funnels through here.
+        if let Some(sink) = self.bgm_pad_sink.take() {
             sink.stop();
         }
         self.bgm_vol = 0.0;
@@ -1163,6 +1306,7 @@ pub fn update(
         state.cart_optical = false;
         state.bgm_path = None;
         state.cover_blur = None;
+        state.playtime_line = None;
         state.stop_bgm();
         // The hover theme may have been ducking the system bgm when the cart
         // vanished — give the system its volume back.
@@ -1189,6 +1333,17 @@ pub fn update(
                     }
                 }
             }
+            // PS3-style information line: the launcher has been stamping
+            // playtime into every game's save dir all along — surface it.
+            // Multi-carts sum their whole library.
+            let ids: Vec<String> = if !available_games.is_empty() {
+                available_games.iter().map(|(g, _)| g.id.clone()).collect()
+            } else {
+                save::collect_available_games()
+                    .map(|(games, _)| games.into_iter().map(|(g, _)| g.id).collect())
+                    .unwrap_or_default()
+            };
+            state.playtime_line = playtime_summary(&ids);
             // Kick off the theme's loudness envelope for the beat reaction.
             state.bgm_env = Arc::new(Mutex::new(None));
             if let Some(bgm) = state.bgm_path.clone() {
@@ -1420,12 +1575,25 @@ pub fn update(
     if hero_hovered && state.bgm_sink.is_none() {
         if let Some(path) = state.bgm_path.clone() {
             if let Ok(bytes) = std::fs::read(&path) {
+                let pad_bytes = bytes.clone();
                 if let Ok(decoder) = Decoder::new(Cursor::new(bytes)) {
                     let sink = Sink::connect_new(&AUDIO.stream.mixer());
                     sink.append(decoder.repeat_infinite());
                     sink.set_volume(0.0);
                     state.bgm_sink = Some(sink);
                     state.bgm_start = get_time();
+                    // Same theme through the docked pad's own speaker — its
+                    // own decoder over the same bytes, faded in lockstep by
+                    // the tick below.
+                    if config.pad_bgm_volume > 0.001 {
+                        if let Some(pad_sink) = crate::audio::pad_sink_new() {
+                            if let Ok(d2) = Decoder::new(Cursor::new(pad_bytes)) {
+                                pad_sink.append(crate::audio::PadSource::new(d2.repeat_infinite()));
+                                pad_sink.set_volume(0.0);
+                                state.bgm_pad_sink = Some(pad_sink);
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -1440,6 +1608,11 @@ pub fn update(
         }
         if let Some(sink) = &state.bgm_sink {
             sink.set_volume(state.bgm_vol);
+        }
+        // The pad copy rides the same envelope, scaled by its own knob.
+        if let Some(pad) = &state.bgm_pad_sink {
+            let hover_fraction = (state.bgm_vol / config.bgm_volume.max(0.01)).min(1.0);
+            pad.set_volume(hover_fraction * config.pad_bgm_volume);
         }
         // Fade the system bgm fully out underneath the cart's hover theme
         // (and back in as the hover theme fades away).
@@ -1590,6 +1763,54 @@ pub fn update(
 // DRAW
 // ===================================
 
+/// "12h 40m · played today" from the launcher's playtime stamps — each game
+/// session lands in its save dir as a "START_ISO END_ISO" line. None when
+/// nothing meaningful has been logged.
+fn playtime_summary(ids: &[String]) -> Option<String> {
+    use chrono::{DateTime, Utc};
+    let mut total = chrono::Duration::zero();
+    let mut last: Option<DateTime<Utc>> = None;
+    for id in ids {
+        let path = format!("/var/kazeta/saves/default/{}/.kazeta/var/playtime.log", id);
+        let Ok(text) = std::fs::read_to_string(&path) else { continue };
+        for line in text.lines() {
+            let mut parts = line.split_whitespace();
+            let (Some(a), Some(b)) = (parts.next(), parts.next()) else { continue };
+            let (Ok(start), Ok(end)) =
+                (DateTime::parse_from_rfc3339(a), DateTime::parse_from_rfc3339(b))
+            else {
+                continue;
+            };
+            let d = end.signed_duration_since(start);
+            if d > chrono::Duration::zero() {
+                total = total + d;
+            }
+            let end_utc = end.with_timezone(&Utc);
+            if last.map(|l| end_utc > l).unwrap_or(true) {
+                last = Some(end_utc);
+            }
+        }
+    }
+    let last = last?;
+    let mins = total.num_minutes();
+    if mins < 1 {
+        return None;
+    }
+    let hours = if mins < 60 {
+        format!("{}m", mins)
+    } else {
+        format!("{}h {}m", mins / 60, mins % 60)
+    };
+    let days = Utc::now().signed_duration_since(last).num_days();
+    let when = match days {
+        d if d < 1 => "played today".to_string(),
+        1 => "played yesterday".to_string(),
+        d if d < 7 => format!("played {} days ago", d),
+        _ => format!("played {}", last.format("%b %e")),
+    };
+    Some(format!("{} · {}", hours, when))
+}
+
 /// One layer of Play-hero branding for the draw pass. During a swap two of
 /// these exist at once: the ejected cart fading out under the new one fading
 /// in.
@@ -1598,6 +1819,7 @@ struct HeroBrandDraw<'a> {
     icon: Option<&'a Texture2D>,
     badge: &'a Texture2D,
     label: Option<&'a str>,
+    playtime: Option<&'a str>,
     vis: f32, // 0..1 raw fade progress; eased and turned into alpha here
 }
 
@@ -1681,6 +1903,24 @@ fn draw_hero_brand(
         color: tint,
         ..Default::default()
     });
+    // The information line — total hours and recency — sits left-aligned
+    // just above the Play bar, quiet like the PS3's info board.
+    if let Some(pt) = brand.playtime {
+        let pt_size = (FONT_SIZE as f32 * s * 0.62) as u16;
+        let (px, py) = (bx + 5.0 * s, by + bh - bar_h - 4.0 * s);
+        draw_text_ex(pt, px + shadow_offset, py + shadow_offset, TextParams {
+            font: Some(font),
+            font_size: pt_size,
+            color: Color::new(0.0, 0.0, 0.0, 0.8 * v),
+            ..Default::default()
+        });
+        draw_text_ex(pt, px, py, TextParams {
+            font: Some(font),
+            font_size: pt_size,
+            color: Color::new(1.0, 1.0, 1.0, 0.85 * v),
+            ..Default::default()
+        });
+    }
     // Media badge (SD card or disc art) top-right.
     let badge_size = 22.0 * s;
     draw_texture_ex(
@@ -1717,7 +1957,9 @@ fn draw_bokeh(state: &MetroState, intro: f32, s: f32) {
         let breath = 0.5 - 0.5 * (t * b.twinkle_hz * std::f32::consts::TAU + b.phase * 1.7).cos();
         // The motes brighten and swell on the cart theme's beat while the
         // Play hero is hovered; `beat` is zero at every other moment.
-        let mut a = b.alpha * breath * (1.0 + state.beat * 5.0);
+        // (Halved from the original x5 to match the background's calmer
+        // flash.)
+        let mut a = b.alpha * breath * (1.0 + state.beat * 2.5);
         // Boot intro: every mote flies out of a point just below
         // bottom-center, curling as it travels to its resting spot.
         if intro < 1.0 {
@@ -1733,13 +1975,33 @@ fn draw_bokeh(state: &MetroState, intro: f32, s: f32) {
         if a <= 0.003 {
             continue;
         }
-        let r = b.r * s * (1.0 + state.beat * 0.55);
+        // Sparkles glint (squared breath spikes the peaks) and barely swell
+        // on the beat; the soft discs breathe slow and swell more.
+        let (tex, r_swell) = if b.sparkle {
+            a = b.alpha * breath * breath * (1.0 + state.beat * 1.0);
+            if intro < 1.0 {
+                a *= intro;
+            }
+            (&state.sparkle_tex, 0.20)
+        } else {
+            (&state.bokeh_tex, 0.44)
+        };
+        let r = b.r * s * (1.0 + state.beat * r_swell);
+        // Per-mote blend between the dash's green-white and champagne gold —
+        // a lens sees warm lights, and the warmth is what reads as bokeh.
+        let cool = (0.82, 1.0, 0.86);
+        let gold = (1.0, 0.87, 0.62);
+        let col = Color::new(
+            cool.0 + (gold.0 - cool.0) * b.warm,
+            cool.1 + (gold.1 - cool.1) * b.warm,
+            cool.2 + (gold.2 - cool.2) * b.warm,
+            a,
+        );
         draw_texture_ex(
-            &state.bokeh_tex,
+            tex,
             x * w - r,
             y * h - r,
-            // Faint green-white so the motes sit inside the dash's palette.
-            Color::new(0.82, 1.0, 0.86, a),
+            col,
             DrawTextureParams { dest_size: Some(vec2(r * 2.0, r * 2.0)), ..Default::default() },
         );
     }
@@ -2323,8 +2585,26 @@ pub fn draw(
             });
             // Hold it back so tiles and text keep their contrast — but lift
             // the veil on each hit, so the whole room brightens to the beat.
-            let dim = (0.45 - state.beat * 0.20).max(0.20);
+            // (Half the original lift: full 0.20 flashed too hard.)
+            let dim = (0.45 - state.beat * 0.10).max(0.20);
             draw_rectangle(0.0, 0.0, w, h, Color::new(0.0, 0.0, 0.0, dim * v));
+            // Living film grain over the smooth gradient — the jittered tile
+            // offset each frame is what makes it read as grain instead of a
+            // dirty screen, and it hides the 8-bit banding a soft blur
+            // otherwise shows.
+            let t = get_time();
+            let jx = ((t * 61.0).fract() * 128.0) as f32;
+            let jy = ((t * 47.0).fract() * 128.0) as f32;
+            let ga = 0.045 * v;
+            let mut gy = -jy;
+            while gy < h {
+                let mut gx = -jx;
+                while gx < w {
+                    draw_texture(&state.grain_tex, gx, gy, Color::new(1.0, 1.0, 1.0, ga));
+                    gx += 128.0;
+                }
+                gy += 128.0;
+            }
         }
     }
 
@@ -2369,6 +2649,7 @@ pub fn draw(
             icon: out.icon.as_ref(),
             badge: if out.optical { &state.badge_disc } else { &state.badge_sd },
             label: out.label.as_deref(),
+            playtime: None,
             vis: out.vis,
         });
     }
@@ -2378,6 +2659,7 @@ pub fn draw(
             icon: state.icon_tex.as_ref(),
             badge: if state.cart_optical { &state.badge_disc } else { &state.badge_sd },
             label: state.cart_label.as_deref(),
+            playtime: state.playtime_line.as_deref(),
             vis: state.cart_vis,
         });
     }

@@ -12,6 +12,13 @@ sync
 
 for m in $(findmnt -rn -o TARGET | grep '^/run/media/'); do
 	dev=$(findmnt -n -o SOURCE "$m" 2>/dev/null)
+	# Carts only: MMC cards, USB storage, optical. The updater mounts
+	# frzr_efi under /run/media too — ripping the BOOT partition out on
+	# every eject quietly breaks future system updates.
+	case "$dev" in
+		/dev/mmcblk*|/dev/sd*|/dev/sr*) ;;
+		*) continue ;;
+	esac
 	umount "$m" 2>/dev/null || umount -l "$m"
 	case "$dev" in
 		/dev/sr*)

@@ -20,6 +20,10 @@ fn default_screensaver() -> String {
     "NEVER".to_string()
 }
 
+fn default_pad_bgm_volume() -> f32 {
+    0.35
+}
+
 /// Gets the full path to the kazeta.toml configuration file.
 fn get_config_path() -> Result<PathBuf, Box<dyn Error>> {
     let mut config_path = get_user_data_dir().ok_or("Could not find user's data directory.")?;
@@ -38,6 +42,11 @@ pub struct Config {
     pub bluetooth: bool,
     pub autoboot: bool,
     pub bgm_volume: f32,
+    /// Hover theme through a USB-docked DualSense's own speaker/coils.
+    /// 0.0 disables; wireless pads have no audio path and silently skip.
+    /// serde default keeps config.toml files from before this field parsing.
+    #[serde(default = "default_pad_bgm_volume")]
+    pub pad_bgm_volume: f32,
     pub sfx_volume: f32,
     pub audio_output: String,
     pub theme: String,
@@ -77,6 +86,7 @@ impl Default for Config {
             bluetooth: true,
             autoboot: true,
             bgm_volume: 0.7,
+            pad_bgm_volume: 0.5,
             sfx_volume: 0.7,
             audio_output: "Auto".to_string(),
             theme: "Default".to_string(),
