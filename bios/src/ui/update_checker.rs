@@ -3,6 +3,7 @@ use crate::{
     config::Config,
     FONT_SIZE, VERSION_NUMBER, Screen, BackgroundState, render_background, get_current_font, text_with_config_color, InputState, wrap_text, VideoPlayer,
 };
+use crate::ui::metro::{legend_row, LegendItem, LegendKey};
 use macroquad::prelude::*;
 use regex::Regex;
 use serde::Deserialize;
@@ -236,7 +237,7 @@ pub fn draw(
         UpdateCheckerScreenState::UpToDate => {
             text_with_config_color(font_cache, config, "You are running the latest version.", text_x, text_y_start, font_size);
             text_with_config_color(font_cache, config, &format!("Current version: {}", VERSION_NUMBER), text_x, text_y_start + line_height, font_size);
-            text_with_config_color(font_cache, config, "Press [SOUTH] or [EAST] to return.", text_x, text_y_start + line_height * 3.0, font_size);
+            legend_row(font, &[LegendItem::new(LegendKey::Back, "Back")], scale_factor, 1.0);
         }
         UpdateCheckerScreenState::UpdateAvailable(release) => {
             text_with_config_color(font_cache, config, &format!("New version available: {}", release.tag_name), text_x, text_y_start, font_size);
@@ -300,9 +301,15 @@ pub fn draw(
                 }
             }
 
-            let continue_text = "Press [SOUTH] to Install Update";
-            let continue_dims = measure_text(continue_text, Some(font), font_size, 1.0);
-            text_with_config_color(font_cache, config, continue_text, screen_width() / 2.0 - continue_dims.width / 2.0, container_y + container_h - 20.0 * scale_factor, font_size);
+            legend_row(
+                font,
+                &[
+                    LegendItem::new(LegendKey::Confirm, "Install Update"),
+                    LegendItem::new(LegendKey::Back, "Back"),
+                ],
+                scale_factor,
+                1.0,
+            );
         }
         UpdateCheckerScreenState::InProgress(message) => {
             let text_dims = measure_text(message, Some(font), font_size, 1.0);
@@ -310,18 +317,22 @@ pub fn draw(
         }
         UpdateCheckerScreenState::UpdateComplete => {
             let line1 = "Update Complete!";
-            let line2 = "Press [SOUTH] to shut down, or [WEST] to reboot.";
-
             let dims1 = measure_text(line1, Some(font), font_size, 1.0);
-            let dims2 = measure_text(line2, Some(font), font_size, 1.0);
-
             text_with_config_color(font_cache, config, line1, screen_width() / 2.0 - dims1.width / 2.0, screen_height() / 2.0 - line_height, font_size);
-            text_with_config_color(font_cache, config, line2, screen_width() / 2.0 - dims2.width / 2.0, screen_height() / 2.0, font_size);
+            legend_row(
+                font,
+                &[
+                    LegendItem::new(LegendKey::Confirm, "Shut Down"),
+                    LegendItem::new(LegendKey::West, "Reboot"),
+                ],
+                scale_factor,
+                1.0,
+            );
         }
         UpdateCheckerScreenState::Error(msg) => {
             text_with_config_color(font_cache, config, "An error occurred:", text_x, text_y_start, font_size);
             text_with_config_color(font_cache, config, msg, text_x, text_y_start + line_height, font_size);
-            text_with_config_color(font_cache, config, "Press [SOUTH] or [EAST] to return.", text_x, text_y_start + line_height * 3.0, font_size);
+            legend_row(font, &[LegendItem::new(LegendKey::Back, "Back")], scale_factor, 1.0);
         }
     }
 }

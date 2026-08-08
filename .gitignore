@@ -1,2 +1,4 @@
 /bios/target/
+/guided/target/
+/.build-out/
 *.stackdump

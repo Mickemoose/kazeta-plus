@@ -38,7 +38,12 @@ pub static AUDIO: Lazy<AudioSystem> = Lazy::new(|| {
 
 use std::sync::Mutex;
 
-pub static PAD_STREAM: Mutex<Option<OutputStream>> = Mutex::new(None);
+/// The pad's output stream, tagged with the PipeWire node id it was opened
+/// against. The id is a fresh number on every replug, and it is the only
+/// reliable staleness signal: the node NAME is derived from the USB device and
+/// so is byte-identical before and after, while the stream itself is pinned to
+/// the old node instance and silently plays into a dead end.
+pub static PAD_STREAM: Mutex<Option<(String, OutputStream)>> = Mutex::new(None);
 
 /// The pad's PipeWire sink, as (wpctl id, node name) — None when the pad is
 /// wireless or absent.
@@ -82,13 +87,33 @@ fn find_pad_sink() -> Option<(String, String)> {
 pub fn pad_sink_new() -> Option<Sink> {
     // Re-asserted every hover: the pad forgets its audio path on replug.
     crate::dualsense::enable_speaker();
+    // Locate the pad BEFORE consulting the cache, so a replug (new node id) or
+    // an unplug (no node at all) can retire a stream that is now pointed at a
+    // node PipeWire has destroyed.
+    let Some((id, node)) = find_pad_sink() else {
+        if let Ok(mut guard) = PAD_STREAM.lock() {
+            if guard.take().is_some() {
+                println!("[PAD_AUDIO] Pad gone; dropped its stream");
+            }
+        }
+        return None;
+    };
     {
-        let guard = PAD_STREAM.lock().ok()?;
-        if let Some(stream) = guard.as_ref() {
-            return Some(Sink::connect_new(stream.mixer()));
+        let mut guard = PAD_STREAM.lock().ok()?;
+        match guard.as_ref() {
+            Some((cached_id, stream)) if *cached_id == id => {
+                return Some(Sink::connect_new(stream.mixer()));
+            }
+            Some((cached_id, _)) => {
+                println!(
+                    "[PAD_AUDIO] Pad re-enumerated (node {} -> {}); rebuilding stream",
+                    cached_id, id
+                );
+                *guard = None; // drop the dead stream before opening the new one
+            }
+            None => {}
         }
     }
-    let (id, node) = find_pad_sink()?;
     // The sink ships muted at the server level; wake it once.
     let _ = std::process::Command::new("wpctl").args(["set-mute", &id, "0"]).output();
     let _ = std::process::Command::new("wpctl").args(["set-volume", &id, "1.0"]).output();
@@ -112,8 +137,8 @@ pub fn pad_sink_new() -> Option<Sink> {
         }
     };
     let mut guard = PAD_STREAM.lock().ok()?;
-    *guard = Some(stream);
-    guard.as_ref().map(|s| Sink::connect_new(s.mixer()))
+    *guard = Some((id, stream));
+    guard.as_ref().map(|(_, s)| Sink::connect_new(s.mixer()))
 }
 
 /// Any source, refolded into the pad's 4-channel frame: nothing to the

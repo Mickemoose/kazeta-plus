@@ -3,6 +3,7 @@ use crate::{
     config::{Config, get_user_data_dir},
     FONT_SIZE, Screen, BackgroundState, render_background, get_current_font, text_with_config_color, InputState, wrap_text, VideoPlayer,
 };
+use crate::ui::metro::{legend_row, sheet, LegendItem, LegendKey, TILE_RED, XBOX_GREEN};
 use macroquad::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
@@ -464,11 +465,17 @@ pub fn draw(
                 text_with_config_color(font_cache, config, line, text_x, y_pos, description_font_size);
             }
 
-            // Draw pagination controls and hint text
-            let hint_y = container_y + container_h - 20.0;
-            let hint_text = "Press [SOUTH] to Download, [WEST] to Delete";
-            let hint_dims = measure_text(hint_text, Some(font), (font_size as f32 * 0.8) as u16, 1.0);
-            text_with_config_color(font_cache, config, hint_text, screen_width() / 2.0 - hint_dims.width / 2.0, hint_y, (font_size as f32 * 0.8) as u16);
+            // Draw pagination controls
+            legend_row(
+                font,
+                &[
+                    LegendItem::new(LegendKey::Confirm, "Download"),
+                    LegendItem::new(LegendKey::West, "Delete"),
+                    LegendItem::new(LegendKey::Back, "Back"),
+                ],
+                scale_factor,
+                1.0,
+            );
 
             if total_pages > 1 {
                 let page_text = format!("Page {} / {}", state.current_page + 1, total_pages);
@@ -481,8 +488,7 @@ pub fn draw(
             let dialog_h = 150.0 * scale_factor;
             let dialog_x = screen_width() / 2.0 - dialog_w / 2.0;
             let dialog_y = screen_height() / 2.0 - dialog_h / 2.0;
-            draw_rectangle(dialog_x, dialog_y, dialog_w, dialog_h, Color::new(0.1, 0.1, 0.1, 0.9));
-            draw_rectangle_lines(dialog_x, dialog_y, dialog_w, dialog_h, 3.0, WHITE);
+            sheet(dialog_x, dialog_y, dialog_w, dialog_h, TILE_RED, scale_factor);
 
             let question = format!("Delete '{}'?", theme_display_name);
             let question_dims = measure_text(&question, Some(font), font_size, 1.0);
@@ -508,8 +514,7 @@ pub fn draw(
             let dialog_h = 170.0 * scale_factor; // Made dialog taller
             let dialog_x = screen_width() / 2.0 - dialog_w / 2.0;
             let dialog_y = screen_height() / 2.0 - dialog_h / 2.0;
-            draw_rectangle(dialog_x, dialog_y, dialog_w, dialog_h, Color::new(0.1, 0.1, 0.1, 0.9));
-            draw_rectangle_lines(dialog_x, dialog_y, dialog_w, dialog_h, 3.0, WHITE);
+            sheet(dialog_x, dialog_y, dialog_w, dialog_h, XBOX_GREEN, scale_factor);
 
             // Line 1
             let question = format!("'{}' is already installed.", theme.name);
@@ -589,9 +594,7 @@ pub fn draw(
             let text_dims = measure_text(msg, Some(font), font_size, 1.0);
             text_with_config_color(font_cache, config, msg, screen_width() / 2.0 - text_dims.width / 2.0, screen_height() / 2.0, font_size);
 
-            let continue_text = "Press [SOUTH] to continue";
-            let continue_dims = measure_text(continue_text, Some(font), font_size, 1.0);
-            text_with_config_color(font_cache, config, continue_text, screen_width() / 2.0 - continue_dims.width / 2.0, screen_height() / 2.0 + line_height * 2.0, font_size);
+            legend_row(font, &[LegendItem::new(LegendKey::Confirm, "Continue")], scale_factor, 1.0);
         }
     }
 }
@@ -605,8 +608,7 @@ fn draw_conversion_dialog(
     let dialog_h = 300.0 * scale_factor;
     let dialog_x = screen_width() / 2.0 - dialog_w / 2.0;
     let dialog_y = screen_height() / 2.0 - dialog_h / 2.0;
-    draw_rectangle(dialog_x, dialog_y, dialog_w, dialog_h, Color::new(0.1, 0.1, 0.1, 0.9));
-    draw_rectangle_lines(dialog_x, dialog_y, dialog_w, dialog_h, 3.0, WHITE);
+    sheet(dialog_x, dialog_y, dialog_w, dialog_h, XBOX_GREEN, scale_factor);
 
     let title_dims = measure_text(title, Some(font), font_size, 1.0);
     text_with_config_color(font_cache, config, title, screen_width() / 2.0 - title_dims.width / 2.0, dialog_y + 40.0 * scale_factor, font_size);

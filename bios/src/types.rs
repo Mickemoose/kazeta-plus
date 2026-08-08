@@ -57,7 +57,7 @@ pub enum DialogState {
 }
 
 // SCREENS
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Screen {
     MainMenu,
     SaveData,

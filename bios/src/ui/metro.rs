@@ -81,10 +81,56 @@ pub const TABS: &[MetroTab] = &[
 ];
 
 const DEFAULT_TAB: usize = 0; // home
-// Left edge of the tab strip and panes, 360p units. Sized so home's full
-// row (wide small + hero banner + wide small) keeps a margin on the right
-// even with the 1.07x focus scale on the last column.
-const ORIGIN_X: f32 = 52.0;
+
+// Tile geometry in 360p design units. tile_rect() and the content-width
+// measurement below both derive from these, so the two can never drift apart.
+// The hero is a wide banner matching the 920x430 cover art spec; small tiles
+// are landscape 185x131 like the real dash, with its thin gaps.
+const TILE_UNIT: f32 = 80.0;
+const TILE_GAP: f32 = 2.0;
+const SMALL_W: f32 = TILE_UNIT * (185.0 / 131.0);
+const HERO_H: f32 = TILE_UNIT * 2.0 + TILE_GAP;
+const HERO_W: f32 = HERO_H * (920.0 / 430.0);
+
+/// Width of one tab's tile block, in design units: columns left to right, a
+/// column holding the hero is banner-width, all others are one small tile.
+fn tab_content_w(tiles: &[MetroTile]) -> f32 {
+    let cols = tiles.iter().map(|t| t.col as usize).max().map_or(0, |m| m + 1);
+    let mut w = 0.0;
+    for c in 0..cols {
+        if c > 0 {
+            w += TILE_GAP;
+        }
+        w += if tiles.iter().any(|t| t.col as usize == c && t.hero) { HERO_W } else { SMALL_W };
+    }
+    w
+}
+
+/// The content box every screen shares, in design units: the widest tab's tile
+/// block. Taking the max across tabs is what stops the block sliding sideways
+/// when you change tab.
+fn content_w() -> f32 {
+    TABS.iter().map(|t| tab_content_w(t.tiles)).fold(0.0f32, f32::max)
+}
+
+/// Left edge of the tab strip, the panes and every screen's frame, in design
+/// units. Centring the box on the panel — rather than pinning it to a fixed
+/// left edge — is what closes the dead strip at 16:9 and keeps the settings
+/// grid's last column on screen at 4:3.
+fn pane_origin_x() -> f32 {
+    let design_w = if screen_height() > 0.0 {
+        360.0 * screen_width() / screen_height()
+    } else {
+        640.0
+    };
+    ((design_w - content_w()) / 2.0).max(6.0)
+}
+
+/// Right edge of that same box — where right-aligned furniture lands, so the
+/// legend sits under the content instead of floating off at the screen edge.
+fn pane_right() -> f32 {
+    pane_origin_x() + content_w()
+}
 
 // Focus animation, timings straight from dashx360's MetroTile control.
 const SEL_SCALE: f32 = 1.07;     // focused tiles grow 7%
@@ -100,7 +146,7 @@ fn primary_tile(tab: usize) -> usize {
 const SLIDE_TIME: f32 = 0.25; // pane slide duration, seconds
 
 // Xbox green and the flat Metro tile palette.
-const XBOX_GREEN: Color = Color::new(0.063, 0.486, 0.063, 1.0);
+pub const XBOX_GREEN: Color = Color::new(0.063, 0.486, 0.063, 1.0);
 const TILE_SLATE: Color = Color::new(0.24, 0.25, 0.26, 1.0);
 const TILE_SLATE_ALT: Color = Color::new(0.30, 0.31, 0.33, 1.0);
 const BG_FALLBACK: Color = Color::new(0.12, 0.12, 0.12, 1.0);
@@ -189,6 +235,10 @@ pub struct MetroState {
     // speaker/coils (wireless pads have no Linux audio path — silently
     // TV-only there).
     bgm_pad_sink: Option<Sink>,
+    /// When a pad docks mid-track it can't join a sink that was built without
+    /// it. Set a moment ahead of now on connect, because PipeWire needs a beat
+    /// to publish the pad's node before it can be found.
+    pad_attach_at: Option<f64>,
     bgm_vol: f32,
     // Mount fingerprint so cart swaps invalidate branding even while the
     // game list is stale (it only rebuilds when the Play screen opens).
@@ -203,6 +253,7 @@ struct OutgoingBrand {
     icon: Option<Texture2D>,
     label: Option<String>,
     optical: bool,
+    consoles: Vec<usize>, // CONSOLE_ICONS indices, so the bubbles fade too
     vis: f32, // 1..0, drops to zero then the snapshot is discarded
 }
 
@@ -238,6 +289,9 @@ const TOAST_TIME: f32 = 2.8; // player connect/disconnect pill lifetime
 enum OutroAction {
     Play,
     SaveData,
+    /// A utility screen: the dash plays its reverse choreography and hands over
+    /// when it lands, so opening Settings is a departure rather than a cut.
+    Enter(Screen),
 }
 
 /// One notification pill queued for the bottom of the screen.
@@ -352,7 +406,7 @@ thread_local! {
 
 /// Bottom-left shoulder hint: real LB/RB glyphs plus a label, replacing the
 /// old abbreviation chips ("LB", "R1", "]") that guessed at the brand.
-fn draw_shoulder_hint(
+pub fn draw_shoulder_hint(
     font: &Font,
     legend: LegendIcon,
     label: &str,
@@ -363,7 +417,7 @@ fn draw_shoulder_hint(
 ) {
     let icon_h = 14.0 * s;
     let cy = 323.5 * s; // vertical center of the old chip row
-    let mut x = ORIGIN_X * s;
+    let mut x = pane_origin_x() * s;
     let mut icon = |tex: &Texture2D, x: &mut f32| {
         draw_texture_ex(tex, *x, cy - icon_h / 2.0, Color::new(1.0, 1.0, 1.0, a),
             DrawTextureParams { dest_size: Some(vec2(icon_h, icon_h)), ..Default::default() });
@@ -388,6 +442,134 @@ fn draw_shoulder_hint(
         font: Some(font), font_size: size,
         color: Color::new(1.0, 1.0, 1.0, 0.55 * a), ..Default::default()
     });
+}
+
+/// The one floating-surface recipe, lifted out of the save dialog: soft
+/// shadow, slate fill, a top sheen and a bottom ramp cut from the shared fade
+/// texture, and a 3-unit accent spine down the left. Deliberately no outline —
+/// the hard white border is what made the old modals read as a different
+/// application, and stacked gradient strips are what made them band.
+pub fn sheet(x: f32, y: f32, w: f32, h: f32, accent: Color, s: f32) {
+    draw_tile_shadow(x, y, w, h, s, 1.0);
+    draw_rectangle(x, y, w, h, TILE_SLATE);
+    FADE_TEX.with(|tex| {
+        draw_texture_ex(tex, x, y, Color::new(1.0, 1.0, 1.0, 0.20), DrawTextureParams {
+            dest_size: Some(vec2(w, h * 0.16)), flip_y: true, ..Default::default()
+        });
+        draw_texture_ex(tex, x, y + h * 0.72, Color::new(0.0, 0.0, 0.0, 0.45), DrawTextureParams {
+            dest_size: Some(vec2(w, h * 0.28)), ..Default::default()
+        });
+    });
+    draw_rectangle(x, y, 3.0 * s, h, accent);
+}
+
+/// Which glyph bank a legend entry draws from. Named by face position, not by
+/// brand — the bank picks the right art for whatever pad is in hand.
+#[derive(Clone, Copy, PartialEq)]
+pub enum LegendKey {
+    Confirm, // south face: A / cross / B / Enter
+    Back,    // east face
+    Alt,     // north face: Y / triangle / X
+    West,    // west face, for destructive secondary actions
+    Start,
+}
+
+/// One glyph-plus-verb pair in the shared bottom-right legend. The verb states
+/// what the button actually does here ("Launch", "Connect", "Forget"), never a
+/// generic "Select" and never a `[SOUTH]` token.
+pub struct LegendItem<'a> {
+    pub key: LegendKey,
+    pub label: &'a str,
+    pub enabled: bool,
+}
+
+impl<'a> LegendItem<'a> {
+    pub fn new(key: LegendKey, label: &'a str) -> Self {
+        Self { key, label, enabled: true }
+    }
+    /// An action this screen currently won't perform: shown, but dimmed, so
+    /// the row never reflows as the cursor moves.
+    pub fn dim(key: LegendKey, label: &'a str) -> Self {
+        Self { key, label, enabled: false }
+    }
+}
+
+thread_local! {
+    /// Last-used input device, mirrored out of MetroState so any screen can
+    /// draw brand-correct glyphs without threading it through its signature.
+    static ACTIVE_LEGEND: std::cell::Cell<u8> = std::cell::Cell::new(0);
+}
+
+/// The glyph brand legends draw in, tracking the last-used input device.
+pub fn active_legend_icon() -> LegendIcon {
+    match ACTIVE_LEGEND.with(|c| c.get()) {
+        1 => LegendIcon::Xbox,
+        2 => LegendIcon::PlayStation,
+        3 => LegendIcon::Switch,
+        4 => LegendIcon::Switch2,
+        5 => LegendIcon::Steam,
+        6 => LegendIcon::N64,
+        _ => LegendIcon::Keyboard,
+    }
+}
+
+fn set_active_legend_icon(icon: LegendIcon) {
+    ACTIVE_LEGEND.with(|c| c.set(icon as u8));
+}
+
+/// The one button legend: a right-aligned run of glyph-plus-verb pairs on the
+/// content box's right edge, at the single baseline every screen shares. Back
+/// goes last, so the way out is always in the same place.
+pub fn legend_row(font: &Font, items: &[LegendItem], s: f32, a: f32) {
+    if a <= 0.003 || items.is_empty() {
+        return;
+    }
+    let icon = active_legend_icon() as usize;
+    let size = ((FONT_SIZE as f32 * s * 0.80) as u16).max(9);
+    let icon_h = 18.0 * s;
+    let icon_gap = 4.0 * s;
+    let group_gap = 16.0 * s;
+    let cy = 324.0 * s;
+
+    let mut total = 0.0;
+    for (i, it) in items.iter().enumerate() {
+        if i > 0 {
+            total += group_gap;
+        }
+        total += icon_h + icon_gap + measure_text(it.label, Some(font), size, 1.0).width;
+    }
+    let mut x = pane_right() * s - total;
+
+    for (i, it) in items.iter().enumerate() {
+        if i > 0 {
+            x += group_gap;
+        }
+        let m = if it.enabled { 1.0 } else { 0.35 };
+        let tint = Color::new(1.0, 1.0, 1.0, a * m);
+        let (ix, iy) = (x, cy - icon_h / 2.0);
+        let p = DrawTextureParams { dest_size: Some(vec2(icon_h, icon_h)), ..Default::default() };
+        match it.key {
+            LegendKey::Confirm => LEGEND_ICONS.with(|g| draw_texture_ex(&g[icon], ix, iy, tint, p)),
+            LegendKey::Back => LEGEND_ICONS_BACK.with(|g| draw_texture_ex(&g[icon], ix, iy, tint, p)),
+            LegendKey::Alt => LEGEND_ICONS_EJECT.with(|g| draw_texture_ex(&g[icon], ix, iy, tint, p)),
+            LegendKey::West => LEGEND_ICONS_WEST.with(|g| draw_texture_ex(&g[icon], ix, iy, tint, p)),
+            LegendKey::Start => LEGEND_ICONS_START.with(|g| draw_texture_ex(&g[icon], ix, iy, tint, p)),
+        }
+        x += icon_h + icon_gap;
+
+        let d = measure_text(it.label, Some(font), size, 1.0);
+        let ty = cy + d.offset_y * 0.5;
+        let so = 1.0 * (size as f32 / FONT_SIZE as f32);
+        draw_text_ex(it.label, x + so, ty + so, TextParams {
+            font: Some(font), font_size: size,
+            color: Color::new(0.0, 0.0, 0.0, 0.85 * a * m), ..Default::default()
+        });
+        draw_text_ex(it.label, x, ty, TextParams {
+            font: Some(font), font_size: size,
+            color: Color::new(1.0, 1.0, 1.0, 0.75 * a * m), ..Default::default()
+        });
+        x += d.width;
+    }
 }
 
 fn legend_tex(bytes: &[u8]) -> Texture2D {
@@ -970,7 +1152,7 @@ impl MetroState {
             had_cart: None,
             bokeh, bokeh_tex: make_bokeh_texture(), sparkle_tex: make_sparkle_texture(),
             grain_tex: make_grain_texture(), fade_tex: make_fade_texture(),
-            bgm_path: None, bgm_sink: None, bgm_pad_sink: None, bgm_vol: 0.0,
+            bgm_path: None, bgm_sink: None, bgm_pad_sink: None, pad_attach_at: None, bgm_vol: 0.0,
             mounts_fp: String::new(), mounts_polled: -10.0,
         }
     }
@@ -985,6 +1167,13 @@ impl MetroState {
     /// (the multicart selector shares the dashboard's device detection).
     pub fn legend_icon(&self) -> LegendIcon {
         self.legend_icon
+    }
+
+    /// Leave the dash for a utility screen through the outro choreography
+    /// instead of cutting to it. The handoff fires when the clock lands.
+    fn depart_to(&mut self, screen: Screen) {
+        self.outro_action = OutroAction::Enter(screen);
+        self.outro_t = Some(0.0);
     }
 
     pub fn stop_bgm(&mut self) {
@@ -1173,7 +1362,6 @@ fn draw_focus_glow_ex(x: f32, y: f32, w: f32, h: f32, s: f32, color: Color, spre
 
 /// Selection frame whose edge bars stop `r` short of the corners — reads as
 /// dashx360's small corner radius at dash distance.
-#[allow(dead_code)]
 fn draw_focus_frame(x: f32, y: f32, w: f32, h: f32, th: f32, r: f32, color: Color) {
     draw_rectangle(x + r, y, w - 2.0 * r, th, color);
     draw_rectangle(x + r, y + h - th, w - 2.0 * r, th, color);
@@ -1186,13 +1374,11 @@ fn draw_focus_frame(x: f32, y: f32, w: f32, h: f32, th: f32, r: f32, color: Colo
 /// slots are simply never declared, leaving a gap on purpose.
 fn tile_rect(tile: &MetroTile, tiles: &[MetroTile], origin_x: f32, origin_y: f32, s: f32) -> Rect {
     // Sized in the app's 360p design space (scale_factor blows it up).
-    // The hero is a wide banner matching the 920x430 cover art spec; small
-    // tiles are landscape 185x131 like the real dash, with its thin gaps.
-    let unit = 80.0 * s;
-    let gap = 2.0 * s;
-    let small_w = unit * (185.0 / 131.0);
-    let hero_h = unit * 2.0 + gap;
-    let hero_w = hero_h * (920.0 / 430.0);
+    let unit = TILE_UNIT * s;
+    let gap = TILE_GAP * s;
+    let small_w = SMALL_W * s;
+    let hero_h = HERO_H * s;
+    let hero_w = HERO_W * s;
 
     let mut x = origin_x;
     for c in 0..tile.col {
@@ -1303,6 +1489,9 @@ pub fn update(
         let prev_icon = state.icon_tex.take();
         let prev_label = state.cart_label.take();
         let prev_optical = state.cart_optical;
+        // Taken before the rescan below overwrites it, so the ejected cart's
+        // bubbles can fade out with the rest of its branding.
+        let prev_consoles = std::mem::take(&mut state.cart_console_icons);
         state.cart_optical = false;
         state.bgm_path = None;
         state.cover_blur = None;
@@ -1368,6 +1557,7 @@ pub fn update(
                     icon: prev_icon,
                     label: prev_label,
                     optical: prev_optical,
+                    consoles: prev_consoles,
                     vis: state.cart_vis,
                 });
             }
@@ -1382,16 +1572,28 @@ pub fn update(
     state.press_flash = (state.press_flash - get_frame_time() / PRESS_FLASH_TIME).max(0.0);
     state.intro_t = (state.intro_t + get_frame_time() / INTRO_TIME).min(1.0);
 
-    // Legend glyph follows whatever device the user touched last.
+    // Legend glyph follows whatever device the user touched last. Mirrored
+    // into the thread-local so screens that never see MetroState — the
+    // downloaders, the CD player, the update checker — draw the same brand.
     state.legend_icon = match input_state.last_source {
         InputSource::Keyboard => LegendIcon::Keyboard,
         InputSource::Pad => pad_legend_icon(input_state.pad_vendor, &input_state.pad_name),
     };
+    set_active_legend_icon(state.legend_icon);
 
     // Player toasts: consume connect/disconnect events from the LED painter
     // and show them one at a time as a bottom pill.
     for ev in crate::pad_leds::take_pad_events() {
         let (r, g, b) = crate::pad_leds::PLAYER_COLORS[ev.slot.min(3)];
+        if ev.connected {
+            state.pad_attach_at = Some(get_time() + 1.5);
+        } else if let Some(sink) = state.bgm_pad_sink.take() {
+            // The pad's PipeWire node dies with it, so this copy is playing
+            // into a dead end. Retire it now — left in place it would also
+            // make the replug path think a pad copy already exists and skip
+            // the rebuild.
+            sink.stop();
+        }
         sound_effects.play_toast(&config);
         state.toasts.push(Toast {
             text: format!(
@@ -1429,7 +1631,13 @@ pub fn update(
     // Play outro: the dashboard slides back out (reverse intro), then the
     // launch/multicart handoff fires. Navigation is parked while it runs.
     if let Some(o) = state.outro_t {
-        let o = o + get_frame_time() / OUTRO_TIME;
+        // Opening a utility screen runs the same choreography at double speed;
+        // 0.7s is right for a launch and sluggish for a menu.
+        let rate = match state.outro_action {
+            OutroAction::Enter(_) => 2.0,
+            _ => 1.0,
+        };
+        let o = o + get_frame_time() * rate / OUTRO_TIME;
         if o < 1.0 {
             state.outro_t = Some(o);
         } else {
@@ -1456,6 +1664,12 @@ pub fn update(
                     activate_save_data(
                         current_screen, input_state, storage_state, sound_effects, config,
                     );
+                }
+                // Assigned unconditionally past 1.0: a stuck clock must never
+                // strand the user on an empty dash.
+                OutroAction::Enter(screen) => {
+                    state.intro_t = 0.0;
+                    *current_screen = screen;
                 }
             }
         }
@@ -1561,6 +1775,24 @@ pub fn update(
     if state.tile != tile_before || state.tab != tab_before {
         state.prev_sel = (state.tab == tab_before).then_some(tile_before);
         state.sel_anim = 0.0;
+    }
+
+    // A pad that docked mid-track has no copy on the theme that is already
+    // playing, and it can't be handed one — the sinks were built together.
+    // Drop both once PipeWire has had time to publish the pad's node; the
+    // block below rebuilds them in lockstep on the next frame, so the two
+    // copies can never end up playing the same loop out of phase. stop_bgm
+    // zeroes the volume, so this reads as a short fade rather than a jump.
+    if let Some(at) = state.pad_attach_at {
+        if get_time() >= at {
+            state.pad_attach_at = None;
+            if state.bgm_sink.is_some()
+                && state.bgm_pad_sink.is_none()
+                && config.pad_bgm_volume > 0.001
+            {
+                state.stop_bgm();
+            }
+        }
     }
 
     // --- Hover bgm: loop the cart's theme while the Play hero is selected ---
@@ -1747,14 +1979,16 @@ pub fn update(
                     sound_effects.play_reject(&config);
                 }
             }
-            BladeAction::Wifi => { *current_screen = Screen::Wifi; sound_effects.play_select(&config); }
-            BladeAction::Bluetooth => { *current_screen = Screen::Bluetooth; sound_effects.play_select(&config); }
-            BladeAction::ThemeDownloader => { *current_screen = Screen::ThemeDownloader; sound_effects.play_select(&config); }
-            BladeAction::RuntimeDownloader => { *current_screen = Screen::RuntimeDownloader; sound_effects.play_select(&config); }
-            BladeAction::CdPlayer => { *current_screen = Screen::CdPlayer; sound_effects.play_select(&config); }
-            BladeAction::UpdateChecker => { *current_screen = Screen::UpdateChecker; sound_effects.play_select(&config); }
-            BladeAction::Settings => { *current_screen = Screen::GeneralSettings; sound_effects.play_select(&config); }
-            BladeAction::About => { *current_screen = Screen::About; sound_effects.play_select(&config); }
+            // Utility screens depart through the dash's own outro rather than
+            // cutting: the tiles wave out, then the handoff fires.
+            BladeAction::Wifi => { state.depart_to(Screen::Wifi); sound_effects.play_select(&config); }
+            BladeAction::Bluetooth => { state.depart_to(Screen::Bluetooth); sound_effects.play_select(&config); }
+            BladeAction::ThemeDownloader => { state.depart_to(Screen::ThemeDownloader); sound_effects.play_select(&config); }
+            BladeAction::RuntimeDownloader => { state.depart_to(Screen::RuntimeDownloader); sound_effects.play_select(&config); }
+            BladeAction::CdPlayer => { state.depart_to(Screen::CdPlayer); sound_effects.play_select(&config); }
+            BladeAction::UpdateChecker => { state.depart_to(Screen::UpdateChecker); sound_effects.play_select(&config); }
+            BladeAction::Settings => { state.depart_to(Screen::GeneralSettings); sound_effects.play_select(&config); }
+            BladeAction::About => { state.depart_to(Screen::About); sound_effects.play_select(&config); }
         }
     }
 }
@@ -1820,6 +2054,7 @@ struct HeroBrandDraw<'a> {
     badge: &'a Texture2D,
     label: Option<&'a str>,
     playtime: Option<&'a str>,
+    consoles: &'a [usize], // CONSOLE_ICONS indices for this layer's bubbles
     vis: f32, // 0..1 raw fade progress; eased and turned into alpha here
 }
 
@@ -1849,9 +2084,30 @@ fn draw_hero_brand(
 
     if cover_pass {
         if let Some(tex) = brand.cover {
+            // Art that follows the 920x430 cover spec fills the banner exactly
+            // (tile_rect derives the banner's aspect from that same spec, so
+            // this is a 1:1 draw). Anything else is fitted inside and
+            // letterboxed — a stretched cover is the one thing worse than bars.
+            let frame_ar = bw / bh;
+            let tex_ar = tex.width() / tex.height();
+            let (fx, fy, fw, fh) = if (tex_ar - frame_ar).abs() <= frame_ar * 0.02 {
+                (bx, by, bw, bh)
+            } else if tex_ar > frame_ar {
+                let h = bw / tex_ar;
+                (bx, by + (bh - h) / 2.0, bw, h)
+            } else {
+                let w = bh * tex_ar;
+                (bx + (bw - w) / 2.0, by, w, bh)
+            };
+            // Bars sit on near-black so the fit reads as a deliberate frame
+            // rather than a gap; the tile's own green would look like a bug.
+            if fw < bw - 0.5 || fh < bh - 0.5 {
+                draw_rectangle(bx, by, bw, bh, Color::new(0.04, 0.045, 0.05, v));
+            }
             // Ken Burns while hovered: a gentle push-in with a slow breathing
             // zoom and a lazy drift, done as a source-rect crop so the art
-            // never spills outside the frame. motion 0 = the plain stretch.
+            // never spills outside the frame. Both axes take the same divisor,
+            // so the crop preserves the source aspect. motion 0 = plain draw.
             let src = if motion > 0.001 {
                 let t = get_time() as f32;
                 let tau = std::f32::consts::TAU;
@@ -1871,8 +2127,8 @@ fn draw_hero_brand(
                 None
             };
             draw_texture_ex(
-                tex, bx, by, tint,
-                DrawTextureParams { dest_size: Some(vec2(bw, bh)), source: src, ..Default::default() },
+                tex, fx, fy, tint,
+                DrawTextureParams { dest_size: Some(vec2(fw, fh)), source: src, ..Default::default() },
             );
         }
         return;
@@ -1881,16 +2137,35 @@ fn draw_hero_brand(
     // Translucent "Play: NAME" bar along the bottom.
     let bar_h = 15.0 * s;
     draw_rectangle(bx, by + bh - bar_h, bw, bar_h, Color::new(0.0, 0.0, 0.0, 0.62 * v));
-    let text = match brand.label {
+    let mut text = match brand.label {
         Some(name) => format!("Play: {}", name),
         None => "Play".to_string(),
     };
     // Hand-rolled shadowed text: text_with_color pins its shadow at 0.9
     // alpha, which would leave a black ghost of the label mid-fade.
-    let font_size = (FONT_SIZE as f32 * s * 0.78) as u16;
+    let mut font_size = (FONT_SIZE as f32 * s * 0.78) as u16;
     let font = get_current_font(font_cache, config);
-    let shadow_offset = 1.0 * (font_size as f32 / FONT_SIZE as f32);
     let (tx, ty) = (bx + 5.0 * s, by + bh - 4.5 * s);
+    // Long cart names used to walk straight off the banner. Shrink to a floor
+    // first, then ellipsize — the cart icon owns the bottom-right corner, so
+    // the run has to stop short of it.
+    let max_w = (bx + bw - 36.0 * s) - tx;
+    if max_w > 0.0 {
+        let floor = ((FONT_SIZE as f32 * s * 0.52) as u16).max(8);
+        let mut d = measure_text(&text, Some(font), font_size, 1.0);
+        if d.width > max_w && d.width > 0.0 {
+            font_size = ((font_size as f32 * max_w / d.width).floor() as u16).max(floor);
+            d = measure_text(&text, Some(font), font_size, 1.0);
+        }
+        if d.width > max_w && d.width > 0.0 {
+            let chars: Vec<char> = text.chars().collect();
+            let keep = ((chars.len() as f32 * max_w / d.width).floor() as usize).saturating_sub(1);
+            let mut cut: String = chars.into_iter().take(keep.max(1)).collect();
+            cut.push('\u{2026}');
+            text = cut;
+        }
+    }
+    let shadow_offset = 1.0 * (font_size as f32 / FONT_SIZE as f32);
     draw_text_ex(&text, tx + shadow_offset, ty + shadow_offset, TextParams {
         font: Some(font),
         font_size,
@@ -2018,7 +2293,6 @@ fn draw_tab_pane(
     copy_logs_option_enabled: bool,
     hero_brands: &[HeroBrandDraw],
     save_icons: &[Texture2D],
-    cart_consoles: &[usize],
     hint_sd: &Texture2D,
     badge_disc: &Texture2D,
     fade_tex: &Texture2D,
@@ -2027,6 +2301,9 @@ fn draw_tab_pane(
     slide_anim: f32,
     slide_dir: f32,
     exiting: bool,
+    // Whether the travelling focus frame may draw. Off during the outro, when
+    // the tiles are flying off screen and a cursor in flight reads as a glitch.
+    travel_ok: bool,
     beat: f32,
     origin_y: f32,
     _animation_state: &AnimationState,
@@ -2034,7 +2311,7 @@ fn draw_tab_pane(
     config: &Config,
     s: f32,
 ) {
-    let origin_x = ORIGIN_X * s;
+    let origin_x = pane_origin_x() * s;
     let current_font = get_current_font(font_cache, config);
 
     // The shrinking-back tile only matters while this pane owns the cursor
@@ -2045,7 +2322,10 @@ fn draw_tab_pane(
         None
     };
 
-    let draw_one = |idx: usize| {
+    // One resolver for the tiles and for the travelling focus frame, so the
+    // frame can never disagree with the tile it is flying to about where the
+    // intro slide and the tab-switch stagger have put it.
+    let rect_of = |idx: usize| -> Rect {
         let tile = &tab.tiles[idx];
         let mut r = tile_rect(tile, tab.tiles, origin_x, origin_y, s);
         // Boot intro: tiles slide home from the screen edges — left half of
@@ -2071,6 +2351,12 @@ fn draw_tab_pane(
                 slide_dir * (1.0 - pt) * w
             };
         }
+        r
+    };
+
+    let draw_one = |idx: usize| {
+        let tile = &tab.tiles[idx];
+        let r = rect_of(idx);
         let is_selected = selected == Some(idx);
         let is_disabled = match tile.action {
             BladeAction::Play => !play_option_enabled,
@@ -2228,47 +2514,73 @@ fn draw_tab_pane(
         // Console family icons for the cart's runtime(s) drift under the
         // hero, each sealed in a soap bubble that bobs on its own clock.
         // Anchored to the unscaled rect so the focus grow doesn't jiggle them.
-        if hero_play && !hero_brands.is_empty() && !cart_consoles.is_empty() {
+        // Drawn per brand layer, so an ejected cart's bubbles fade out with
+        // the rest of its branding instead of popping on the eject frame.
+        if hero_play {
             let t = get_time() as f32;
             let bub = 44.0 * s;   // bubble diameter
             let ico = 27.0 * s;   // console icon inside it
-            let step = bub + 6.0 * s;
             let base_x = r.x + 4.0 * s;
             let base_y = r.y + r.h + 3.0 * s;
             CONSOLE_ICONS.with(|icons| {
                 BUBBLE.with(|bubble| {
-                    for (i, idx) in cart_consoles.iter().enumerate() {
-                        let ph = i as f32 * 1.7;
-                        // Lazy bob with a gentler sideways sway, each bubble
-                        // on its own phase so they never move in lockstep.
-                        let bx = base_x + i as f32 * step
-                            + (t * 0.55 + ph * 1.3).sin() * 2.5 * s;
-                        // Bubbles ride the beat too, bobbing higher on hits.
-                        let by = base_y + (t * 0.85 + ph).sin() * 3.5 * s - beat * 9.0 * s;
-                        let tex = &icons[*idx];
-                        let iw = ico * tex.width() / tex.height();
-                        draw_texture_ex(
-                            tex,
-                            bx + (bub - iw) / 2.0,
-                            by + (bub - ico) / 2.0,
-                            Color::new(1.0, 1.0, 1.0, 0.95),
-                            DrawTextureParams {
-                                dest_size: Some(vec2(iw, ico)),
-                                ..Default::default()
-                            },
-                        );
-                        // Bubble over the icon: light enough that the art
-                        // reads through, with the rim selling the glass.
-                        draw_texture_ex(
-                            bubble,
-                            bx,
-                            by,
-                            Color::new(1.0, 1.0, 1.0, 0.55),
-                            DrawTextureParams {
-                                dest_size: Some(vec2(bub, bub)),
-                                ..Default::default()
-                            },
-                        );
+                    for brand in hero_brands {
+                        let n = brand.consoles.len();
+                        let bv = ease_out(brand.vis.clamp(0.0, 1.0));
+                        if n == 0 || bv <= 0.003 {
+                            continue;
+                        }
+                        // However many runtimes a cart declares, the band stays
+                        // inside the hero's own width — it used to run off to
+                        // the right and collide with the legend.
+                        let mut step = bub + 6.0 * s;
+                        if n > 1 {
+                            let room = (r.x + r.w - base_x - bub) / (n - 1) as f32;
+                            step = step.min(room.max(0.0));
+                        }
+                        for (i, idx) in brand.consoles.iter().enumerate() {
+                            let ph = i as f32 * 1.7;
+                            // Each bubble arrives on its own beat of the
+                            // brand's fade, so the band assembles left to
+                            // right and disperses the same way on eject.
+                            let ent = ease_out(((bv - i as f32 * 0.06) / 0.5).clamp(0.0, 1.0));
+                            if ent <= 0.002 {
+                                continue;
+                            }
+                            // Lazy bob with a gentler sideways sway, each bubble
+                            // on its own phase so they never move in lockstep.
+                            let bx = base_x + i as f32 * step
+                                + (t * 0.55 + ph * 1.3).sin() * 2.5 * s;
+                            // Bubbles ride the beat too, bobbing higher on hits,
+                            // and rise the last few units into place.
+                            let by = base_y + (t * 0.85 + ph).sin() * 3.5 * s
+                                - beat * 9.0 * s
+                                + (1.0 - ent) * 10.0 * s;
+                            let tex = &icons[*idx];
+                            let iw = ico * tex.width() / tex.height();
+                            draw_texture_ex(
+                                tex,
+                                bx + (bub - iw) / 2.0,
+                                by + (bub - ico) / 2.0,
+                                Color::new(1.0, 1.0, 1.0, 0.95 * ent),
+                                DrawTextureParams {
+                                    dest_size: Some(vec2(iw, ico)),
+                                    ..Default::default()
+                                },
+                            );
+                            // Bubble over the icon: light enough that the art
+                            // reads through, with the rim selling the glass.
+                            draw_texture_ex(
+                                bubble,
+                                bx,
+                                by,
+                                Color::new(1.0, 1.0, 1.0, 0.55 * ent),
+                                DrawTextureParams {
+                                    dest_size: Some(vec2(bub, bub)),
+                                    ..Default::default()
+                                },
+                            );
+                        }
                     }
                 });
             });
@@ -2390,6 +2702,46 @@ fn draw_tab_pane(
     if let Some(sel) = selected {
         draw_one(sel);
     }
+
+    // The cursor as one object moving through the layout: a thin frame
+    // detaches from the tile you left, slides across the gap and stretches
+    // into the tile you arrived at, landing as that tile finishes its grow.
+    // The breathing glow stays pinned to the destination, so the frame reads
+    // as travel while the glow reads as "you are here".
+    if travel_ok {
+        if let (Some(sel), Some(prev)) = (selected, prev_sel) {
+            let p = ease_out((sel_anim / SEL_GROW_TIME).min(1.0));
+            if p < 1.0 {
+                let grown = |r: Rect| -> Rect {
+                    let k = SEL_SCALE;
+                    Rect::new(
+                        r.x - r.w * (k - 1.0) / 2.0,
+                        r.y - r.h * (k - 1.0) / 2.0,
+                        r.w * k,
+                        r.h * k,
+                    )
+                };
+                let (a, b) = (grown(rect_of(prev)), grown(rect_of(sel)));
+                let mix = |u: f32, v: f32| u + (v - u) * p;
+                let (fx, fy) = (mix(a.x, b.x), mix(a.y, b.y));
+                let (fw, fh) = (mix(a.w, b.w), mix(a.h, b.h));
+                let col = string_to_color(&config.cursor_color);
+                // Hands off to the destination's glow rather than stacking on
+                // top of it.
+                let fade = 1.0 - p * p;
+                // Black liner first: a green cursor colour landing on the
+                // green hero would otherwise disappear exactly as it arrives.
+                draw_focus_frame(
+                    fx - 1.0 * s, fy - 1.0 * s, fw + 2.0 * s, fh + 2.0 * s,
+                    1.0 * s, 3.0 * s, Color::new(0.0, 0.0, 0.0, 0.5 * fade),
+                );
+                draw_focus_frame(
+                    fx, fy, fw, fh, 2.0 * s, 3.0 * s,
+                    Color::new(col.r, col.g, col.b, 0.9 * fade),
+                );
+            }
+        }
+    }
 }
 
 /// Metro-styled multicart game selection: a grid of slate tiles built around
@@ -2510,45 +2862,15 @@ pub fn draw_game_selection(
     // --- Button legend, lower right like the dashboard: confirm boots the
     // cart, back returns to the dash. Glyphs match the last-used device. ---
     {
-        let legend_size = (FONT_SIZE as f32 * s * 0.8) as u16;
-        let icon_h = 18.0 * s;
-        let cy = 324.0 * s;
-        let icon_gap = 4.0 * s;
-        let group_gap = 16.0 * s;
-        let dim_white = Color::new(1.0, 1.0, 1.0, 0.75);
-
-        let back_lbl = "Back";
-        let back_dims = measure_text(back_lbl, Some(current_font), legend_size, 1.0);
-        let back_text_x = screen_width() - 24.0 * s - back_dims.width;
-        LEGEND_ICONS_BACK.with(|icons| {
-            draw_texture_ex(
-                &icons[legend_icon as usize],
-                back_text_x - icon_gap - icon_h,
-                cy - icon_h / 2.0,
-                WHITE,
-                DrawTextureParams { dest_size: Some(vec2(icon_h, icon_h)), ..Default::default() },
-            );
-        });
-        text_with_color(
-            font_cache, config, back_lbl,
-            back_text_x, cy + back_dims.offset_y / 2.0, legend_size, dim_white,
-        );
-
-        let play_lbl = "Play";
-        let play_dims = measure_text(play_lbl, Some(current_font), legend_size, 1.0);
-        let play_text_x = back_text_x - icon_gap - icon_h - group_gap - play_dims.width;
-        LEGEND_ICONS.with(|icons| {
-            draw_texture_ex(
-                &icons[legend_icon as usize],
-                play_text_x - icon_gap - icon_h,
-                cy - icon_h / 2.0,
-                WHITE,
-                DrawTextureParams { dest_size: Some(vec2(icon_h, icon_h)), ..Default::default() },
-            );
-        });
-        text_with_color(
-            font_cache, config, play_lbl,
-            play_text_x, cy + play_dims.offset_y / 2.0, legend_size, dim_white,
+        set_active_legend_icon(legend_icon);
+        legend_row(
+            current_font,
+            &[
+                LegendItem::new(LegendKey::Confirm, "Launch"),
+                LegendItem::new(LegendKey::Back, "Back"),
+            ],
+            s,
+            1.0,
         );
     }
 }
@@ -2650,6 +2972,7 @@ pub fn draw(
             badge: if out.optical { &state.badge_disc } else { &state.badge_sd },
             label: out.label.as_deref(),
             playtime: None,
+            consoles: &out.consoles,
             vis: out.vis,
         });
     }
@@ -2660,6 +2983,7 @@ pub fn draw(
             badge: if state.cart_optical { &state.badge_disc } else { &state.badge_sd },
             label: state.cart_label.as_deref(),
             playtime: state.playtime_line.as_deref(),
+            consoles: &state.cart_console_icons,
             vis: state.cart_vis,
         });
     }
@@ -2670,15 +2994,15 @@ pub fn draw(
         draw_tab_pane(
             &TABS[state.prev_tab], None, 1.0, None, 0.0, intro,
             play_option_enabled, copy_logs_option_enabled,
-            &hero_brands, &state.save_icons, &state.cart_console_icons, &state.badge_sd, &state.badge_disc, &state.fade_tex,
-            state.anim, state.dir, true, state.beat, origin_y, animation_state, font_cache, config, s,
+            &hero_brands, &state.save_icons, &state.badge_sd, &state.badge_disc, &state.fade_tex,
+            state.anim, state.dir, true, false, state.beat, origin_y, animation_state, font_cache, config, s,
         );
     }
     draw_tab_pane(
         &TABS[state.tab], Some(state.tile), state.sel_anim, state.prev_sel, state.press_flash, intro,
         play_option_enabled, copy_logs_option_enabled,
-        &hero_brands, &state.save_icons, &state.cart_console_icons, &state.badge_sd, &state.badge_disc, &state.fade_tex,
-        state.anim, state.dir, false, state.beat, origin_y, animation_state, font_cache, config, s,
+        &hero_brands, &state.save_icons, &state.badge_sd, &state.badge_disc, &state.fade_tex,
+        state.anim, state.dir, false, state.outro_t.is_none(), state.beat, origin_y, animation_state, font_cache, config, s,
     );
 
     // --- Button legend, lower right like the real dash; the confirm glyph
@@ -2686,70 +3010,44 @@ pub fn draw(
     // rest of the status furniture (hand-rolled shadowed text so the fixed
     // 0.9-alpha helper shadow can't ghost during the fade) ---
     if overlay_a > 0.0 {
-        let legend_size = (FONT_SIZE as f32 * s * 0.8) as u16;
-        let label = "Select";
-        let dims = measure_text(label, Some(current_font), legend_size, 1.0);
-        let end_x = screen_width() - 24.0 * s;
-        let text_x = end_x - dims.width;
-        let cy = 324.0 * s;
-        let icon_h = 18.0 * s;
-        LEGEND_ICONS.with(|icons| {
-            draw_texture_ex(
-                &icons[state.legend_icon as usize],
-                text_x - 4.0 * s - icon_h,
-                cy - icon_h / 2.0,
-                Color::new(1.0, 1.0, 1.0, overlay_a),
-                DrawTextureParams {
-                    dest_size: Some(vec2(icon_h, icon_h)),
-                    ..Default::default()
-                },
-            );
-        });
-        let shadowed = |text: &str, x: f32, y: f32, size: u16, alpha: f32| {
-            let so = 1.0 * (size as f32 / FONT_SIZE as f32);
-            draw_text_ex(text, x + so, y + so, TextParams {
-                font: Some(current_font), font_size: size,
-                color: Color::new(0.0, 0.0, 0.0, 0.9 * overlay_a),
-                ..Default::default()
-            });
-            draw_text_ex(text, x, y, TextParams {
-                font: Some(current_font), font_size: size,
-                color: Color::new(1.0, 1.0, 1.0, alpha * overlay_a),
-                ..Default::default()
-            });
+        // The verb names what the focused tile actually does. A tile that
+        // can't act right now — Play with no cart, Session Logs with no SD —
+        // keeps its slot and dims, which is the first time this BIOS admits a
+        // button won't do anything.
+        let tile = TABS[state.tab].tiles.get(state.tile);
+        let action = tile.map(|t| t.action);
+        let confirm = match action {
+            Some(BladeAction::Play) => "Launch",
+            Some(BladeAction::CdPlayer) => "Play Disc",
+            Some(BladeAction::CopyLogs) => "Copy Logs",
+            Some(BladeAction::UpdateChecker) => "Check",
+            Some(BladeAction::ThemeDownloader) | Some(BladeAction::RuntimeDownloader) => "Browse",
+            _ => "Open",
         };
-        shadowed(label, text_x, cy + dims.offset_y / 2.0, legend_size, 0.75);
-
-        // Eject appears only while the Play hero holds a cart to eject.
-        let on_play_hero = TABS[state.tab]
-            .tiles
-            .get(state.tile)
+        let confirm_on = match action {
+            Some(BladeAction::Play) => play_option_enabled,
+            Some(BladeAction::CopyLogs) => copy_logs_option_enabled,
+            _ => true,
+        };
+        let on_play_hero = tile
             .map(|t| t.hero && t.action == BladeAction::Play)
             .unwrap_or(false);
+
+        let mut items: Vec<LegendItem> = Vec::new();
         if on_play_hero && play_option_enabled {
-            let ej_lbl = "Eject";
-            let ej_dims = measure_text(ej_lbl, Some(current_font), legend_size, 1.0);
-            let ej_text_x = text_x - 4.0 * s - icon_h - 16.0 * s - ej_dims.width;
-            LEGEND_ICONS_EJECT.with(|icons| {
-                draw_texture_ex(
-                    &icons[state.legend_icon as usize],
-                    ej_text_x - 4.0 * s - icon_h,
-                    cy - icon_h / 2.0,
-                    Color::new(1.0, 1.0, 1.0, overlay_a),
-                    DrawTextureParams {
-                        dest_size: Some(vec2(icon_h, icon_h)),
-                        ..Default::default()
-                    },
-                );
-            });
-            shadowed(ej_lbl, ej_text_x, cy + ej_dims.offset_y / 2.0, legend_size, 0.75);
+            items.push(LegendItem::new(LegendKey::Alt, "Eject"));
         }
+        items.push(LegendItem { key: LegendKey::Confirm, label: confirm, enabled: confirm_on });
+        legend_row(current_font, &items, s, overlay_a);
+
+        // The dash is the one screen that never told you the tabs existed.
+        draw_shoulder_hint(current_font, state.legend_icon, "Tabs", true, true, s, overlay_a);
     }
 
     // --- Tab strip: every tab name in a row, active one big and white;
     // during the intro the whole strip slides down from above the screen ---
     let strip_y = 62.0 * s - (1.0 - intro) * 120.0 * s;
-    let mut x = ORIGIN_X * s;
+    let mut x = pane_origin_x() * s;
     for (i, tab) in TABS.iter().enumerate() {
         let is_active = i == state.tab;
         let font_size = (FONT_SIZE as f32 * s * if is_active { 1.45 } else { 0.95 }) as u16;
@@ -2771,7 +3069,7 @@ pub fn draw(
         if !state.save_icons.is_empty() {
             let p = ease_out(o);
             let tile = &TABS[0].tiles[0];
-            let r = tile_rect(tile, TABS[0].tiles, ORIGIN_X * s, origin_y, s);
+            let r = tile_rect(tile, TABS[0].tiles, pane_origin_x() * s, origin_y, s);
             let (cx, cy) = (r.x + r.w / 2.0, r.y + r.h / 2.0);
             let n = state.save_icons.len();
             for (i, tex) in state.save_icons.iter().enumerate() {
@@ -3146,7 +3444,7 @@ const SET_LIST_H: f32 = 178.0;
 const SET_CHIP_Y: f32 = 268.0;
 const SET_CHIP_H: f32 = 18.0;
 const TILE_FOCUS: Color = Color::new(0.38, 0.39, 0.41, 1.0);
-const TILE_RED: Color = Color::new(0.52, 0.11, 0.11, 1.0);
+pub const TILE_RED: Color = Color::new(0.52, 0.11, 0.11, 1.0);
 const TILE_RED_DIM: Color = Color::new(0.30, 0.16, 0.16, 1.0);
 
 /// Animation clocks for the settings screen. Lives here rather than in
@@ -3208,7 +3506,7 @@ pub fn draw_settings(
 
     // --- Frame, derived from the live screen so 4:3 (480 design units wide)
     // and 16:10 work as well as 16:9 ---
-    let m = ORIGIN_X;
+    let m = pane_origin_x();
     let small_w = 80.0 * (185.0 / 131.0);
     let grid_right = m + 4.0 * small_w + 3.0 * 2.0; // the dash's own tile-grid edge
     let content_r = grid_right.min(w_du - m);
@@ -4074,7 +4372,7 @@ pub fn draw_save_data(
 
     // Same frame the settings screen uses, so the wall lines up with the
     // dashboard's tiles at every aspect ratio.
-    let m = ORIGIN_X;
+    let m = pane_origin_x();
     let small_w = 80.0 * (185.0 / 131.0);
     let grid_right = m + 4.0 * small_w + 3.0 * 2.0;
     let content_r = grid_right.min(w_du - m);
@@ -4307,7 +4605,7 @@ pub fn draw_save_data(
     // tile threw its icons out on, so the burst you just watched reassembles
     // into this grid. ---
     let burst_origin = {
-        let r = tile_rect(&TABS[0].tiles[0], TABS[0].tiles, ORIGIN_X * s, 112.0 * s, s);
+        let r = tile_rect(&TABS[0].tiles[0], TABS[0].tiles, pane_origin_x() * s, 112.0 * s, s);
         vec2(r.x + r.w / 2.0, r.y + r.h / 2.0)
     };
     let slot_rect = |i: usize| -> (f32, f32) {
@@ -4735,17 +5033,7 @@ pub fn draw_save_dialog(
     let phd = ph * s;
     let py = (h - phd) / 2.0;
 
-    draw_tile_shadow(px, py, pwd, phd, s, 1.0);
-    draw_rectangle(px, py, pwd, phd, TILE_SLATE);
-    FADE_TEX.with(|tex| {
-        draw_texture_ex(tex, px, py, Color::new(1.0, 1.0, 1.0, 0.20), DrawTextureParams {
-            dest_size: Some(vec2(pwd, phd * 0.16)), flip_y: true, ..Default::default()
-        });
-        draw_texture_ex(tex, px, py + phd * 0.72, Color::new(0.0, 0.0, 0.0, 0.45), DrawTextureParams {
-            dest_size: Some(vec2(pwd, phd * 0.28)), ..Default::default()
-        });
-    });
-    draw_rectangle(px, py, 3.0 * s, phd, if destructive { TILE_RED } else { XBOX_GREEN });
+    sheet(px, py, pwd, phd, if destructive { TILE_RED } else { XBOX_GREEN }, s);
 
     // --- Subject header: you can never act on a save the sheet hasn't named ---
     if let Some(mem) = subject {
@@ -5246,7 +5534,7 @@ pub fn draw_bluetooth(
     let t = get_time() as f32;
 
     // --- Frame, matching settings and the save wall ---
-    let m = ORIGIN_X;
+    let m = pane_origin_x();
     let small_w = 80.0 * (185.0 / 131.0);
     let grid_right = m + 4.0 * small_w + 3.0 * 2.0;
     let content_r = grid_right.min(w_du - m);
@@ -5865,7 +6153,7 @@ pub fn draw_wifi(
     let t = get_time() as f32;
 
     // --- Frame, matching bluetooth/settings ---
-    let m = ORIGIN_X;
+    let m = pane_origin_x();
     let small_w = 80.0 * (185.0 / 131.0);
     let grid_right = m + 4.0 * small_w + 3.0 * 2.0;
     let content_r = grid_right.min(w_du - m);
@@ -6380,7 +6668,7 @@ fn draw_wifi_osk(
     draw_rectangle(0.0, 0.0, w, h, Color::new(0.0, 0.0, 0.0, 0.60));
 
     // --- Sheet ---
-    let m = ORIGIN_X;
+    let m = pane_origin_x();
     let sheet_w_du = (w_du - 2.0 * m).min(470.0);
     let sx = (w - sheet_w_du * s) / 2.0;
     let sy = 38.0 * s;

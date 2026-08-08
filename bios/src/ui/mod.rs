@@ -724,14 +724,25 @@ pub fn render_debug_screen(
         text_with_config_color(font_cache, config, message, x_pos, y_pos, font_size);
     }
 
-    // --- Draw the instruction or flash message ---
-    let instruction_text = flash_message.unwrap_or("PRESS [SOUTH] TO SAVE LOG (OR [EAST] TO EXIT)");
-    let instruction_font_size = (14.0 * scale_factor) as u16;
-    let instruction_text_width = measure_text(instruction_text, None, instruction_font_size, 1.0).width;
-    let instruction_x = (screen_width() - instruction_text_width) / 2.0; // Center it
-    let instruction_y = screen_height() - (5.0 * scale_factor); // Position near the bottom
-
-    draw_text(instruction_text, instruction_x, instruction_y, instruction_font_size as f32, WHITE);
+    // --- Flash message stays centred; the controls live in the shared legend
+    // so this screen names its buttons the way every other screen does ---
+    if let Some(msg) = flash_message {
+        let instruction_font_size = (14.0 * scale_factor) as u16;
+        let instruction_text_width = measure_text(msg, None, instruction_font_size, 1.0).width;
+        let instruction_x = (screen_width() - instruction_text_width) / 2.0;
+        let instruction_y = screen_height() - (5.0 * scale_factor);
+        draw_text(msg, instruction_x, instruction_y, instruction_font_size as f32, WHITE);
+    } else {
+        metro::legend_row(
+            get_current_font(font_cache, config),
+            &[
+                metro::LegendItem::new(metro::LegendKey::Confirm, "Save Log"),
+                metro::LegendItem::new(metro::LegendKey::Back, "Exit"),
+            ],
+            scale_factor,
+            1.0,
+        );
+    }
 }
 
 // DIALOG BOX
@@ -828,11 +839,12 @@ pub fn render_dialog_box(
         text_with_config_color(font_cache, config, opt2, no_x, option_y, font_size);
 
     } else { // No options, just an "OK" implied for the Reset Complete screen
-        let ok_text = "PRESS [SOUTH] TO RESTART";
-        let text_dims = measure_text(ok_text, Some(current_font), font_size, 1.0);
-        let text_x = screen_width() / 2.0 - text_dims.width / 2.0;
-        let text_y = box_y + box_height - 40.0 * scale_factor;
-        text_with_config_color(font_cache, config, ok_text, text_x, text_y, font_size);
+        metro::legend_row(
+            current_font,
+            &[metro::LegendItem::new(metro::LegendKey::Confirm, "Restart")],
+            scale_factor,
+            1.0,
+        );
     }
 }
 

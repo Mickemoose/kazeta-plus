@@ -6,6 +6,7 @@ use crate::{
     ui::text_with_color,
     render_background, get_current_font, measure_text, text_with_config_color, InputState, VideoPlayer,
 };
+use crate::ui::metro::{active_legend_icon, draw_shoulder_hint, legend_row, LegendItem, LegendKey};
 use macroquad::prelude::*;
 use rodio::Sink;
 use std::{
@@ -383,8 +384,16 @@ pub fn draw(
         }
     }
 
-    // --- Draw Controls Help ---
-    let help_text = "[SOUTH] PLAY/PAUSE | [EAST] BACK | [LB/RB] SEEK 15 SECONDS";
-    let help_dims = measure_text(help_text, Some(current_font), (12.0 * scale_factor) as u16, 1.0);
-    text_with_config_color(font_cache, config, help_text, (screen_width() - help_dims.width) / 2.0, screen_height() - (20.0 * scale_factor), (12.0 * scale_factor) as u16);
+    // --- Controls, in the shared legend so this screen agrees with the dash
+    // about where the way out is and what the buttons are called ---
+    legend_row(
+        current_font,
+        &[
+            LegendItem::new(LegendKey::Confirm, "Play / Pause"),
+            LegendItem::new(LegendKey::Back, "Back"),
+        ],
+        scale_factor,
+        1.0,
+    );
+    draw_shoulder_hint(current_font, active_legend_icon(), "Seek 15s", true, true, scale_factor, 1.0);
 }
