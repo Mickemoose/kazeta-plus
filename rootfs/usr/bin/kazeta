@@ -298,6 +298,22 @@ PLAYTIME_PID=$! # save PID of background job
 
 # --- EXECUTION & ERROR HANDLING ---
 
+# Proton 10's winebus prefers raw hidraw passthrough for Sony pads, and
+# hidraw devices get NO XInput identity inside the prefix — XInput-only
+# ports (UE4: Crisis Core etc.) see no controller at all without Steam
+# Input. Pushing the pad onto Proton's SDL path grants the XInput view
+# while the host-side virtual pad stays a DualSense, so kazeta's UIs keep
+# PlayStation glyphs. Valve ships this exact quirk for God of War Ragnarok.
+# Carts whose games speak native DualSense HID (adaptive triggers) opt back
+# in with 'HidrawPassthrough: true' — swap, never set both: DISABLE wins
+# over ENABLE inside winebus.
+cart_hidraw="$(get_attribute 'HidrawPassthrough' ${cart_info})"
+if [ "$cart_hidraw" = "true" ]; then
+	export PROTON_ENABLE_HIDRAW="0x054C/0x0CE6,0x054C/0x0DF2"
+else
+	export PROTON_DISABLE_HIDRAW="0x054C/0x0CE6,0x054C/0x0DF2,0x054C/0x09CC,0x054C/0x05C4,0x054C/0x0BA0"
+fi
+
 # 1. Start Timer
 START_TIME=$(date +%s)
 
@@ -312,12 +328,45 @@ set +x # disable debug tracing
 END_TIME=$(date +%s)
 DURATION=$((END_TIME - START_TIME))
 
+# The guide's "Kazeta Home" ends the pipeline nonzero within seconds of
+# whenever the user pressed it — which is not a launch failure. The marker
+# gates the crash screen below.
+HOME_REQUESTED=0
+if [ -f /var/kazeta/state/.HOME_REQUESTED ]; then
+	HOME_REQUESTED=1
+	rm -f /var/kazeta/state/.HOME_REQUESTED
+fi
+
+# Proton leftovers can outlive the compositor: a winedevice.exe whose
+# wineserver died waits on a futex forever (wedging the reaper chain on a
+# Home exit), and anything still holding overlay files turns the trap's lazy
+# unmount into an invisible leak. Sweep before cleanup, gently first.
+for _i in 1 2 3 4 5 6 7 8 9 10; do
+	pgrep -f "pressure-vessel|srt-bwrap|umu|wine" >/dev/null 2>&1 || break
+	pkill -TERM -f "pressure-vessel|srt-bwrap|umu|wine" 2>/dev/null
+	sleep 1
+done
+pkill -KILL -f "pressure-vessel|srt-bwrap|umu|wine" 2>/dev/null
+
+# A per-cart controller profile otherwise persists FOREVER (the console was
+# found still carrying a stale one from an old session) — restore the
+# DualSense composite's default identity so the OS UI gets its glyphs and
+# shape back. Only when this cart dirtied the state: unconditional resets
+# would mis-shape non-Sony pads whose configs default differently.
+if [ -n "$cart_controller" ] && [ -n "$controller_path" ]; then
+	busctl call org.shadowblip.InputPlumber \
+		/org/shadowblip/InputPlumber/CompositeDevice0 \
+		org.shadowblip.Input.CompositeDevice \
+		SetTargetDevices "as" 3 ds5 mouse keyboard 2>/dev/null
+fi
+
 # 4. Define Threshold (Seconds)
 # If the game runs for less than this, we consider it a "Failure to Launch"
 CRASH_THRESHOLD=10
 
-# Check: Did it fail? AND Did it fail quickly?
-if [ $EXIT_CODE -ne 0 ] && [ $DURATION -lt $CRASH_THRESHOLD ]; then
+# Check: Did it fail? AND Did it fail quickly? AND was it NOT the user
+# leaving on purpose?
+if [ $EXIT_CODE -ne 0 ] && [ $DURATION -lt $CRASH_THRESHOLD ] && [ $HOME_REQUESTED -eq 0 ]; then
 	# ===============================
 	#      ERROR SCREEN LOGIC
 	# ===============================

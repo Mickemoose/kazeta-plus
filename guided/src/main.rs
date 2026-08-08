@@ -260,12 +260,41 @@ fn dashboard_running() -> bool {
         .unwrap_or(false)
 }
 
+/// Tear the game down in an order Proton survives. The old version signaled
+/// only the compositor and the run wrapper — never the game, which died as
+/// collateral when its display vanished (no save flush), and never Wine's
+/// helpers, which matched neither pattern. One winedevice.exe whose
+/// wineserver was already dead then sat in an eternal futex wait under the
+/// gamescope reaper: the reaper waited on it, the compositor on the reaper,
+/// the cart script on the compositor, the session on the script — and the
+/// BIOS never came back. So: mark the exit as user-requested (the cart
+/// script skips its crash screen), TERM the actual tree, give it a grace
+/// window to flush saves, KILL stragglers, and only then take the
+/// compositor down — which also ends the run wrapper's pipeline.
 fn kill_game() {
-    // The compositor's comm is gamescope-wl; -f on the exec file is the
-    // belt-and-braces for anything the name check misses.
+    let _ = std::fs::write("/var/kazeta/state/.HOME_REQUESTED", "");
+    // "wine" catches wineserver and winedevice.exe too, by substring.
+    let tree = ["pressure-vessel", "srt-bwrap", "umu", "wine"];
+    for p in &tree {
+        let _ = Command::new("pkill").args(["-TERM", "-f", p]).status();
+    }
+    for _ in 0..40 {
+        let alive = Command::new("pgrep")
+            .args(["-f", "pressure-vessel|srt-bwrap|umu|wine"])
+            .output()
+            .map(|o| !o.stdout.is_empty())
+            .unwrap_or(false);
+        if !alive {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    for p in &tree {
+        let _ = Command::new("pkill").args(["-KILL", "-f", p]).status();
+    }
     let a = Command::new("pkill").args(["-x", "gamescope-wl"]).status();
     let b = Command::new("pkill").args(["-f", "kazeta-cart-exec"]).status();
-    log(&format!("kill_game: gamescope-wl={:?} cart-exec={:?}", a, b));
+    log(&format!("kill_game: tree swept; gamescope-wl={:?} cart-exec={:?}", a, b));
 }
 
 struct CartGame {
@@ -658,6 +687,22 @@ struct Overlay {
     snap: Vec<u32>,
 }
 
+/// The compositor's process name is `gamescope-wl` (header note) — but match
+/// plain `gamescope` too. A live one is proof this X server is gamescope's:
+/// the console never runs bare X, and the VM never runs gamescope.
+fn gamescope_running() -> bool {
+    std::fs::read_dir("/proc")
+        .map(|rd| {
+            rd.flatten().any(|e| {
+                e.file_name().to_string_lossy().chars().all(|c| c.is_ascii_digit())
+                    && std::fs::read_to_string(e.path().join("comm"))
+                        .map(|c| matches!(c.trim(), "gamescope-wl" | "gamescope"))
+                        .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false)
+}
+
 /// Shadow border width around the sheet, in 1080p design units.
 const PANEL_PAD_DU: f32 = 26.0;
 /// Downward shadow offset. The canvas gets this much extra bottom padding so
@@ -683,14 +728,37 @@ impl Overlay {
         conn.create_colormap(ColormapAlloc::NONE, colormap, root, visual)?;
 
         // Gamescope acts as the window manager and stamps the EWMH check
-        // window; a session with no WM at all is the VM's bare X server.
-        let wm_check = conn.intern_atom(true, b"_NET_SUPPORTING_WM_CHECK")?.reply()?.atom;
-        let bare_x = wm_check == x11rb::NONE
-            || conn
-                .get_property(false, root, wm_check, AtomEnum::WINDOW, 0, 1)?
-                .reply()
-                .map(|r| r.value_len == 0)
-                .unwrap_or(true);
+        // window — but the game session's gamescope doesn't reliably
+        // advertise it (proven live: the sniff said "no WM" mid-game, the
+        // bare-X path unmapped on close, and gamescope answered by latching
+        // the last frame on screen — the transparent ghost). So the sniff is
+        // the LAST resort: an explicit KAZETA_GUIDE_COMPOSITOR wins outright,
+        // a live gamescope process is proof by itself, and EWMH gets asked
+        // repeatedly because the compositor may still be dressing the session
+        // when this daemon (re)connects.
+        let bare_x = match std::env::var("KAZETA_GUIDE_COMPOSITOR").ok().as_deref() {
+            Some("bare") => true,
+            Some(_) => false,
+            None if gamescope_running() => false,
+            None => {
+                let mut bare = true;
+                for _ in 0..10 {
+                    let wm_check = conn.intern_atom(true, b"_NET_SUPPORTING_WM_CHECK")?.reply()?.atom;
+                    bare = wm_check == x11rb::NONE
+                        || conn
+                            .get_property(false, root, wm_check, AtomEnum::WINDOW, 0, 1)?
+                            .reply()
+                            .map(|r| r.value_len == 0)
+                            .unwrap_or(true);
+                    if !bare || gamescope_running() {
+                        bare = false;
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(300));
+                }
+                bare
+            }
+        };
         log(&format!("compositor: {}", if bare_x { "none (windowed mode)" } else { "gamescope" }));
 
         let s = sh as f32 / 1080.0;
@@ -970,6 +1038,23 @@ impl Overlay {
         self.conn.clear_area(false, self.win, 0, 0, self.sw, self.sh)?;
         self.conn.flush()?;
         Ok(())
+    }
+
+    /// Belt-and-braces: leave NOTHING on screen no matter what state came
+    /// before — map if somehow unmapped (the only cure for a latched frame is
+    /// mapping again and clearing through it) and wipe edge to edge.
+    /// Gamescope only: on bare X a mapped window is an opaque rectangle, so
+    /// there "nothing on screen" is exactly the unmap clear() already did.
+    fn wipe(&mut self) {
+        if self.bare_x {
+            return;
+        }
+        if !self.mapped {
+            let _ = self.conn.map_window(self.win);
+            self.mapped = true;
+        }
+        let _ = self.conn.clear_area(false, self.win, 0, 0, self.sw, self.sh);
+        let _ = self.conn.flush();
     }
 
     /// Raw canvas upload at an arbitrary spot (toasts).
@@ -1626,6 +1711,9 @@ impl App {
         self.overlay.grab_keyboard();
         self.sfx.play("select.wav");
         let _ = self.overlay.ensure_mapped();
+        // Opening always starts from a blank slate — stale pixels from any
+        // earlier mishap die here instead of showing under the fresh panel.
+        self.overlay.wipe();
         let _ = self.overlay.backdrop();
         let panel = self.ui.render(self.overlay.pw, self.overlay.ph, self.overlay.sh, self.sel, None);
         for f in 1..=6 {
@@ -1653,6 +1741,9 @@ impl App {
             std::thread::sleep(Duration::from_millis(14));
         }
         let _ = self.overlay.clear();
+        // Closing means CLOSED: every surface this daemon owns ends blank,
+        // whatever mode confusion or half-finished paint came before.
+        self.overlay.wipe();
         match release_of {
             Some(name) => self.defer_intercept = Some((name, Instant::now())),
             None => set_intercept(1),
@@ -1960,11 +2051,13 @@ fn main() {
         }
 
         // Fallback for a deferred mode switch whose release never arrived
-        // (e.g. the pad disconnected mid-press).
+        // (e.g. the pad disconnected mid-press). Deferred switches always
+        // re-check `open`: firing a stale close-switch after a quick re-open
+        // is what left the guide visible with its input routed to the game.
         if let Some((_, t)) = &app.defer_intercept {
             if t.elapsed() > Duration::from_millis(600) {
                 app.defer_intercept = None;
-                set_intercept(1);
+                set_intercept(if app.open { 2 } else { 1 });
             }
         }
 
@@ -2024,7 +2117,9 @@ fn main() {
                 if val < 0.5 {
                     if app.defer_intercept.as_ref().map(|(n, _)| n == &name).unwrap_or(false) {
                         app.defer_intercept = None;
-                        set_intercept(1);
+                        // Same rule as the timeout fallback: a release that
+                        // arrives after a re-open must not demote the mode.
+                        set_intercept(if app.open { 2 } else { 1 });
                     }
                     continue;
                 }
