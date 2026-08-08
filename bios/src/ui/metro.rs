@@ -196,6 +196,11 @@ pub struct MetroState {
     // update() only ticks while Metro is the active screen, so the clock
     // naturally starts when the splash hands over.
     intro_t: f32,
+    /// Boot logo curtain (0..1): the Kazeta mark on black, then a crossfade
+    /// into the theme background. Runs exactly once — it is never reset, so
+    /// `replay_intro` and the outro returns re-run the tiles without ever
+    /// showing the mark a second time.
+    logo_t: f32,
     // Outro (0..1 when Some): the reverse choreography that plays after a
     // tile with a departure animation is chosen; the action fires when it
     // completes.
@@ -281,6 +286,8 @@ const BGM_FADE_TIME: f32 = 0.7; // seconds for a full fade in or out
 const CART_ANIM_TIME: f32 = 0.4; // seconds for cart branding to fade in or out
 const BOKEH_COUNT: usize = 45;
 const INTRO_TIME: f32 = 1.0; // boot choreography after the splash video
+const LOGO_TIME: f32 = 2.2; // boot logo curtain, before the choreography
+const LOGO_HOLD: f32 = 0.45; // fraction of LOGO_TIME the mark holds before lifting
 const OUTRO_TIME: f32 = 0.7; // reverse choreography when Play is chosen
 const TOAST_TIME: f32 = 2.8; // player connect/disconnect pill lifetime
 
@@ -596,6 +603,12 @@ thread_local! {
     // The settings screen draws outside MetroState, whose fade_tex/badge_disc
     // are private fields — it keeps its own copies.
     static FADE_TEX: Texture2D = make_fade_texture();
+    // The selector draws its own mote stream outside MetroState, whose
+    // bokeh_tex/sparkle_tex are private fields — it keeps its own copies.
+    static BOKEH_TEX: Texture2D = make_bokeh_texture();
+    static SPARKLE_TEX: Texture2D = make_sparkle_texture();
+    // The mark shown over black at boot, before the dashboard resolves.
+    static LOGO_INTRO: Texture2D = legend_tex(include_bytes!("../../KAZETA_BW.png"));
     static TILE_DISC: Texture2D = legend_tex(include_bytes!("../../DISC.png"));
     // Console-family icons shown under the Play hero, indexed by the CI_*
     // constants below.
@@ -1144,6 +1157,7 @@ impl MetroState {
             save_icons, cart_console_icons: Vec::new(),
             sel_anim: 1.0, prev_sel: None, press_flash: 0.0,
             intro_t: 0.0,
+            logo_t: 0.0,
             outro_t: None,
             outro_action: OutroAction::Play,
             booting: false,
@@ -1570,7 +1584,14 @@ pub fn update(
     // Focus/press animation clocks.
     state.sel_anim = (state.sel_anim + get_frame_time()).min(1.0);
     state.press_flash = (state.press_flash - get_frame_time() / PRESS_FLASH_TIME).max(0.0);
-    state.intro_t = (state.intro_t + get_frame_time() / INTRO_TIME).min(1.0);
+    // The logo curtain runs first and parks the tile choreography while it is
+    // up, so the tiles slide in *after* the mark clears rather than behind it.
+    if state.logo_t < 1.0 {
+        state.logo_t = (state.logo_t + get_frame_time() / LOGO_TIME).min(1.0);
+        state.intro_t = 0.0;
+    } else {
+        state.intro_t = (state.intro_t + get_frame_time() / INTRO_TIME).min(1.0);
+    }
 
     // Legend glyph follows whatever device the user touched last. Mirrored
     // into the thread-local so screens that never see MetroState — the
@@ -2043,6 +2064,265 @@ fn playtime_summary(ids: &[String]) -> Option<String> {
         _ => format!("played {}", last.format("%b %e")),
     };
     Some(format!("{} · {}", hours, when))
+}
+
+/// Total playtime and the last end stamp for a single cart id. Every game on
+/// a multicart carries its own Id=, so this is per game, not per cart.
+fn playtime_of(id: &str) -> Option<(chrono::Duration, chrono::DateTime<chrono::Utc>)> {
+    use chrono::{DateTime, Utc};
+    let path = format!("/var/kazeta/saves/default/{}/.kazeta/var/playtime.log", id);
+    let text = std::fs::read_to_string(&path).ok()?;
+    let mut total = chrono::Duration::zero();
+    let mut last: Option<DateTime<Utc>> = None;
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let (Some(a), Some(b)) = (parts.next(), parts.next()) else { continue };
+        let (Ok(start), Ok(end)) =
+            (DateTime::parse_from_rfc3339(a), DateTime::parse_from_rfc3339(b))
+        else {
+            continue;
+        };
+        let d = end.signed_duration_since(start);
+        if d > chrono::Duration::zero() {
+            total = total + d;
+        }
+        let end_utc = end.with_timezone(&Utc);
+        if last.map(|l| end_utc > l).unwrap_or(true) {
+            last = Some(end_utc);
+        }
+    }
+    let last = last?;
+    // Under a minute is indistinguishable from never having played it.
+    if total.num_minutes() < 1 {
+        return None;
+    }
+    Some((total, last))
+}
+
+fn fmt_duration(d: chrono::Duration) -> String {
+    let mins = d.num_minutes();
+    if mins < 60 {
+        format!("{}m", mins)
+    } else {
+        format!("{}h {:02}m", mins / 60, mins % 60)
+    }
+}
+
+fn fmt_when(last: chrono::DateTime<chrono::Utc>) -> String {
+    let days = chrono::Utc::now().signed_duration_since(last).num_days();
+    match days {
+        d if d < 1 => "today".to_string(),
+        1 => "yesterday".to_string(),
+        d if d < 7 => format!("{} days ago", d),
+        _ => last.format("%b %e").to_string().trim().to_string(),
+    }
+}
+
+/// The path a mote stream traces across the screen.
+#[derive(Clone, Copy, PartialEq)]
+enum StreamShape {
+    /// One slow S-wave whose phase creeps with time — the multicart selector.
+    Wave,
+    /// Two humps, an M across the screen. Held still rather than drifting,
+    /// because a letterform that slides sideways stops reading as a letter.
+    M,
+}
+
+/// A shallow stream of motes drifting left to right along a shared path, at a
+/// quarter the size of the dashboard's field. Every mote rides the *same*
+/// curve with its own vertical offset — that shared shape is what reads as a
+/// current flowing across the screen rather than scattered drift.
+/// Positions are pure functions of time and index, so this needs no state.
+/// `fade` scales every mote's alpha, so the stream can ride a screen's intro.
+fn draw_stream_bokeh(s: f32, shape: StreamShape, fade: f32) {
+    const COUNT: usize = 54;
+    const FREQ: f32 = 1.15; // S-wave periods across the screen
+    const AMP: f32 = 0.19; // as a fraction of screen height
+    const MID: f32 = 0.46;
+    // The M sits a little lower and swings wider, so both humps clear the
+    // header and the peaks read as distinct strokes.
+    const M_BASE: f32 = 0.62;
+    const M_AMP: f32 = 0.30;
+    if fade <= 0.003 {
+        return;
+    }
+    let t = get_time() as f32;
+    let (w, h) = (screen_width(), screen_height());
+    let tau = std::f32::consts::TAU;
+
+    BOKEH_TEX.with(|disc| {
+        SPARKLE_TEX.with(|glint| {
+            for i in 0..COUNT {
+                // Deterministic per-mote parameters — no stored state, and
+                // identical every run so the stream never "reshuffles".
+                let p = |k: u32, lo: f32, hi: f32| {
+                    lo + hash01(i as u32 * 977 + k * 7919) * (hi - lo)
+                };
+                // Same one-in-three split as the dashboard: a few in-focus
+                // glints among soft discs is what sells depth of field.
+                let sparkle = i % 3 == 2;
+                let phase = p(3, 0.0, tau);
+
+                // Left to right, wrapping wide of both edges so nothing pops.
+                let x = (p(2, 0.0, 1.0) + t * p(1, 0.020, 0.055)).rem_euclid(1.2) - 0.1;
+                let path = match shape {
+                    StreamShape::Wave => MID + AMP * (x * tau * FREQ + t * 0.09).sin(),
+                    // Raised cosine at twice the rate: peaks a quarter and
+                    // three quarters across, valleys at both edges and the
+                    // middle. Screen y grows downward, so the humps subtract.
+                    StreamShape::M => M_BASE - M_AMP * (1.0 - (x * 2.0 * tau).cos()) * 0.5,
+                };
+                let y = path
+                    + p(4, -0.11, 0.11)
+                    + 0.012 * (t * tau * 0.11 + phase).sin();
+
+                let breath = 0.5 - 0.5 * (t * p(5, 0.10, 0.40) * tau + phase * 1.7).cos();
+                // Quarter the dashboard's radii (2.5..7 and 16..56), so the
+                // whole field reads small however the sizes are mixed.
+                let (tex, r, a) = if sparkle {
+                    (glint, p(6, 0.8, 2.0), p(7, 0.30, 0.60) * breath * breath * fade)
+                } else {
+                    (disc, p(6, 4.0, 14.0), p(7, 0.05, 0.13) * breath * fade)
+                };
+                if a <= 0.003 {
+                    continue;
+                }
+                // Same cool-to-gold blend the dashboard uses.
+                let warm = p(8, 0.3, 1.0);
+                let cool = (0.82, 1.0, 0.86);
+                let gold = (1.0, 0.87, 0.62);
+                let col = Color::new(
+                    cool.0 + (gold.0 - cool.0) * warm,
+                    cool.1 + (gold.1 - cool.1) * warm,
+                    cool.2 + (gold.2 - cool.2) * warm,
+                    a,
+                );
+                let r = r * s;
+                draw_texture_ex(
+                    tex,
+                    x * w - r,
+                    y * h - r,
+                    col,
+                    DrawTextureParams {
+                        dest_size: Some(vec2(r * 2.0, r * 2.0)),
+                        ..Default::default()
+                    },
+                );
+            }
+        });
+    });
+}
+
+/// Everything the selector needs about one game, resolved once when the screen
+/// opens so the draw pass never touches the filesystem.
+pub struct GameEntry {
+    pub playtime: Option<String>, // "40h 10m"
+    pub when: Option<String>,     // "yesterday"
+    /// Last-played stamp as a unix second, so the caller can pick the most
+    /// recent one to open the cursor on.
+    pub last_ts: Option<i64>,
+    pub consoles: Vec<usize>,     // CONSOLE_ICONS indices for the runtime
+    pub has_save: bool,
+}
+
+/// Resolve the per-game metadata for a whole cart in one pass.
+pub fn build_game_entries(games: &[(save::CartInfo, PathBuf)]) -> Vec<GameEntry> {
+    games
+        .iter()
+        .map(|(info, _)| {
+            let pt = playtime_of(&info.id);
+            GameEntry {
+                playtime: pt.as_ref().map(|(d, _)| fmt_duration(*d)),
+                when: pt.as_ref().map(|(_, l)| fmt_when(*l)),
+                last_ts: pt.as_ref().map(|(_, l)| l.timestamp()),
+                consoles: console_icons_for_runtime(info.runtime.as_deref().unwrap_or("")),
+                has_save: std::path::Path::new(&format!("/var/kazeta/saves/default/{}", info.id))
+                    .exists(),
+            }
+        })
+        .collect()
+}
+
+fn rgb_to_hsl(r: f32, g: f32, b: f32) -> (f32, f32, f32) {
+    let mx = r.max(g).max(b);
+    let mn = r.min(g).min(b);
+    let l = (mx + mn) / 2.0;
+    if (mx - mn).abs() < 1.0e-5 {
+        return (0.0, 0.0, l);
+    }
+    let d = mx - mn;
+    let s = d / (1.0 - (2.0 * l - 1.0).abs()).max(1.0e-5);
+    let h = if mx == r {
+        ((g - b) / d).rem_euclid(6.0)
+    } else if mx == g {
+        (b - r) / d + 2.0
+    } else {
+        (r - g) / d + 4.0
+    };
+    (h * 60.0, s, l)
+}
+
+fn hsl_to_rgb(h: f32, s: f32, l: f32) -> Color {
+    let c = (1.0 - (2.0 * l - 1.0).abs()) * s;
+    let hp = h.rem_euclid(360.0) / 60.0;
+    let x = c * (1.0 - (hp % 2.0 - 1.0).abs());
+    let (r, g, b) = match hp as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = l - c / 2.0;
+    Color::new(r + m, g + m, b + m, 1.0)
+}
+
+/// Mean colour of an icon's non-transparent pixels, pushed to a usable
+/// saturation and lightness so a washed-out sprite still yields a live accent.
+/// Decoded on the CPU rather than read back off the GPU, and run once per
+/// game when its icon lands — never per frame.
+pub fn icon_accent_from_bytes(bytes: &[u8]) -> Color {
+    let fallback = Color::new(0.35, 0.55, 0.75, 1.0);
+    let Ok(img) = ::image::load_from_memory(bytes) else { return fallback };
+    let rgba = img.to_rgba8();
+    let (mut r, mut g, mut b, mut n) = (0.0f32, 0.0f32, 0.0f32, 0u32);
+    for px in rgba.pixels() {
+        if px[3] < 40 {
+            continue;
+        }
+        r += px[0] as f32;
+        g += px[1] as f32;
+        b += px[2] as f32;
+        n += 1;
+    }
+    if n == 0 {
+        return fallback;
+    }
+    let n = n as f32 * 255.0;
+    let (hh, ss, _) = rgb_to_hsl(r / n, g / n, b / n);
+    hsl_to_rgb(hh, ss.clamp(0.42, 0.80), 0.55)
+}
+
+/// Shrink-to-fit with an ellipsis, for names that outrun their column.
+fn fit_text(text: &str, font: &Font, size: u16, max_w: f32) -> String {
+    if max_w <= 0.0 {
+        return String::new();
+    }
+    if measure_text(text, Some(font), size, 1.0).width <= max_w {
+        return text.to_string();
+    }
+    let chars: Vec<char> = text.chars().collect();
+    let mut keep = chars.len();
+    while keep > 1 {
+        keep -= 1;
+        let mut t: String = chars[..keep].iter().collect();
+        t.push('\u{2026}');
+        if measure_text(&t, Some(font), size, 1.0).width <= max_w {
+            return t;
+        }
+    }
+    "\u{2026}".to_string()
 }
 
 /// One layer of Play-hero branding for the draw pass. During a swap two of
@@ -2744,13 +3024,18 @@ fn draw_tab_pane(
     }
 }
 
-/// Metro-styled multicart game selection: a grid of slate tiles built around
-/// the carts' 32x32 icons (nearest-neighbor upscaled, pixel-crisp), cart name
-/// as the header, selected game's name below the grid. Navigation stays the
-/// 5-wide grid handled by the caller.
+/// Metro-styled multicart game selection: a scannable list of games on the
+/// left with playtime right-aligned in a tabular column, and a detail hero on
+/// the right. The hero's cover is manufactured from the game's own 32x32 icon
+/// and the colours inside it, because a cover is the one thing a multicart
+/// game never ships. The runtime is carried by its console badge rather than
+/// a string. Navigation is vertical, handled by the caller.
 pub fn draw_game_selection(
     games: &[(save::CartInfo, PathBuf)],
+    entries: &[GameEntry],
     game_icon_cache: &HashMap<String, Texture2D>,
+    game_cover_cache: &HashMap<String, Texture2D>,
+    accent_cache: &HashMap<String, Color>,
     placeholder: &Texture2D,
     selected_game: usize,
     cart_label: Option<&str>,
@@ -2767,97 +3052,306 @@ pub fn draw_game_selection(
     render_background(background_cache, video_cache, config, background_state);
 
     let current_font = get_current_font(font_cache, config);
+    let sel = selected_game.min(games.len().saturating_sub(1));
+    let fallback_accent = Color::new(0.35, 0.55, 0.75, 1.0);
+    let accent = games
+        .get(sel)
+        .and_then(|(info, _)| accent_cache.get(&info.id).copied())
+        .unwrap_or(fallback_accent);
+
+    // The room takes the colour of whatever you're pointing at — the same
+    // trick the dashboard plays with a blurred cover, done with one value.
+    // One stretched alpha ramp, not stacked strips: a translucent wash this
+    // large bands into visible horizontal lines when built out of rectangles.
+    FADE_TEX.with(|fade| {
+        let h = screen_height();
+        let band = h * 0.55;
+        draw_texture_ex(
+            fade,
+            0.0,
+            h - band,
+            Color::new(accent.r, accent.g, accent.b, 0.26),
+            DrawTextureParams {
+                dest_size: Some(vec2(screen_width(), band)),
+                ..Default::default()
+            },
+        );
+    });
+
+    // Ambient stream over the wash, under everything the user reads.
+    if config.background_particles == "ON" {
+        draw_stream_bokeh(s, StreamShape::Wave, 1.0);
+    }
 
     // --- Header: small "select game" eyebrow, cart name big underneath ---
-    let eyebrow_size = (FONT_SIZE as f32 * s * 0.8) as u16;
     text_with_color(
         font_cache, config, "select game",
-        75.0 * s, 42.0 * s, eyebrow_size,
+        36.0 * s, 32.0 * s, (FONT_SIZE as f32 * s * 0.8) as u16,
         Color::new(1.0, 1.0, 1.0, 0.45),
     );
-    let title_size = (FONT_SIZE as f32 * s * 1.45) as u16;
     text_with_color(
         font_cache, config, cart_label.unwrap_or("Cartridge"),
-        75.0 * s, 68.0 * s, title_size, WHITE,
+        36.0 * s, 56.0 * s, (FONT_SIZE as f32 * s * 1.45) as u16, WHITE,
     );
 
-    // --- Grid of icon tiles, 5 wide (matches the caller's navigation) ---
-    let unit = 66.0 * s;
-    let gap = 6.0 * s;
-    let cols = 5usize;
-    let rows = (games.len() + cols - 1) / cols;
-    let grid_w = cols as f32 * unit + (cols - 1) as f32 * gap;
-    let start_x = (screen_width() - grid_w) / 2.0;
-    let start_y = 100.0 * s;
+    // Design-space geometry (640x360 units, scaled by s).
+    let list_x = 36.0 * s;
+    let list_y = 72.0 * s;
+    let list_w = 270.0 * s;
+    let row_h = 32.0 * s;
+    const VISIBLE: usize = 7;
+    let hero_x = 336.0 * s;
+    let hero_w = 268.0 * s;
+    // Real cart covers follow the 920x430 spec, so the slot takes that aspect
+    // and art that follows it fills the frame exactly — no bars, no stretch.
+    let cover_h = hero_w * 430.0 / 920.0;
+    let plate_h = 26.0 * s;
 
-    for (i, (cart_info, _)) in games.iter().enumerate() {
-        let col = (i % cols) as f32;
-        let row = (i / cols) as f32;
-        let is_selected = i == selected_game;
+    // Keep the cursor in the middle of the window where it can be.
+    let first = if games.len() <= VISIBLE {
+        0
+    } else {
+        sel.saturating_sub(VISIBLE / 2)
+            .min(games.len() - VISIBLE)
+    };
 
-        let (mut rx, mut ry, mut rw, mut rh) = (
-            start_x + col * (unit + gap),
-            start_y + row * (unit + gap),
-            unit,
-            unit,
-        );
-        if is_selected {
-            let grow = 4.0 * s;
-            rx -= grow; ry -= grow; rw += grow * 2.0; rh += grow * 2.0;
-        }
+    let name_size = (FONT_SIZE as f32 * s * 0.85) as u16;
+    let small_size = (FONT_SIZE as f32 * s * 0.7) as u16;
+    let key_size = ((FONT_SIZE as f32 * s * 0.52) as u16).max(7);
+    let val_size = (FONT_SIZE as f32 * s * 0.8) as u16;
 
-        // Slate tile with the dashboard's vertical sheen.
-        let fill = if i % 2 == 0 { TILE_SLATE } else { TILE_SLATE_ALT };
-        const STRIPS: usize = 6;
-        let strip_h = rh / STRIPS as f32;
-        for strip in 0..STRIPS {
-            let t = strip as f32 / (STRIPS - 1) as f32;
-            let b = 1.08 - 0.16 * t;
-            draw_rectangle(
-                rx, ry + strip as f32 * strip_h, rw, strip_h + 1.0,
-                Color::new((fill.r * b).min(1.0), (fill.g * b).min(1.0), (fill.b * b).min(1.0), 1.0),
+    CONSOLE_ICONS.with(|icons| {
+        // ---------------- the list ----------------
+        for slot in 0..VISIBLE.min(games.len().saturating_sub(first)) {
+            let i = first + slot;
+            let (info, _) = &games[i];
+            let entry = entries.get(i);
+            let ry = list_y + slot as f32 * row_h;
+            let is_sel = i == sel;
+
+            if is_sel {
+                // Flat slate tinted toward the game's own colour. Deliberately
+                // not a gradient: a stepped ramp this wide bands as visibly
+                // across the row as the wash did up the screen.
+                let mix = 0.20;
+                draw_rectangle(
+                    list_x, ry, list_w, row_h,
+                    Color::new(
+                        TILE_SLATE.r * (1.0 - mix) + accent.r * mix,
+                        TILE_SLATE.g * (1.0 - mix) + accent.g * mix,
+                        TILE_SLATE.b * (1.0 - mix) + accent.b * mix,
+                        1.0,
+                    ),
+                );
+                draw_rectangle(list_x, ry, 3.0 * s, row_h, accent);
+                let border = string_to_color(&config.cursor_color);
+                draw_focus_glow_ex(list_x, ry, list_w, row_h, s, border, 0.85, 1.6);
+            } else if i % 2 == 1 {
+                draw_rectangle(list_x, ry, list_w, row_h, Color::new(1.0, 1.0, 1.0, 0.030));
+            }
+
+            // The 32x32 icon, pixel-crisp.
+            let icon = game_icon_cache.get(&info.id).unwrap_or(placeholder);
+            icon.set_filter(FilterMode::Nearest);
+            let isz = 22.0 * s;
+            draw_texture_ex(
+                icon, list_x + 8.0 * s, ry + (row_h - isz) / 2.0, WHITE,
+                DrawTextureParams { dest_size: Some(vec2(isz, isz)), ..Default::default() },
             );
-        }
 
-        // The 32x32 icon, upscaled pixel-crisp to fill most of the tile.
-        let icon = game_icon_cache.get(&cart_info.id).unwrap_or(placeholder);
-        icon.set_filter(FilterMode::Nearest);
-        let icon_size = rw * 0.72;
-        draw_texture_ex(
-            icon,
-            rx + (rw - icon_size) / 2.0,
-            ry + (rh - icon_size) / 2.0,
-            WHITE,
-            DrawTextureParams { dest_size: Some(vec2(icon_size, icon_size)), ..Default::default() },
-        );
-
-        if is_selected {
-            let border = string_to_color(&config.cursor_color);
-            draw_focus_glow(rx, ry, rw, rh, s, border);
-        }
-    }
-
-    // --- Selected game's name, big and centered under the grid ---
-    if let Some((cart_info, _)) = games.get(selected_game) {
-        let name = cart_info.name.as_deref().unwrap_or(&cart_info.id);
-        let name_size = (FONT_SIZE as f32 * s * 1.25) as u16;
-        let dims = measure_text(name, Some(current_font), name_size, 1.0);
-        let name_y = start_y + rows as f32 * (unit + gap) + 34.0 * s;
-        text_with_color(
-            font_cache, config, name,
-            (screen_width() - dims.width) / 2.0, name_y, name_size, WHITE,
-        );
-        if let Some(runtime) = cart_info.runtime.as_deref() {
-            let sub_size = (FONT_SIZE as f32 * s * 0.7) as u16;
-            let sub = format!("runtime: {}", runtime);
-            let sub_dims = measure_text(&sub, Some(current_font), sub_size, 1.0);
+            // Playtime, right-aligned so the column reads as a ranking.
+            let pt = entry
+                .and_then(|e| e.playtime.as_deref())
+                .unwrap_or("\u{2014}");
+            let pt_w = measure_text(pt, Some(current_font), small_size, 1.0).width;
+            let pt_x = list_x + list_w - 8.0 * s - pt_w;
+            let played = entry.map(|e| e.playtime.is_some()).unwrap_or(false);
             text_with_color(
-                font_cache, config, &sub,
-                (screen_width() - sub_dims.width) / 2.0, name_y + 18.0 * s, sub_size,
-                Color::new(1.0, 1.0, 1.0, 0.4),
+                font_cache, config, pt, pt_x, ry + row_h * 0.62, small_size,
+                if played { Color::new(1.0, 1.0, 1.0, 0.78) } else { Color::new(1.0, 1.0, 1.0, 0.30) },
+            );
+
+            // Console badges instead of a runtime string.
+            let badge = 15.0 * s;
+            let cons = entry.map(|e| &e.consoles[..]).unwrap_or(&[]);
+            let mut bx = pt_x - 8.0 * s - cons.len() as f32 * (badge + 2.0 * s);
+            let badges_left = bx;
+            for idx in cons.iter().take(2) {
+                if let Some(tex) = icons.get(*idx) {
+                    draw_texture_ex(
+                        tex, bx, ry + (row_h - badge) / 2.0,
+                        Color::new(1.0, 1.0, 1.0, if is_sel { 1.0 } else { 0.82 }),
+                        DrawTextureParams { dest_size: Some(vec2(badge, badge)), ..Default::default() },
+                    );
+                }
+                bx += badge + 2.0 * s;
+            }
+
+            let name_x = list_x + 36.0 * s;
+            let name = fit_text(
+                info.name.as_deref().unwrap_or(&info.id),
+                current_font, name_size,
+                (badges_left - 6.0 * s - name_x).max(0.0),
+            );
+            text_with_color(
+                font_cache, config, &name, name_x, ry + row_h * 0.62, name_size,
+                if is_sel { WHITE } else { Color::new(1.0, 1.0, 1.0, 0.86) },
             );
         }
-    }
+
+        // Scroll rail, only when the list actually overflows.
+        if games.len() > VISIBLE {
+            let track_h = VISIBLE as f32 * row_h;
+            let track_x = list_x + list_w + 6.0 * s;
+            draw_rectangle(track_x, list_y, 2.0 * s, track_h, Color::new(1.0, 1.0, 1.0, 0.09));
+            let thumb = track_h * VISIBLE as f32 / games.len() as f32;
+            let top = track_h * first as f32 / games.len() as f32;
+            draw_rectangle(track_x, list_y + top, 2.0 * s, thumb, Color::new(1.0, 1.0, 1.0, 0.40));
+        }
+
+        // ---------------- the hero ----------------
+        let Some((info, _)) = games.get(sel) else { return };
+        let entry = entries.get(sel);
+        let icon = game_icon_cache.get(&info.id).unwrap_or(placeholder);
+        icon.set_filter(FilterMode::Nearest);
+
+        // The cart's own Cover= art if it shipped one; a cover manufactured
+        // from the icon and the colours inside it only when it didn't.
+        {
+            if let Some(tex) = game_cover_cache.get(&info.id) {
+                tex.set_filter(FilterMode::Linear);
+                // Art on the 920x430 spec fills the slot exactly; anything
+                // else is fitted and letterboxed on near-black, because a
+                // stretched cover is the one thing worse than bars.
+                let frame_ar = hero_w / cover_h;
+                let tex_ar = tex.width() / tex.height();
+                let (fx, fy, fw, fh) = if (tex_ar - frame_ar).abs() <= frame_ar * 0.02 {
+                    (hero_x, list_y, hero_w, cover_h)
+                } else if tex_ar > frame_ar {
+                    let h = hero_w / tex_ar;
+                    (hero_x, list_y + (cover_h - h) / 2.0, hero_w, h)
+                } else {
+                    let w = cover_h * tex_ar;
+                    (hero_x + (hero_w - w) / 2.0, list_y, w, cover_h)
+                };
+                if fw < hero_w - 0.5 || fh < cover_h - 0.5 {
+                    draw_rectangle(hero_x, list_y, hero_w, cover_h, Color::new(0.04, 0.045, 0.05, 1.0));
+                }
+                draw_texture_ex(
+                    tex, fx, fy, WHITE,
+                    DrawTextureParams { dest_size: Some(vec2(fw, fh)), ..Default::default() },
+                );
+            } else {
+                // Near-black bed, then the accent laid over it as a single
+                // stretched ramp (flipped, so it's strongest at the top).
+                draw_rectangle(hero_x, list_y, hero_w, cover_h, Color::new(0.045, 0.050, 0.055, 1.0));
+                FADE_TEX.with(|fade| {
+                    draw_texture_ex(
+                        fade, hero_x, list_y,
+                        Color::new(accent.r * 0.62, accent.g * 0.62, accent.b * 0.62, 1.0),
+                        DrawTextureParams {
+                            dest_size: Some(vec2(hero_w, cover_h)),
+                            flip_y: true,
+                            ..Default::default()
+                        },
+                    );
+                });
+                // Bleed copy, kept fully inside the frame so nothing needs
+                // clipping, then the crisp sprite over it.
+                draw_texture_ex(
+                    icon, hero_x + hero_w - cover_h, list_y, Color::new(1.0, 1.0, 1.0, 0.10),
+                    DrawTextureParams { dest_size: Some(vec2(cover_h, cover_h)), ..Default::default() },
+                );
+                let face = (cover_h - plate_h) * 0.78;
+                draw_texture_ex(
+                    icon,
+                    hero_x + (hero_w - face) / 2.0,
+                    list_y + (cover_h - plate_h - face) / 2.0,
+                    WHITE,
+                    DrawTextureParams { dest_size: Some(vec2(face, face)), ..Default::default() },
+                );
+            }
+            // Name plate: one stretched ramp rather than stacked strips.
+            FADE_TEX.with(|fade| {
+                draw_texture_ex(
+                    fade, hero_x, list_y + cover_h - plate_h,
+                    Color::new(0.0, 0.0, 0.0, 0.80),
+                    DrawTextureParams {
+                        dest_size: Some(vec2(hero_w, plate_h)),
+                        ..Default::default()
+                    },
+                );
+            });
+            let cons = entry.map(|e| &e.consoles[..]).unwrap_or(&[]);
+            let badge = 18.0 * s;
+            let badges_w = cons.len().min(2) as f32 * (badge + 3.0 * s);
+            let title_size = (FONT_SIZE as f32 * s * 1.0) as u16;
+            let title = fit_text(
+                info.name.as_deref().unwrap_or(&info.id),
+                current_font, title_size,
+                hero_w - 16.0 * s - badges_w,
+            );
+            text_with_color(
+                font_cache, config, &title,
+                hero_x + 8.0 * s, list_y + cover_h - 9.0 * s, title_size, WHITE,
+            );
+            let mut bx = hero_x + hero_w - 8.0 * s - badges_w;
+            for idx in cons.iter().take(2) {
+                if let Some(tex) = icons.get(*idx) {
+                    draw_texture_ex(
+                        tex, bx, list_y + cover_h - plate_h + (plate_h - badge) / 2.0, WHITE,
+                        DrawTextureParams { dest_size: Some(vec2(badge, badge)), ..Default::default() },
+                    );
+                }
+                bx += badge + 3.0 * s;
+            }
+        }
+
+        // Stat grid: the numbers you can't get anywhere else on the system.
+        let cell_w = (hero_w - 2.0 * s) / 2.0;
+        let cell_h = 30.0 * s;
+        let stats_y = list_y + cover_h + 3.0 * s;
+        let none = Color::new(1.0, 1.0, 1.0, 0.34);
+        let runtime = info.runtime.as_deref().unwrap_or("");
+        let runtime_label = if runtime.is_empty() { "PC" } else { runtime };
+        let save_label = if entry.map(|e| e.has_save).unwrap_or(false) { "Yes" } else { "None" };
+        let cells: [(&str, &str, bool); 4] = [
+            ("Time played", entry.and_then(|e| e.playtime.as_deref()).unwrap_or("None yet"),
+             entry.map(|e| e.playtime.is_some()).unwrap_or(false)),
+            ("Last played", entry.and_then(|e| e.when.as_deref()).unwrap_or("Never"),
+             entry.map(|e| e.when.is_some()).unwrap_or(false)),
+            ("Runtime", runtime_label, true),
+            ("Save data", save_label, entry.map(|e| e.has_save).unwrap_or(false)),
+        ];
+        for (k, (key, val, lit)) in cells.iter().enumerate() {
+            let cx = hero_x + (k % 2) as f32 * (cell_w + 2.0 * s);
+            let cy = stats_y + (k / 2) as f32 * (cell_h + 2.0 * s);
+            draw_rectangle(cx, cy, cell_w, cell_h, Color::new(1.0, 1.0, 1.0, 0.055));
+            text_with_color(
+                font_cache, config, &key.to_uppercase(),
+                cx + 6.0 * s, cy + 9.0 * s, key_size, Color::new(1.0, 1.0, 1.0, 0.42),
+            );
+            // The runtime cell leads with its console badge.
+            let mut vx = cx + 6.0 * s;
+            if k == 2 {
+                if let Some(idx) = entry.and_then(|e| e.consoles.first()) {
+                    if let Some(tex) = icons.get(*idx) {
+                        let b = 12.0 * s;
+                        draw_texture_ex(
+                            tex, vx, cy + cell_h - 6.0 * s - b, WHITE,
+                            DrawTextureParams { dest_size: Some(vec2(b, b)), ..Default::default() },
+                        );
+                        vx += b + 4.0 * s;
+                    }
+                }
+            }
+            let val = fit_text(val, current_font, val_size, cx + cell_w - 6.0 * s - vx);
+            text_with_color(
+                font_cache, config, &val, vx, cy + cell_h - 6.0 * s, val_size,
+                if *lit { WHITE } else { none },
+            );
+        }
+    });
 
     // --- Button legend, lower right like the dashboard: confirm boots the
     // cart, back returns to the dash. Glyphs match the last-used device. ---
@@ -3168,6 +3662,34 @@ pub fn draw(
             Color::new(0.0, 0.0, 0.0, 0.7),
         );
         text_with_config_color(font_cache, config, message, x, y, font_size);
+    }
+
+    // --- Boot logo curtain ---
+    // The mark holds on black, then black and mark dissolve together to leave
+    // the theme background — which is already drawn underneath, along with the
+    // tiles parked off-screen at intro_t 0. Drawn last so it covers every
+    // other layer, and skipped entirely once it has run.
+    if state.logo_t < 1.0 {
+        let lift = ((state.logo_t - LOGO_HOLD) / (1.0 - LOGO_HOLD)).clamp(0.0, 1.0);
+        let a = 1.0 - ease_out_sine(lift);
+        let (w, h) = (screen_width(), screen_height());
+        draw_rectangle(0.0, 0.0, w, h, Color::new(0.0, 0.0, 0.0, a));
+        LOGO_INTRO.with(|tex| {
+            // Fit inside the screen on the mark's own aspect, with a slight
+            // push-in as it leaves so the hand-off reads as a move rather
+            // than a flat dissolve.
+            let ar = tex.width() / tex.height();
+            let scale = 1.0 + 0.04 * lift;
+            let (lw, lh) = if w / h > ar { (h * ar, h) } else { (w, w / ar) };
+            let (lw, lh) = (lw * scale, lh * scale);
+            draw_texture_ex(
+                tex,
+                (w - lw) / 2.0,
+                (h - lh) / 2.0,
+                Color::new(1.0, 1.0, 1.0, a),
+                DrawTextureParams { dest_size: Some(vec2(lw, lh)), ..Default::default() },
+            );
+        });
     }
 }
 
@@ -4497,9 +5019,10 @@ pub fn draw_save_data(
         });
     });
     if config.background_particles == "ON" {
-        // The dashboard's outro collapsed the motes toward bottom-centre; feed
-        // this screen's own intro so they fly back out instead of snapping.
-        draw_bokeh(state, ease_out(intro), s);
+        // A stream tracing an M rather than the dashboard's drifting field.
+        // The screen's own intro drives the fade, so the motes arrive with
+        // the rest of the furniture instead of snapping on.
+        draw_stream_bokeh(s, StreamShape::M, ease_out(intro));
     }
 
     // --- Header: eyebrow + storage tab strip ---

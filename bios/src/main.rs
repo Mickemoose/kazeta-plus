@@ -24,7 +24,7 @@ use ::rand::Rng; // for selecting a random message on startup
 use regex::Regex; // fetching audio sinks
 use rodio::{
     buffer::SamplesBuffer,
-    Decoder, Sink,
+    Decoder, Sink, Source,
 };
 use std::{
     thread, time, fs, process, env,
@@ -358,55 +358,51 @@ async fn load_all_assets(
     HashMap<String, Font>, // font cache
     SoundEffects, // sfx
 ) {
-    let draw_loading_screen = |status_message: &str, progress: f32| {
-        let font_size = (16.0 * scale_factor) as u16;
-        let line_spacing = 10.0 * scale_factor;
+    // The mark IS the loading screen. It is up from the first frame of asset
+    // loading and stays up through the dashboard's own logo curtain, which
+    // dissolves it into the wallpaper — so the whole boot reads as one
+    // continuous shot instead of a progress bar followed by a logo.
+    let intro_logo = Texture2D::from_file_with_format(
+        include_bytes!("../KAZETA_BW.png"),
+        Some(ImageFormat::Png),
+    );
+    let draw_loading_screen = |_status_message: &str, _progress: f32| {
+        clear_background(BLACK);
+        let (w, h) = (screen_width(), screen_height());
+        // Fit inside the screen on the mark's own aspect, matching the
+        // curtain exactly so the hand-off doesn't shift a pixel.
+        let ar = intro_logo.width() / intro_logo.height();
+        let (lw, lh) = if w / h > ar { (h * ar, h) } else { (w, w / ar) };
+        draw_texture_ex(
+            &intro_logo,
+            (w - lw) / 2.0,
+            (h - lh) / 2.0,
+            WHITE,
+            DrawTextureParams { dest_size: Some(vec2(lw, lh)), ..Default::default() },
+        );
+
+        // The random startup message, quiet along the bottom so it reads as a
+        // footnote under the mark rather than competing with it. Laid out from
+        // the last line upward, so a two-line message grows away from the
+        // bottom edge instead of running off it.
+        let font_size = (12.0 * scale_factor) as u16;
+        let step = font_size as f32 + 5.0 * scale_factor;
         let lines: Vec<&str> = display_message.lines().collect();
-
-        let total_text_height = (lines.len() as f32 * font_size as f32) + ((lines.len() - 1) as f32 * line_spacing);
-        let y_start = screen_height() / 2.0 - total_text_height / 2.0;
-
+        let last_baseline = h - 26.0 * scale_factor;
         for (i, line) in lines.iter().enumerate() {
-            let line_width = measure_text(line, Some(font), font_size, 1.0).width;
-            let x = (screen_width() - line_width) / 2.0; // Center each line individually
-            let y = y_start + (i as f32 * (font_size as f32 + line_spacing));
-            draw_text_ex(line, x, y, TextParams { font: Some(font), font_size, color: WHITE, ..Default::default() });
+            let dims = measure_text(line, Some(font), font_size, 1.0);
+            draw_text_ex(
+                line,
+                (w - dims.width) / 2.0,
+                last_baseline - (lines.len() - 1 - i) as f32 * step,
+                TextParams {
+                    font: Some(font),
+                    font_size,
+                    color: Color::new(1.0, 1.0, 1.0, 0.55),
+                    ..Default::default()
+                },
+            );
         }
-
-        // --- Scale and draw the progress bar ---
-        let bar_height = 10.0 * scale_factor;
-        let bar_width = screen_width() - (20.0 * scale_factor); // Change to full screen width
-        let bar_x = 10.0 * scale_factor; // Start at the far left
-        let bar_y = screen_height() - (20.0 * scale_factor); // Position at the very bottom
-
-        // The border is now a background fill
-        draw_rectangle(bar_x, bar_y, bar_width, bar_height, WHITE);
-
-        // Inset the red fill rectangle to create a border effect
-        let inset = 1.0 * scale_factor; // The thickness of the border
-
-        let safe_progress = progress.min(1.0); // clamp progress to 1.0 to prevent overflow
-
-        draw_rectangle(
-            bar_x + inset,
-            bar_y + inset,
-            (bar_width - inset * 2.0) * safe_progress, // The fill width, adjusted for the border
-            bar_height - inset * 2.0, // The fill height, adjusted for the border
-            RED
-        );
-
-        // loading status
-        let status_font_size = (12.0 * scale_factor) as u16;
-        // Measure the status text to position it on the left, above the bar
-        let status_dims = measure_text(status_message, Some(font), status_font_size, 1.0);
-        let status_y = screen_height() - bar_height - status_dims.height - (5.0 * scale_factor); // 5px gap
-
-        draw_text_ex(
-            status_message,
-            10.0 * scale_factor, // A small margin from the left
-            status_y,
-            TextParams { font: Some(font), font_size: status_font_size, color: WHITE, ..Default::default() },
-        );
     };
 
     // --- COUNT TOTAL ASSETS ---
@@ -890,6 +886,27 @@ async fn main() {
     let mut game_icon_cache: HashMap<String, Texture2D> = HashMap::new();
     let mut game_icon_queue: Vec<(String, PathBuf)> = Vec::new();
 
+    // Selector state: per-game metadata (playtime, console badges, saves), the
+    // accent colour extracted from each icon, and the cart's own branding.
+    // All of it resolved once when the screen opens, never per frame.
+    let mut game_entries: Vec<ui::metro::GameEntry> = Vec::new();
+    let mut game_entries_key = String::new();
+    let mut game_accents: HashMap<String, Color> = HashMap::new();
+    // Per-game Cover= art, when the kzi ships it. The hero only manufactures
+    // a cover out of the icon for games that have none.
+    let mut game_cover_cache: HashMap<String, Texture2D> = HashMap::new();
+    let mut game_cover_queue: Vec<(String, PathBuf)> = Vec::new();
+    let mut cart_theme: Option<PathBuf> = None;
+    let mut cart_title: Option<String> = None;
+    // The theme sounding on the selector, and the path it came from — keyed on
+    // the path so moving between two games that both fall back to the cart's
+    // theme is a no-op instead of a restart.
+    let mut selector_bgm: Option<Sink> = None;
+    // Second copy through a docked DualSense's own speaker, built alongside
+    // the TV copy exactly as the Play hero does it.
+    let mut selector_bgm_pad: Option<Sink> = None;
+    let mut selector_bgm_key = String::new();
+
     // 360-style blades menu state (used when config.menu_style == "BLADES")
     let mut blades_state = ui::blades::BladesState::new();
     // Metro tile menu state (used when config.menu_style == "METRO")
@@ -1338,42 +1355,115 @@ async fn main() {
                         // We use from_file_with_format which reads raw bytes.
                         // None = auto-detect format (png/jpg)
                         let texture = Texture2D::from_file_with_format(KZP_ICON_BYTES, None);
+                        game_accents.insert(
+                            game_id.clone(),
+                            ui::metro::icon_accent_from_bytes(KZP_ICON_BYTES),
+                        );
                         game_icon_cache.insert(game_id, texture);
                     } else {
                         // LOAD FROM DISK (Standard behavior)
                         // load_texture IS async and returns a Result, so we keep the check here
                         if let Ok(texture) = load_texture(&icon_path.to_string_lossy()).await {
+                            // The same bytes again on the CPU, so the selector
+                            // can colour itself from the art. Once per game.
+                            if let Ok(bytes) = fs::read(&icon_path) {
+                                game_accents.insert(
+                                    game_id.clone(),
+                                    ui::metro::icon_accent_from_bytes(&bytes),
+                                );
+                            }
                             game_icon_cache.insert(game_id, texture);
                         }
                     }
                 }
-                let grid_width = 5; // The number of icons per row
-                if input_state.left {
+                // Covers come after the icons — the list needs icons to draw
+                // at all, the hero's cover only matters once you're looking.
+                else if !game_cover_queue.is_empty() {
+                    let (game_id, cover_path) = game_cover_queue.remove(0);
+                    if let Ok(texture) = load_texture(&cover_path.to_string_lossy()).await {
+                        texture.set_filter(FilterMode::Linear);
+                        game_cover_cache.insert(game_id, texture);
+                    }
+                }
+
+                // Per-game metadata, rebuilt only when the cart's game list
+                // actually changes — playtime and save lookups hit the disk.
+                let entries_key: String = available_games
+                    .iter()
+                    .map(|(g, _)| g.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join("|");
+                if entries_key != game_entries_key {
+                    game_entries = ui::metro::build_game_entries(&available_games);
+                    let display = save::cart_display_info(&available_games);
+                    cart_theme = display.bgm.clone();
+                    cart_title = display.name.clone();
+                    // Queue whatever real cover art this cart ships. Paths are
+                    // relative to each game's own .kzi.
+                    game_cover_cache.clear();
+                    game_cover_queue = available_games
+                        .iter()
+                        .filter_map(|(info, kzi)| {
+                            let rel = info.cover.as_ref()?;
+                            let p = kzi.parent()?.join(rel);
+                            if p.exists() { Some((info.id.clone(), p)) } else { None }
+                        })
+                        .collect();
+                    // Open on whatever was played most recently rather than
+                    // always the top of the list. Only on a genuine cart
+                    // change, so backing out and returning keeps your place.
+                    if let Some((recent, _)) = game_entries
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, e)| e.last_ts.map(|t| (i, t)))
+                        .max_by_key(|(_, t)| *t)
+                    {
+                        game_selection = recent;
+                    }
+                    game_entries_key = entries_key;
+                }
+
+                // Vertical list: up/down step one game, left/right page.
+                const PAGE: usize = 7;
+                if input_state.up {
                     if game_selection > 0 {
                         game_selection -= 1;
                         sound_effects.play_cursor_move(&config);
                     }
                 }
-                if input_state.right {
-                    if game_selection < available_games.len().saturating_sub(1) {
+                if input_state.down {
+                    if game_selection + 1 < available_games.len() {
                         game_selection += 1;
                         sound_effects.play_cursor_move(&config);
                     }
                 }
-                if input_state.up {
-                    if game_selection >= grid_width {
-                        game_selection -= grid_width;
+                if input_state.left {
+                    if game_selection > 0 {
+                        game_selection = game_selection.saturating_sub(PAGE);
                         sound_effects.play_cursor_move(&config);
                     }
                 }
-                if input_state.down {
-                    if game_selection + grid_width < available_games.len() {
-                        game_selection += grid_width;
+                if input_state.right {
+                    if game_selection + 1 < available_games.len() {
+                        game_selection =
+                            (game_selection + PAGE).min(available_games.len() - 1);
                         sound_effects.play_cursor_move(&config);
                     }
                 }
                 if input_state.back {
                     current_screen = Screen::MainMenu;
+                    // Hand the room back: the selector's theme stops on both
+                    // the TV and the pad, and the system track comes back up.
+                    if let Some(sink) = selector_bgm.take() {
+                        sink.stop();
+                    }
+                    if let Some(sink) = selector_bgm_pad.take() {
+                        sink.stop();
+                    }
+                    selector_bgm_key.clear();
+                    if let Some(sys) = &current_bgm {
+                        sys.set_volume(config.bgm_volume);
+                    }
                     // Replay the Metro boot choreography on the way back in —
                     // the user liked the tiles sliding home.
                     metro_state.replay_intro();
@@ -1382,6 +1472,13 @@ async fn main() {
                 if input_state.select {
                     if let Some((cart_info, kzi_path)) = available_games.get(game_selection) {
                         sound_effects.play_select(&config);
+                        if let Some(sink) = selector_bgm.take() {
+                            sink.stop();
+                        }
+                        if let Some(sink) = selector_bgm_pad.take() {
+                            sink.stop();
+                        }
+                        selector_bgm_key.clear();
 
                         if DEV_MODE {
                             // --- DEBUG MODE ---
@@ -1425,11 +1522,77 @@ async fn main() {
                     }
                 }
 
+                // --- Theme: the game's own Bgm= if it has one, otherwise the
+                // cart's. Keyed on the resolved path, so moving between two
+                // games that both fall back to the cart's theme leaves it
+                // playing instead of restarting it on every cursor move. ---
+                let own_theme: Option<PathBuf> = available_games
+                    .get(game_selection)
+                    .and_then(|(info, kzi)| {
+                        info.bgm
+                            .as_ref()
+                            .and_then(|b| kzi.parent().map(|p| p.join(b)))
+                            .filter(|p| p.exists())
+                    });
+                let desired_theme = own_theme.clone().or_else(|| cart_theme.clone());
+                let theme_key = desired_theme
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                // The screen check is load-bearing: Back and Launch both stop
+                // the theme above, and this block runs after them in the same
+                // frame. Without it, the cleared key reads as a change and the
+                // theme starts up again on the way out — then nothing ever
+                // re-enters this arm to stop it, so it plays over the menu.
+                if current_screen == Screen::GameSelection && theme_key != selector_bgm_key {
+                    if let Some(sink) = selector_bgm.take() {
+                        sink.stop();
+                    }
+                    if let Some(sink) = selector_bgm_pad.take() {
+                        sink.stop();
+                    }
+                    if let Some(path) = &desired_theme {
+                        if let Ok(bytes) = fs::read(path) {
+                            let pad_bytes = bytes.clone();
+                            if let Ok(decoder) = Decoder::new(Cursor::new(bytes)) {
+                                let sink = Sink::connect_new(&AUDIO.stream.mixer());
+                                sink.append(decoder.repeat_infinite());
+                                sink.set_volume(config.bgm_volume);
+                                selector_bgm = Some(sink);
+                                // The pad copy needs its own decoder over the
+                                // same bytes — the two sinks can't share one.
+                                if config.pad_bgm_volume > 0.001 {
+                                    if let Some(pad_sink) = audio::pad_sink_new() {
+                                        if let Ok(d2) = Decoder::new(Cursor::new(pad_bytes)) {
+                                            pad_sink.append(
+                                                audio::PadSource::new(d2.repeat_infinite()),
+                                            );
+                                            pad_sink.set_volume(config.pad_bgm_volume);
+                                            selector_bgm_pad = Some(pad_sink);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Duck the system track under a cart or game theme.
+                    if let Some(sys) = &current_bgm {
+                        sys.set_volume(if selector_bgm.is_some() {
+                            0.0
+                        } else {
+                            config.bgm_volume
+                        });
+                    }
+                    selector_bgm_key = theme_key;
+                }
+
                 // --- Render ---
                 if config.menu_style == "METRO" {
                     ui::metro::draw_game_selection(
-                        &available_games, &game_icon_cache, &placeholder, game_selection,
-                        metro_state.cart_label.as_deref(), metro_state.legend_icon(), &animation_state,
+                        &available_games, &game_entries, &game_icon_cache, &game_cover_cache,
+                        &game_accents, &placeholder, game_selection,
+                        cart_title.as_deref().or(metro_state.cart_label.as_deref()),
+                        metro_state.legend_icon(), &animation_state,
                         &background_cache, &mut video_cache, &font_cache, &config,
                         &mut background_state, scale_factor,
                     );

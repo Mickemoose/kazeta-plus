@@ -480,6 +480,115 @@ pub fn parse_kzi_file(kzi_path: &Path) -> Result<CartInfo, SaveError> {
     }
 }
 
+/// Human-friendly ordering: case-insensitive, and runs of digits compare as
+/// numbers so "Country 2" lands before "Country 10" rather than after it.
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let mut ai = a.chars().peekable();
+    let mut bi = b.chars().peekable();
+    loop {
+        match (ai.peek().copied(), bi.peek().copied()) {
+            (None, None) => return Ordering::Equal,
+            (None, Some(_)) => return Ordering::Less,
+            (Some(_), None) => return Ordering::Greater,
+            (Some(x), Some(y)) => {
+                if x.is_ascii_digit() && y.is_ascii_digit() {
+                    let mut na: u64 = 0;
+                    let mut nb: u64 = 0;
+                    while let Some(c) = ai.peek().copied().filter(|c| c.is_ascii_digit()) {
+                        na = na.saturating_mul(10).saturating_add(c as u64 - '0' as u64);
+                        ai.next();
+                    }
+                    while let Some(c) = bi.peek().copied().filter(|c| c.is_ascii_digit()) {
+                        nb = nb.saturating_mul(10).saturating_add(c as u64 - '0' as u64);
+                        bi.next();
+                    }
+                    if na != nb {
+                        return na.cmp(&nb);
+                    }
+                } else {
+                    let (xl, yl) = (x.to_ascii_lowercase(), y.to_ascii_lowercase());
+                    if xl != yl {
+                        return xl.cmp(&yl);
+                    }
+                    ai.next();
+                    bi.next();
+                }
+            }
+        }
+    }
+}
+
+/// Optional `order:` from the cart's cartinfo.yaml — game Ids in the order the
+/// cart author wants them shown. Both YAML list forms are accepted:
+///
+/// ```yaml
+/// order:
+///   - donkey-kong-country
+///   - donkey-kong-country-2
+/// ```
+///
+/// ```yaml
+/// order: [donkey-kong-country, donkey-kong-country-2]
+/// ```
+///
+/// Standalone on purpose: `cart_display_info` falls back to scanning games
+/// itself, so reading the order through it would recurse into the scan.
+fn cart_order_from_yaml() -> Vec<String> {
+    let Ok(yamls) = find_files_by_extension("/run/media/", &["yaml", "yml"], 2, false) else {
+        return Vec::new();
+    };
+    for y in yamls {
+        let is_cartinfo = y
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map(|s| s.eq_ignore_ascii_case("cartinfo"))
+            .unwrap_or(false);
+        if !is_cartinfo {
+            continue;
+        }
+        let Ok(content) = fs::read_to_string(&y) else { continue };
+        let mut order: Vec<String> = Vec::new();
+        let mut in_block = false;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if in_block {
+                if let Some(item) = trimmed.strip_prefix('-') {
+                    let item = item.trim().trim_matches('"').trim_matches('\'');
+                    if !item.is_empty() {
+                        order.push(item.to_string());
+                    }
+                    continue;
+                }
+                // Any other non-blank line ends the list.
+                if !trimmed.is_empty() {
+                    in_block = false;
+                }
+            }
+            if let Some((k, v)) = line.split_once(':') {
+                if k.trim() != "order" {
+                    continue;
+                }
+                let v = v.trim();
+                if let Some(inner) = v.strip_prefix('[').and_then(|r| r.strip_suffix(']')) {
+                    order.extend(
+                        inner
+                            .split(',')
+                            .map(|p| p.trim().trim_matches('"').trim_matches('\'').to_string())
+                            .filter(|p| !p.is_empty()),
+                    );
+                } else if v.is_empty() {
+                    in_block = true;
+                }
+            }
+        }
+        if !order.is_empty() {
+            return order;
+        }
+    }
+    Vec::new()
+}
+
 /// Scans removable media and returns every game that could be parsed, paired with
 /// the path to its .kzi/.kzp file. Shared by the PLAY menu option and the
 /// multicart autodetect at startup so both build the exact same list.
@@ -514,6 +623,23 @@ pub fn collect_available_games() -> Result<(Vec<(CartInfo, PathBuf)>, Vec<String
             }
         }
     }
+
+    // Directory order is whatever the filesystem hands back — arbitrary, and
+    // not necessarily the same between mounts. A cart can curate its own order
+    // via `order:` in cartinfo.yaml; whatever it doesn't list falls in after,
+    // natural-sorted, so a half-filled list still gives a sane result.
+    let order = cart_order_from_yaml();
+    games.sort_by(|(a, _), (b, _)| {
+        let rank = |c: &CartInfo| {
+            order.iter().position(|id| id == &c.id).unwrap_or(usize::MAX)
+        };
+        rank(a).cmp(&rank(b)).then_with(|| {
+            natural_cmp(
+                a.name.as_deref().unwrap_or(&a.id),
+                b.name.as_deref().unwrap_or(&b.id),
+            )
+        })
+    });
 
     Ok((games, debug_log))
 }
