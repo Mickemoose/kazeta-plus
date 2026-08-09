@@ -913,8 +913,6 @@ async fn main() {
     let mut selector_bgm_pad: Option<Sink> = None;
     let mut selector_bgm_key = String::new();
 
-    // 360-style blades menu state (used when config.menu_style == "BLADES")
-    let mut blades_state = ui::blades::BladesState::new();
     // Metro tile menu state (used when config.menu_style == "METRO")
     let mut metro_state = ui::metro::MetroState::new();
 
@@ -1109,7 +1107,7 @@ async fn main() {
             Screen::FadingOut => {
                 // During fade, only render, don't process input
                 // Render the current background and UI elements first
-                if config.menu_style != "BLADES" && config.menu_style != "METRO" {
+                if config.menu_style != "METRO" {
                 ui::main_menu::update(
                     &mut current_screen,
                     &mut main_menu_selection,
@@ -1165,46 +1163,7 @@ async fn main() {
                 }
             },
             Screen::MainMenu => {
-                if config.menu_style == "BLADES" {
-                    ui::blades::update(
-                        &mut current_screen,
-                        &mut blades_state,
-                        &mut play_option_enabled,
-                        &mut copy_logs_option_enabled,
-                        &cart_connected,
-                        &mut input_state,
-                        &sound_effects,
-                        &config,
-                        &log_messages,
-                        &storage_state,
-                        &mut fade_start_time,
-                        &mut current_bgm,
-                        &music_cache,
-                        &mut game_icon_queue,
-                        &mut available_games,
-                        &mut game_selection,
-                        &mut flash_message,
-                        &mut game_process,
-                    );
-
-                    ui::blades::draw(
-                        &blades_state,
-                        play_option_enabled,
-                        copy_logs_option_enabled,
-                        &animation_state,
-                        &logo_cache,
-                        &background_cache,
-                        &mut video_cache,
-                        &font_cache,
-                        &config,
-                        &mut background_state,
-                        &battery_info,
-                        &current_time_str,
-                        &app_state.gcc_adapter_poll_rate,
-                        scale_factor,
-                        flash_message.as_ref().map(|(msg, _)| msg.as_str())
-                    );
-                } else if config.menu_style == "METRO" {
+                if config.menu_style == "METRO" {
                     ui::metro::update(
                         &mut current_screen,
                         &mut metro_state,

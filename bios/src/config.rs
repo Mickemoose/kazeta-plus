@@ -52,7 +52,7 @@ pub struct Config {
     pub theme: String,
     pub menu_position: MenuPosition,
     #[serde(default = "default_menu_style")]
-    pub menu_style: String, // "LIST" (classic) or "BLADES" (360-style)
+    pub menu_style: String, // "LIST" (classic) or "METRO" (360-style)
     pub font_color: String,
     pub cursor_color: String,
     pub cursor_style: String,
@@ -115,12 +115,24 @@ impl Config {
     pub fn load() -> Self {
         if let Ok(config_path) = get_config_path() {
             if let Ok(content) = fs::read_to_string(config_path) {
-                if let Ok(config) = toml::from_str(&content) {
-                    return config;
+                if let Ok(config) = toml::from_str::<Self>(&content) {
+                    return config.migrated();
                 }
             }
         }
         Self::default()
+    }
+
+    /// Fixes up values that name something this build no longer has. A config
+    /// written before the blades dashboard was removed would otherwise fall
+    /// through to the classic List, which is not what anyone who chose the
+    /// 360-style menu wanted — Metro is what that choice means now.
+    fn migrated(mut self) -> Self {
+        if self.menu_style == "BLADES" {
+            println!("[Info] menu_style BLADES no longer exists; using METRO.");
+            self.menu_style = "METRO".to_string();
+        }
+        self
     }
 
     /// Saves the current configuration to config.toml.

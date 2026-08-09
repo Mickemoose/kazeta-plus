@@ -65,7 +65,7 @@ pub const SCREENSAVER_TIMEOUTS: &[&str] = &["NEVER", "1 MIN", "5 MIN", "10 MIN",
 /// Dashboard styles. Applying a theme overwrites `menu_style` (falling back to
 /// LIST when the theme doesn't name one), so this row is the way back — without
 /// it, leaving Metro means hand-editing config.toml.
-pub const MENU_STYLES: &[&str] = &["LIST", "BLADES", "METRO"];
+pub const MENU_STYLES: &[&str] = &["LIST", "METRO"];
 
 pub const CUSTOM_ASSET_SETTINGS: &[&str] = &[
     "BACKGROUND MUSIC",
@@ -151,8 +151,8 @@ pub fn render_settings_page(
     brightness: f32,
     choices: &crate::ui::metro::SettingsChoices,
 ) {
-    // METRO owns the whole frame and draws its own settings screen. LIST and
-    // BLADES fall through to the original body below, unchanged. This is the
+    // METRO owns the whole frame and draws its own settings screen. LIST
+    // falls through to the original body below, unchanged. This is the
     // only function all three settings call sites use (the page itself and
     // both reset dialogs' backdrops), so one gate covers them all.
     if config.menu_style == "METRO" {
@@ -816,8 +816,14 @@ pub fn update(
 
                                 if let Some(val) = &theme.config.menu_position { config.menu_position = val.parse().unwrap_or_default(); }
                                 // Menu style resets to LIST when the theme doesn't ask for one,
-                                // so leaving a blades theme actually leaves the blades.
-                                config.menu_style = theme.config.menu_style.clone().unwrap_or_else(|| "LIST".to_string());
+                                // so leaving a themed dashboard actually leaves it. A theme
+                                // still naming the removed BLADES style gets Metro, matching
+                                // the config migration rather than silently dropping to List.
+                                config.menu_style = match theme.config.menu_style.as_deref() {
+                                    Some("BLADES") => "METRO".to_string(),
+                                    Some(style) => style.to_string(),
+                                    None => "LIST".to_string(),
+                                };
                                 if let Some(val) = &theme.config.font_color { config.font_color = val.clone(); }
                                 if let Some(val) = &theme.config.cursor_color { config.cursor_color = val.clone(); }
                                 if let Some(val) = &theme.config.cursor_style { config.cursor_style = val.clone(); }

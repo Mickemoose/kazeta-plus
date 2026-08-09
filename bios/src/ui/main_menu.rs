@@ -100,7 +100,7 @@ pub fn update(
     }
 }
 
-/// Opens the save data screen (shared by the classic menu and the blades menu).
+/// Opens the save data screen (shared by the classic menu and Metro).
 pub fn activate_save_data(
     current_screen: &mut Screen,
     input_state: &mut InputState,
@@ -119,7 +119,7 @@ pub fn activate_save_data(
 }
 
 /// Scans for carts and either launches, opens the selector, or shows the debug
-/// log (shared by the classic menu and the blades menu). The caller is
+/// log (shared by the classic menu and Metro). The caller is
 /// responsible for checking that a cart is connected first.
 pub fn activate_play(
     current_screen: &mut Screen,
@@ -212,7 +212,7 @@ pub fn activate_play(
 }
 
 /// Copies session logs to the SD card and reports the result via the flash
-/// message (shared by the classic menu and the blades menu). The caller checks
+/// message (shared by the classic menu and Metro). The caller checks
 /// that a cart is connected first.
 pub fn activate_copy_logs(
     flash_message: &mut Option<(String, f32)>,

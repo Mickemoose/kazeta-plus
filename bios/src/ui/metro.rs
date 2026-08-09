@@ -14,7 +14,6 @@ use crate::{
     memory::{get_game_playtime, get_game_size},
     types::{AnimationState, BackgroundState, BatteryInfo, DialogState, ShakeTarget, UIFocus},
     ui::text_with_color,
-    ui::blades::BladeAction,
     ui::bluetooth::{BluetoothScreenState, BluetoothState, BtKind},
     ui::main_menu::{activate_copy_logs, activate_play, activate_save_data},
     ui::wifi::{AccessPoint, WifiScreenState, WifiState, OSK_COLS, OSK_SPECIALS},
@@ -36,9 +35,27 @@ use std::{
 // TAB / TILE DEFINITIONS
 // ===================================
 
+/// What a tile does when chosen. Lived in the blades menu until that style was
+/// removed; it was never about blades, only about which screen a menu entry
+/// opens, so it moved here with the rest of the dashboard.
+#[derive(Clone, Copy, PartialEq)]
+pub enum TileAction {
+    SaveData,
+    Play,
+    CopyLogs,
+    Wifi,
+    Bluetooth,
+    ThemeDownloader,
+    RuntimeDownloader,
+    CdPlayer,
+    UpdateChecker,
+    Settings,
+    About,
+}
+
 pub struct MetroTile {
     pub label: &'static str,
-    pub action: BladeAction,
+    pub action: TileAction,
     pub hero: bool,  // the one big 920x430 banner tile (Play)
     pub green: bool, // Xbox-green fill; false = alternating slate
     pub col: u8,     // grid column; a column holding the hero is banner-width
@@ -55,27 +72,27 @@ pub const TABS: &[MetroTab] = &[
         title: "home",
         // Two small tiles, then the Play banner with open space to its right.
         tiles: &[
-            MetroTile { label: "Save Data", action: BladeAction::SaveData, hero: false, green: true, col: 0, row: 0 },
-            MetroTile { label: "Runtimes", action: BladeAction::RuntimeDownloader, hero: false, green: false, col: 0, row: 1 },
-            MetroTile { label: "Play", action: BladeAction::Play, hero: true, green: true, col: 1, row: 0 },
+            MetroTile { label: "Save Data", action: TileAction::SaveData, hero: false, green: true, col: 0, row: 0 },
+            MetroTile { label: "Runtimes", action: TileAction::RuntimeDownloader, hero: false, green: false, col: 0, row: 1 },
+            MetroTile { label: "Play", action: TileAction::Play, hero: true, green: true, col: 1, row: 0 },
         ],
     },
     MetroTab {
         title: "music",
         tiles: &[
-            MetroTile { label: "CD Player", action: BladeAction::CdPlayer, hero: false, green: true, col: 0, row: 0 },
+            MetroTile { label: "CD Player", action: TileAction::CdPlayer, hero: false, green: true, col: 0, row: 0 },
         ],
     },
     MetroTab {
         title: "settings",
         tiles: &[
-            MetroTile { label: "Settings", action: BladeAction::Settings, hero: false, green: true, col: 0, row: 0 },
-            MetroTile { label: "Wi-Fi", action: BladeAction::Wifi, hero: false, green: false, col: 0, row: 1 },
-            MetroTile { label: "Bluetooth", action: BladeAction::Bluetooth, hero: false, green: false, col: 1, row: 0 },
-            MetroTile { label: "About", action: BladeAction::About, hero: false, green: false, col: 1, row: 1 },
-            MetroTile { label: "Session Logs", action: BladeAction::CopyLogs, hero: false, green: false, col: 2, row: 0 },
-            MetroTile { label: "Updates", action: BladeAction::UpdateChecker, hero: false, green: false, col: 2, row: 1 },
-            MetroTile { label: "Themes", action: BladeAction::ThemeDownloader, hero: false, green: true, col: 3, row: 0 },
+            MetroTile { label: "Settings", action: TileAction::Settings, hero: false, green: true, col: 0, row: 0 },
+            MetroTile { label: "Wi-Fi", action: TileAction::Wifi, hero: false, green: false, col: 0, row: 1 },
+            MetroTile { label: "Bluetooth", action: TileAction::Bluetooth, hero: false, green: false, col: 1, row: 0 },
+            MetroTile { label: "About", action: TileAction::About, hero: false, green: false, col: 1, row: 1 },
+            MetroTile { label: "Session Logs", action: TileAction::CopyLogs, hero: false, green: false, col: 2, row: 0 },
+            MetroTile { label: "Updates", action: TileAction::UpdateChecker, hero: false, green: false, col: 2, row: 1 },
+            MetroTile { label: "Themes", action: TileAction::ThemeDownloader, hero: false, green: true, col: 3, row: 0 },
         ],
     },
 ];
@@ -1822,7 +1839,7 @@ pub fn update(
         && TABS[state.tab]
             .tiles
             .get(state.tile)
-            .map(|t| t.hero && t.action == BladeAction::Play)
+            .map(|t| t.hero && t.action == TileAction::Play)
             .unwrap_or(false);
 
     if hero_hovered && state.bgm_sink.is_none() {
@@ -1888,7 +1905,7 @@ pub fn update(
         let on_play_hero = TABS[state.tab]
             .tiles
             .get(state.tile)
-            .map(|t| t.hero && t.action == BladeAction::Play)
+            .map(|t| t.hero && t.action == TileAction::Play)
             .unwrap_or(false);
         if on_play_hero {
             state.stop_bgm();
@@ -1914,7 +1931,7 @@ pub fn update(
         && TABS[state.tab]
             .tiles
             .get(state.tile)
-            .map(|t| t.hero && t.action == BladeAction::Play)
+            .map(|t| t.hero && t.action == TileAction::Play)
             .unwrap_or(false);
     let bg_target = if hero_focused && state.cover_blur.is_some() { 1.0 } else { 0.0 };
     let bg_step = get_frame_time() / 0.45;
@@ -1975,13 +1992,13 @@ pub fn update(
         }
         let tile = &TABS[state.tab].tiles[state.tile];
         match tile.action {
-            BladeAction::SaveData => {
+            TileAction::SaveData => {
                 // Departure animation first: the tile's save icons burst out
                 // while the dash slides away, then the screen opens.
                 state.outro_action = OutroAction::SaveData;
                 state.outro_t = Some(0.0);
             }
-            BladeAction::Play => {
+            TileAction::Play => {
                 if *play_option_enabled {
                     // Reverse choreography first; activate_play fires when it
                     // lands. The pack's launch flourish (if any) starts with
@@ -1993,7 +2010,7 @@ pub fn update(
                     sound_effects.play_reject(&config);
                 }
             }
-            BladeAction::CopyLogs => {
+            TileAction::CopyLogs => {
                 if *copy_logs_option_enabled {
                     activate_copy_logs(flash_message, sound_effects, config);
                 } else {
@@ -2002,14 +2019,14 @@ pub fn update(
             }
             // Utility screens depart through the dash's own outro rather than
             // cutting: the tiles wave out, then the handoff fires.
-            BladeAction::Wifi => { state.depart_to(Screen::Wifi); sound_effects.play_select(&config); }
-            BladeAction::Bluetooth => { state.depart_to(Screen::Bluetooth); sound_effects.play_select(&config); }
-            BladeAction::ThemeDownloader => { state.depart_to(Screen::ThemeDownloader); sound_effects.play_select(&config); }
-            BladeAction::RuntimeDownloader => { state.depart_to(Screen::RuntimeDownloader); sound_effects.play_select(&config); }
-            BladeAction::CdPlayer => { state.depart_to(Screen::CdPlayer); sound_effects.play_select(&config); }
-            BladeAction::UpdateChecker => { state.depart_to(Screen::UpdateChecker); sound_effects.play_select(&config); }
-            BladeAction::Settings => { state.depart_to(Screen::GeneralSettings); sound_effects.play_select(&config); }
-            BladeAction::About => { state.depart_to(Screen::About); sound_effects.play_select(&config); }
+            TileAction::Wifi => { state.depart_to(Screen::Wifi); sound_effects.play_select(&config); }
+            TileAction::Bluetooth => { state.depart_to(Screen::Bluetooth); sound_effects.play_select(&config); }
+            TileAction::ThemeDownloader => { state.depart_to(Screen::ThemeDownloader); sound_effects.play_select(&config); }
+            TileAction::RuntimeDownloader => { state.depart_to(Screen::RuntimeDownloader); sound_effects.play_select(&config); }
+            TileAction::CdPlayer => { state.depart_to(Screen::CdPlayer); sound_effects.play_select(&config); }
+            TileAction::UpdateChecker => { state.depart_to(Screen::UpdateChecker); sound_effects.play_select(&config); }
+            TileAction::Settings => { state.depart_to(Screen::GeneralSettings); sound_effects.play_select(&config); }
+            TileAction::About => { state.depart_to(Screen::About); sound_effects.play_select(&config); }
         }
     }
 }
@@ -2639,8 +2656,8 @@ fn draw_tab_pane(
         let r = rect_of(idx);
         let is_selected = selected == Some(idx);
         let is_disabled = match tile.action {
-            BladeAction::Play => !play_option_enabled,
-            BladeAction::CopyLogs => !copy_logs_option_enabled,
+            TileAction::Play => !play_option_enabled,
+            TileAction::CopyLogs => !copy_logs_option_enabled,
             _ => false,
         };
 
@@ -2677,7 +2694,7 @@ fn draw_tab_pane(
             draw_tile_shadow(rx, ry, rw, rh, s, lift);
         }
 
-        let hero_play = tile.hero && tile.action == BladeAction::Play;
+        let hero_play = tile.hero && tile.action == TileAction::Play;
 
         draw_rectangle(rx, ry, rw, rh, fill);
 
@@ -2691,7 +2708,7 @@ fn draw_tab_pane(
 
         // Save Data wears a marquee of every saved game's icon, two rows
         // drifting in opposite directions.
-        if tile.action == BladeAction::SaveData && !save_icons.is_empty() {
+        if tile.action == TileAction::SaveData && !save_icons.is_empty() {
             draw_save_marquee(save_icons, rx, ry, rw, s * scale);
         }
 
@@ -2701,7 +2718,7 @@ fn draw_tab_pane(
             // swells with it instead of sitting at a fixed size.
             let art = s * scale;
             let face: Option<(&Texture2D, f32)> = match tile.action {
-                BladeAction::CdPlayer => Some((badge_disc, 44.0)),
+                TileAction::CdPlayer => Some((badge_disc, 44.0)),
                 _ => None,
             };
             if let Some((tex, size)) = face {
@@ -2715,13 +2732,13 @@ fn draw_tab_pane(
                 );
             }
             let thread_face: Option<(&'static std::thread::LocalKey<Texture2D>, f32)> = match tile.action {
-                BladeAction::Wifi => Some((&TILE_WIFI, 40.0)),
-                BladeAction::Bluetooth => Some((&TILE_BLUETOOTH, 40.0)),
-                BladeAction::Settings => Some((&TILE_SETTINGS, 42.0)),
-                BladeAction::About => Some((&TILE_ABOUT, 40.0)),
-                BladeAction::ThemeDownloader => Some((&TILE_THEMES, 40.0)),
-                BladeAction::UpdateChecker => Some((&TILE_UPDATES, 40.0)),
-                BladeAction::CopyLogs => Some((&TILE_LOGS, 40.0)),
+                TileAction::Wifi => Some((&TILE_WIFI, 40.0)),
+                TileAction::Bluetooth => Some((&TILE_BLUETOOTH, 40.0)),
+                TileAction::Settings => Some((&TILE_SETTINGS, 42.0)),
+                TileAction::About => Some((&TILE_ABOUT, 40.0)),
+                TileAction::ThemeDownloader => Some((&TILE_THEMES, 40.0)),
+                TileAction::UpdateChecker => Some((&TILE_UPDATES, 40.0)),
+                TileAction::CopyLogs => Some((&TILE_LOGS, 40.0)),
                 _ => None,
             };
             if let Some((key, size)) = thread_face {
@@ -2742,7 +2759,7 @@ fn draw_tab_pane(
         // at once, each drifting through its own lane before fading out and
         // being replaced by the next system in the pool. Positions and
         // alphas are pure functions of time, so this keeps no state.
-        if tile.action == BladeAction::RuntimeDownloader {
+        if tile.action == TileAction::RuntimeDownloader {
             const SLOTS: usize = 4;
             const CYCLE: f32 = 5.4; // seconds one icon spends on the tile
             const FADE: f32 = 0.2;  // fraction of the cycle spent fading
@@ -3511,20 +3528,20 @@ pub fn draw(
         let tile = TABS[state.tab].tiles.get(state.tile);
         let action = tile.map(|t| t.action);
         let confirm = match action {
-            Some(BladeAction::Play) => "Launch",
-            Some(BladeAction::CdPlayer) => "Play Disc",
-            Some(BladeAction::CopyLogs) => "Copy Logs",
-            Some(BladeAction::UpdateChecker) => "Check",
-            Some(BladeAction::ThemeDownloader) | Some(BladeAction::RuntimeDownloader) => "Browse",
+            Some(TileAction::Play) => "Launch",
+            Some(TileAction::CdPlayer) => "Play Disc",
+            Some(TileAction::CopyLogs) => "Copy Logs",
+            Some(TileAction::UpdateChecker) => "Check",
+            Some(TileAction::ThemeDownloader) | Some(TileAction::RuntimeDownloader) => "Browse",
             _ => "Open",
         };
         let confirm_on = match action {
-            Some(BladeAction::Play) => play_option_enabled,
-            Some(BladeAction::CopyLogs) => copy_logs_option_enabled,
+            Some(TileAction::Play) => play_option_enabled,
+            Some(TileAction::CopyLogs) => copy_logs_option_enabled,
             _ => true,
         };
         let on_play_hero = tile
-            .map(|t| t.hero && t.action == BladeAction::Play)
+            .map(|t| t.hero && t.action == TileAction::Play)
             .unwrap_or(false);
 
         let mut items: Vec<LegendItem> = Vec::new();
@@ -3694,27 +3711,6 @@ pub fn draw(
 }
 
 // ===================================
-// GUIDE OVERLAY
-// ===================================
-
-pub enum GuideAction {
-    None,
-    KazetaHome,
-    PowerOff,
-}
-
-pub struct GuideState {
-    pub open: bool,
-    pub selection: usize,
-}
-
-impl GuideState {
-    pub fn new() -> Self {
-        Self { open: false, selection: 0 }
-    }
-}
-
-// ===================================
 // METRO SETTINGS SCREEN
 // ===================================
 // A dashboard-styled face for the existing settings pages: a column of value
@@ -3773,7 +3769,7 @@ fn s_widget(page: usize, index: usize, value: &str) -> SWidget {
 }
 
 /// Metro's own display labels: Title Case, shortened, and correct. The
-/// settings.rs arrays keep their exact strings and indices for LIST/BLADES.
+/// settings.rs arrays keep their exact strings and indices for LIST.
 fn s_label(page: usize, index: usize) -> &'static str {
     match (page, index) {
         (1, 0) => "Reset Settings",
@@ -3829,7 +3825,7 @@ fn s_value_case(v: &str) -> String {
         "BLUE" => "Blue", "PURPLE" => "Purple",
         "CENTER" => "Center", "TOPLEFT" => "Top Left", "TOPRIGHT" => "Top Right",
         "BOTTOMLEFT" => "Bottom Left", "BOTTOMRIGHT" => "Bottom Right",
-        "LIST" => "List", "BLADES" => "Blades", "METRO" => "Metro",
+        "LIST" => "List", "METRO" => "Metro",
         other => return other.to_string(),
     }
     .to_string()
@@ -3865,7 +3861,7 @@ fn s_help(page: usize, index: usize) -> &'static str {
         (3, 6) => "How fast menu transitions play.",
         (3, 7) => "How fast a background image scrolls.",
         (3, 8) => "How fast the background's color gradient drifts.",
-        (3, 9) => "Which dashboard to use: the classic List, the 360-style Blades, or Metro.",
+        (3, 9) => "Which dashboard to use: the classic List, or the 360-style Metro.",
         (3, 10) => "Dim the screen after sitting idle. Any button wakes it up.",
         (3, 11) => "Opens the Audio page. The shoulder buttons change page too.",
         (3, 12) => "Opens the Assets page. The shoulder buttons change page too.",
@@ -5823,104 +5819,6 @@ pub fn draw_dialog(
             }
         }
     }
-}
-
-const GUIDE_ITEMS: &[&str] = &["Close Guide", "Kazeta Home", "Power Off"];
-
-/// Metro-styled guide modal, drawn over whatever screen is active. Call after
-/// the screen has rendered, feeding it the pre-suppression input snapshot.
-/// Returns the action the caller should perform.
-pub fn guide_overlay(
-    state: &mut GuideState,
-    up: bool,
-    down: bool,
-    select: bool,
-    back: bool,
-    sound_effects: &SoundEffects,
-    font_cache: &HashMap<String, Font>,
-    config: &Config,
-    s: f32,
-) -> GuideAction {
-    if up {
-        state.selection = if state.selection == 0 { GUIDE_ITEMS.len() - 1 } else { state.selection - 1 };
-        sound_effects.play_cursor_move(config);
-    }
-    if down {
-        state.selection = (state.selection + 1) % GUIDE_ITEMS.len();
-        sound_effects.play_cursor_move(config);
-    }
-
-    let mut action = GuideAction::None;
-    if back {
-        state.open = false;
-        sound_effects.play_back(config);
-    } else if select {
-        match state.selection {
-            0 => {
-                state.open = false;
-                sound_effects.play_back(config);
-            }
-            1 => {
-                state.open = false;
-                action = GuideAction::KazetaHome;
-                sound_effects.play_select(config);
-            }
-            2 => {
-                action = GuideAction::PowerOff;
-                sound_effects.play_select(config);
-            }
-            _ => {}
-        }
-    }
-
-    // Dim the world, then a small Metro panel dead center.
-    draw_rectangle(0.0, 0.0, screen_width(), screen_height(), Color::new(0.0, 0.0, 0.0, 0.6));
-
-    let pw = 190.0 * s;
-    let ph = 122.0 * s;
-    let px = (screen_width() - pw) / 2.0;
-    let py = (screen_height() - ph) / 2.0;
-
-    const STRIPS: usize = 8;
-    let strip_h = ph / STRIPS as f32;
-    for strip in 0..STRIPS {
-        let t = strip as f32 / (STRIPS - 1) as f32;
-        let b = 1.06 - 0.12 * t;
-        draw_rectangle(
-            px, py + strip as f32 * strip_h, pw, strip_h + 1.0,
-            Color::new(
-                (TILE_SLATE.r * b).min(1.0),
-                (TILE_SLATE.g * b).min(1.0),
-                (TILE_SLATE.b * b).min(1.0),
-                1.0,
-            ),
-        );
-    }
-    draw_rectangle_lines(px, py, pw, ph, 2.0 * s, WHITE);
-    draw_rectangle_lines(
-        px + 2.0 * s, py + 2.0 * s, pw - 4.0 * s, ph - 4.0 * s,
-        1.0 * s, Color::new(0.0, 0.0, 0.0, 0.35),
-    );
-
-    let eyebrow = (FONT_SIZE as f32 * s * 0.8) as u16;
-    text_with_color(
-        font_cache, config, "guide",
-        px + 12.0 * s, py + 18.0 * s, eyebrow,
-        Color::new(1.0, 1.0, 1.0, 0.5),
-    );
-
-    let item_size = (FONT_SIZE as f32 * s) as u16;
-    for (i, label) in GUIDE_ITEMS.iter().enumerate() {
-        let y = py + 46.0 * s + i as f32 * 24.0 * s;
-        let selected = i == state.selection;
-        if selected {
-            draw_rectangle(px + 8.0 * s, y - 12.0 * s, 3.0 * s, 15.0 * s, XBOX_GREEN);
-        }
-        let color = if selected { WHITE } else { Color::new(1.0, 1.0, 1.0, 0.45) };
-        text_with_color(font_cache, config, label, px + 17.0 * s, y, item_size, color);
-    }
-
-    action
 }
 
 // ===================================

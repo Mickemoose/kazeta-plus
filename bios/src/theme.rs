@@ -10,7 +10,7 @@ use std::fs;
 #[derive(Deserialize, Debug, Clone)]
 pub struct ThemeConfigFile {
     pub menu_position: Option<String>,
-    pub menu_style: Option<String>, // "LIST" or "BLADES"
+    pub menu_style: Option<String>, // "LIST" or "METRO"
     pub font_color: Option<String>,
     pub cursor_color: Option<String>,
     pub cursor_style: Option<String>,

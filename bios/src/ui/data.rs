@@ -27,7 +27,7 @@ pub async fn update(
     // Metro draws the saves as a 5x3 wall of tiles instead of the classic
     // 13x5 icon grid, so every index computation in this function goes through
     // these instead of the constants. When the style isn't METRO they ARE the
-    // constants and `idx` is `get_memory_index`, so LIST and BLADES behave
+    // constants and `idx` is `get_memory_index`, so LIST behaves
     // bit-for-bit as before.
     let is_metro = config.menu_style == "METRO";
     let (gw, gh) = if is_metro {
@@ -494,7 +494,7 @@ pub fn draw(
     gcc_adapter_poll_rate: &Option<u32>,
 ) {
     // METRO renders the whole screen — the wall, the storage strip, the detail
-    // bar and the dimming veil under any dialog. LIST and BLADES fall through
+    // bar and the dimming veil under any dialog. LIST falls through
     // to the original body below, unchanged. This sits above the dialog-state
     // guard on purpose: the Metro wall keeps drawing while a dialog is open,
     // so the sheet sits over a dimmed grid instead of bare wallpaper.

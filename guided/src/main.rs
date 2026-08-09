@@ -52,9 +52,78 @@ enum RowKind {
     PowerOff,
 }
 
+/// The guide's pages. NXE paged its guide sideways while the game kept
+/// running underneath; these are the same gesture, on the shoulder-adjacent
+/// left/right binding because that is what InputPlumber reliably reports.
+#[derive(PartialEq, Clone, Copy)]
+enum Tab {
+    Home,
+    NowPlaying,
+    Controllers,
+}
+
+const TABS: &[Tab] = &[Tab::Home, Tab::NowPlaying, Tab::Controllers];
+
+impl Tab {
+    fn label(self) -> &'static str {
+        match self {
+            Tab::Home => "home",
+            Tab::NowPlaying => "now playing",
+            Tab::Controllers => "controllers",
+        }
+    }
+}
+
+/// Total recorded playtime for a cart id, plus the running session's elapsed
+/// seconds when the launcher has stamped a start. Same files the dashboard
+/// reads, so the two can never disagree.
+fn playtime_secs(id: &str) -> (u64, Option<u64>) {
+    use chrono::{DateTime, Utc};
+    let base = format!("/var/kazeta/saves/default/{}/.kazeta/var", id);
+    let mut total: i64 = 0;
+    if let Ok(text) = std::fs::read_to_string(format!("{}/playtime.log", base)) {
+        for line in text.lines() {
+            let mut p = line.split_whitespace();
+            if let (Some(a), Some(b)) = (p.next(), p.next()) {
+                if let (Ok(s), Ok(e)) =
+                    (DateTime::parse_from_rfc3339(a), DateTime::parse_from_rfc3339(b))
+                {
+                    let d = e.signed_duration_since(s).num_seconds();
+                    if d > 0 {
+                        total += d;
+                    }
+                }
+            }
+        }
+    }
+    // playtime_end is written on exit; while a game runs, start alone is the
+    // live session clock.
+    let session = std::fs::read_to_string(format!("{}/playtime_start", base))
+        .ok()
+        .and_then(|s| DateTime::parse_from_rfc3339(s.trim()).ok())
+        .map(|st| {
+            Utc::now()
+                .signed_duration_since(st.with_timezone(&Utc))
+                .num_seconds()
+                .max(0) as u64
+        });
+    (total.max(0) as u64, session)
+}
+
+fn fmt_hm(secs: u64) -> String {
+    let m = secs / 60;
+    if m < 60 {
+        format!("{}m", m)
+    } else {
+        format!("{}h {:02}m", m / 60, m % 60)
+    }
+}
+
 const KS_HOME: u32 = 0xff50;
 const KS_UP: u32 = 0xff52;
 const KS_DOWN: u32 = 0xff54;
+const KS_LEFT: u32 = 0xff51;
+const KS_RIGHT: u32 = 0xff53;
 const KS_RETURN: u32 = 0xff0d;
 const KS_ESCAPE: u32 = 0xff1b;
 const KS_BACKSPACE: u32 = 0xff08;
@@ -397,7 +466,9 @@ fn launch_kzi(kzi: &std::path::Path) {
 
 /// Name + icon of the running game, resolved by matching the exec line the
 /// kazeta script staged against the .kzi files on mounted media.
-fn resolve_game() -> Option<(String, Option<PathBuf>)> {
+/// (display name, icon path, cart Id) for whatever is running. The Id is what
+/// the playtime stamps are keyed on, so Now Playing needs it too.
+fn resolve_game() -> Option<(String, Option<PathBuf>, Option<String>)> {
     let exec = std::fs::read_to_string("/tmp/kazeta-cart-exec").ok()?;
     let exec = exec.trim().trim_matches('"').to_string();
     if exec.is_empty() {
@@ -413,6 +484,7 @@ fn resolve_game() -> Option<(String, Option<PathBuf>)> {
                 let mut name = None;
                 let mut icon = None;
                 let mut kzi_exec = None;
+                let mut id = None;
                 for line in content.lines() {
                     if let Some((k, v)) = line.split_once('=') {
                         let v = v.trim().trim_matches('"');
@@ -420,6 +492,7 @@ fn resolve_game() -> Option<(String, Option<PathBuf>)> {
                             "Name" => name = Some(v.to_string()),
                             "Icon" => icon = Some(v.to_string()),
                             "Exec" => kzi_exec = Some(v.to_string()),
+                            "Id" => id = Some(v.to_string()),
                             _ => {}
                         }
                     }
@@ -429,6 +502,7 @@ fn resolve_game() -> Option<(String, Option<PathBuf>)> {
                     return Some((
                         name.unwrap_or_else(|| "Kazeta+".into()),
                         icon.map(|i| dir.join(i)),
+                        id,
                     ));
                 }
             }
@@ -1109,6 +1183,13 @@ struct Ui {
     sd_icon: Option<Rgba>,
     source: Source,
     game: Option<(String, Option<Rgba>)>,
+    /// Cart Id of the running game, for the playtime stamps.
+    game_id: Option<String>,
+    /// Which page the guide is showing.
+    tab: usize,
+    /// Physical pads at open, in the same slot order paint_pad_leds uses, so
+    /// slot N here is the pad wearing player-light N.
+    pads: Vec<u32>,
     dashboard: bool,
     /// Inserted cart (dashboard only) — drives the launch row.
     cart: Option<Cart>,
@@ -1221,6 +1302,37 @@ impl Ui {
                 None => ("Kazeta+", None),
             }
         };
+        // Tab strip, right-aligned on the header's own baseline. Deliberately
+        // not a band of its own: the sheet's height is fixed and the rows
+        // already fill it, so the pages have to be free vertically.
+        let show_tabs = self.mode == UiMode::Menu;
+        let tab_size = 17.0 * s;
+        let tab_gap = (18.0 * s) as i32;
+        let tabs_w: i32 = if show_tabs {
+            TABS.iter()
+                .map(|t| cv.text_width(&self.font, t.label(), tab_size) + tab_gap)
+                .sum::<i32>()
+                - tab_gap
+        } else {
+            0
+        };
+        let title_r = if show_tabs { inner_r - tabs_w - (24.0 * s) as i32 } else { inner_r };
+        if show_tabs {
+            let mut tabx = inner_r - tabs_w;
+            let ty = oy + (58.0 * s) as i32;
+            for (i, t) in TABS.iter().enumerate() {
+                let w = cv.text_width(&self.font, t.label(), tab_size);
+                let on = i == self.tab;
+                cv.text(&self.font, t.label(), tabx, ty, tab_size, if on { 255 } else { 110 });
+                if on {
+                    // The dash's green underline, the same mark the tiles use
+                    // for "this is the live one".
+                    cv.fill(tabx, ty + (7.0 * s) as i32, w, 1.max((2.0 * s) as i32), GREEN, 255);
+                }
+                tabx += w + tab_gap;
+            }
+        }
+
         let mut tx = margin;
         if let Some(img) = icon {
             let isz = (40.0 * s) as i32;
@@ -1229,7 +1341,7 @@ impl Ui {
         }
         // Squeeze long multicart names into the panel.
         let mut tsize = 34.0 * s;
-        let avail = inner_r - tx;
+        let avail = title_r - tx;
         while tsize > 16.0 * s && cv.text_width(&self.font, title, tsize) > avail {
             tsize *= 0.92;
         }
@@ -1237,7 +1349,92 @@ impl Ui {
         cv.blend_fill(margin, oy + (84.0 * s) as i32, inner_r - margin, 1.max((1.0 * s) as i32), (255, 255, 255), 30);
 
         let rw = inner_r - margin;
-        if self.mode == UiMode::Menu {
+        let tab = TABS[self.tab.min(TABS.len() - 1)];
+        if self.mode == UiMode::Menu && tab == Tab::NowPlaying {
+            let top = oy + (108.0 * s) as i32;
+            if let Some((name, gicon)) = &self.game {
+                let isz = (64.0 * s) as i32;
+                if let Some(img) = gicon {
+                    cv.blit(img, margin, top, isz);
+                }
+                let nx = margin + isz + (16.0 * s) as i32;
+                let mut nsize = 27.0 * s;
+                while nsize > 15.0 * s
+                    && cv.text_width(&self.font, name, nsize) > margin + rw - nx
+                {
+                    nsize *= 0.92;
+                }
+                cv.text(&self.font, name, nx, top + (38.0 * s) as i32, nsize, 255);
+
+                // The launcher has been stamping these all along; this is the
+                // first place they are visible without leaving the game.
+                let (total, session) =
+                    self.game_id.as_deref().map(playtime_secs).unwrap_or((0, None));
+                let by = top + isz + (22.0 * s) as i32;
+                let bh = (58.0 * s) as i32;
+                let bw2 = (rw - (8.0 * s) as i32) / 2;
+                let stat = |cv: &mut Canvas, x: i32, k: &str, v: &str| {
+                    cv.fill(x, by, bw2, bh, SLATE_ROW, 255);
+                    cv.text(&self.font, k, x + (14.0 * s) as i32, by + (22.0 * s) as i32, 15.0 * s, 150);
+                    cv.text(&self.font, v, x + (14.0 * s) as i32, by + (47.0 * s) as i32, 25.0 * s, 255);
+                };
+                let sess = session.map(fmt_hm).unwrap_or_else(|| "—".to_string());
+                // The live session is not in the log yet, so it is added on
+                // rather than read out of it.
+                let lifetime = total + session.unwrap_or(0);
+                let tot = if lifetime == 0 { "first run".to_string() } else { fmt_hm(lifetime) };
+                stat(&mut cv, margin, "this session", &sess);
+                stat(&mut cv, margin + bw2 + (8.0 * s) as i32, "total played", &tot);
+            } else {
+                cv.text(&self.font, "nothing playing", margin, top + (36.0 * s) as i32, 25.0 * s, 130);
+                if let Some(c) = &self.cart {
+                    let line = format!("{} in the slot", c.name);
+                    cv.text(&self.font, &line, margin, top + (68.0 * s) as i32, 18.0 * s, 110);
+                }
+            }
+        } else if self.mode == UiMode::Menu && tab == Tab::Controllers {
+            // NXE showed four quadrants; four slot rows is the same promise —
+            // you can always see who is plugged in without leaving the game.
+            let top = oy + (108.0 * s) as i32;
+            let row_h = (44.0 * s) as i32;
+            let gap = (8.0 * s) as i32;
+            for slot in 0..4usize {
+                let ry = top + slot as i32 * (row_h + gap);
+                let present = slot < self.pads.len();
+                cv.fill(margin, ry, rw, row_h, if present { SLATE_ROW } else { SLATE }, 255);
+                if !present {
+                    // Empty slots read as an outline, not a filled row.
+                    let bw = 1.max((1.0 * s) as i32);
+                    cv.blend_fill(margin, ry, rw, bw, (255, 255, 255), 26);
+                    cv.blend_fill(margin, ry + row_h - bw, rw, bw, (255, 255, 255), 26);
+                }
+                let mut cx = margin + (14.0 * s) as i32;
+                if present {
+                    if let Some(img) = &self.controller_icon {
+                        let isz = (26.0 * s) as i32;
+                        cv.blit(img, cx, ry + (row_h - isz) / 2, isz);
+                    }
+                }
+                cx += (34.0 * s) as i32;
+                let ty = ry + row_h / 2 + (7.0 * s) as i32;
+                let label = format!("player {}", slot + 1);
+                cv.text(&self.font, &label, cx, ty, 20.0 * s, if present { 235 } else { 90 });
+                // Battery right-aligned; a wired pad with no supply node
+                // simply has nothing to say rather than reading as empty.
+                let right = match (present, read_battery(slot)) {
+                    (false, _) => "—".to_string(),
+                    (true, Some((pct, charging))) => {
+                        if charging { format!("{}% charging", pct) } else { format!("{}%", pct) }
+                    }
+                    (true, None) => "connected".to_string(),
+                };
+                let w = cv.text_width(&self.font, &right, 18.0 * s);
+                cv.text(
+                    &self.font, &right, margin + rw - w - (14.0 * s) as i32, ty, 18.0 * s,
+                    if present { 190 } else { 80 },
+                );
+            }
+        } else if self.mode == UiMode::Menu {
             let rows = self.rows();
             // Four dashboard rows sit tighter than the in-game three so the
             // legend row keeps its clearance.
@@ -1676,11 +1873,17 @@ impl App {
         self.ui.mode = UiMode::Menu;
         self.ui.game_sel = 0;
         self.ui.cart = if self.ui.dashboard { scan_cart() } else { None };
+        // Always reopen on Home: the guide is a place you glance at, not a
+        // state you navigate back out of.
+        self.ui.tab = 0;
+        self.ui.game_id = None;
+        self.ui.pads = scan_physical_pads();
         self.ui.game = if self.ui.dashboard {
             None
         } else {
-            resolve_game().map(|(name, icon)| {
+            resolve_game().map(|(name, icon, id)| {
                 let img = icon.and_then(|p| std::fs::read(p).ok()).and_then(|b| decode_png(&b));
+                self.ui.game_id = id;
                 (name, img)
             })
         };
@@ -1870,6 +2073,17 @@ impl App {
                 let r = self.pad_release("back");
                 self.close_menu(r);
             }
+            "left" | "right" => {
+                let n = TABS.len();
+                let d = if action == "left" { n - 1 } else { 1 };
+                self.ui.tab = (self.ui.tab + d) % n;
+                self.sfx.play("move.wav");
+                self.redraw();
+            }
+            // Now Playing and Controllers are read-outs, not menus: paging and
+            // closing are the only gestures they answer to. This arm must sit
+            // above the row actions, since match arms resolve in order.
+            _ if TABS[self.ui.tab.min(TABS.len() - 1)] != Tab::Home => {}
             "up" => self.step_sel(-1),
             "down" => self.step_sel(1),
             // North face (Y / Triangle) or keyboard E — the dashboard's own
@@ -1985,6 +2199,9 @@ fn main() {
         sd_icon: decode_png(ICON_SDCARD),
         source: Source::Pad,
         game: None,
+        game_id: None,
+        tab: 0,
+        pads: Vec::new(),
         dashboard: false,
         cart: None,
         mode: UiMode::Menu,
@@ -2025,6 +2242,8 @@ fn main() {
                         KS_HOME => Some("toggle"),
                         KS_UP => Some("up"),
                         KS_DOWN => Some("down"),
+                        KS_LEFT => Some("left"),
+                        KS_RIGHT => Some("right"),
                         KS_RETURN => Some("accept"),
                         KS_ESCAPE | KS_BACKSPACE => Some("back"),
                         KS_E => Some("eject"),
@@ -2131,6 +2350,11 @@ fn main() {
                     "ui_back" => "back",
                     "ui_up" => "up",
                     "ui_down" => "down",
+                    // Paging the guide's tabs. NXE used the shoulders, but the
+                    // ui_* namespace is what InputPlumber reliably reports in
+                    // intercept mode 2, so the d-pad carries it.
+                    "ui_left" => "left",
+                    "ui_right" => "right",
                     "ui_accept" => "accept",
                     // The north face arrives under different names across
                     // InputPlumber versions; none of these are used elsewhere.

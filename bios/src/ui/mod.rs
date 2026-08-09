@@ -10,7 +10,6 @@ use macroquad::prelude::*;
 use std::collections::HashMap;
 
 pub mod about;
-pub mod blades;
 pub mod bluetooth;
 pub mod cd_player;
 pub mod data;
@@ -755,8 +754,8 @@ pub fn render_dialog_box(
     scale_factor: f32,
     animation_state: &AnimationState,
 ) {
-    // METRO draws its own dialog in the dashboard's language; LIST and
-    // BLADES fall through to the original box below, unchanged.
+    // METRO draws its own dialog in the dashboard's language; LIST falls
+    // through to the original box below, unchanged.
     if config.menu_style == "METRO" {
         crate::ui::metro::draw_dialog(message, options, selection, font_cache, config, scale_factor);
         return;
@@ -865,7 +864,7 @@ pub fn render_dialog(
     scale_factor: f32,
     storage_state: &Arc<Mutex<crate::StorageMediaState>>,
 ) {
-    // METRO draws the save dialogs as its own sheet; LIST and BLADES fall
+    // METRO draws the save dialogs as its own sheet; LIST falls
     // through to the original body below, unchanged.
     if config.menu_style == "METRO" {
         crate::ui::metro::draw_save_dialog(

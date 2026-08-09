@@ -11,6 +11,7 @@ path = "src/main.rs"
 x11rb = "0.13"
 fontdue = "0.9"
 png = "0.17"
+chrono = "0.4" # parsing the launcher's RFC3339 playtime stamps
 
 [profile.release]
 strip = true
