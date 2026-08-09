@@ -890,7 +890,13 @@ async fn main() {
     // accent colour extracted from each icon, and the cart's own branding.
     // All of it resolved once when the screen opens, never per frame.
     let mut game_entries: Vec<ui::metro::GameEntry> = Vec::new();
+    // Cleared on every exit from the selector, so re-entering re-reads
+    // playtime, saves and cover art — a cart whose art was edited in place
+    // has the same game ids, so the id list alone can't detect the change.
     let mut game_entries_key = String::new();
+    // Only changes when the cart's game list actually changes. Kept apart
+    // from the rebuild key so a refresh doesn't move the cursor.
+    let mut game_cursor_key = String::new();
     let mut game_accents: HashMap<String, Color> = HashMap::new();
     // Per-game Cover= art, when the kzi ships it. The hero only manufactures
     // a cover out of the icon for games that have none.
@@ -1410,15 +1416,19 @@ async fn main() {
                         })
                         .collect();
                     // Open on whatever was played most recently rather than
-                    // always the top of the list. Only on a genuine cart
-                    // change, so backing out and returning keeps your place.
-                    if let Some((recent, _)) = game_entries
-                        .iter()
-                        .enumerate()
-                        .filter_map(|(i, e)| e.last_ts.map(|t| (i, t)))
-                        .max_by_key(|(_, t)| *t)
-                    {
-                        game_selection = recent;
+                    // always the top of the list — but only when the cart
+                    // itself changed, so backing out and returning (or a
+                    // plain art refresh) keeps your place.
+                    if entries_key != game_cursor_key {
+                        if let Some((recent, _)) = game_entries
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, e)| e.last_ts.map(|t| (i, t)))
+                            .max_by_key(|(_, t)| *t)
+                        {
+                            game_selection = recent;
+                        }
+                        game_cursor_key = entries_key.clone();
                     }
                     game_entries_key = entries_key;
                 }
@@ -1461,6 +1471,10 @@ async fn main() {
                         sink.stop();
                     }
                     selector_bgm_key.clear();
+                    // Re-read cover art, playtime and the cart theme next time
+                    // the selector opens; art edited in place on the same cart
+                    // is otherwise invisible behind the cached textures.
+                    game_entries_key.clear();
                     if let Some(sys) = &current_bgm {
                         sys.set_volume(config.bgm_volume);
                     }
@@ -1479,6 +1493,9 @@ async fn main() {
                             sink.stop();
                         }
                         selector_bgm_key.clear();
+                        // Playtime for the game about to run will be stale the
+                        // moment it exits, so force a re-read on the way back.
+                        game_entries_key.clear();
 
                         if DEV_MODE {
                             // --- DEBUG MODE ---

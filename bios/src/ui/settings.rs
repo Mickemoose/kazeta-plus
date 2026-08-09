@@ -37,6 +37,7 @@ pub const AUDIO_SETTINGS: &[&str] = &[
     "MASTER VOLUME",
     "BGM VOLUME",
     "SFX VOLUME",
+    "DUALSENSE VOLUME",
     "AUDIO OUTPUT",
     "VIDEO SETTINGS",
     "GUI CUSTOMIZATION",
@@ -277,9 +278,10 @@ pub fn get_settings_value(page: usize, index: usize, config: &Config, system_vol
             0 => format!("{:.0}%", system_volume * 100.0), // MASTER VOLUME
             1 => format!("{:.0}%", config.bgm_volume * 100.0), // BGM VOLUME
             2 => format!("{:.0}%", config.sfx_volume * 100.0), // SFX VOLUME
-            3 => config.audio_output.clone().to_uppercase(), // AUDIO OUTPUT
-            4 => "<-".to_string(),
-            5 => "->".to_string(),
+            3 => format!("{:.0}%", config.pad_bgm_volume * 100.0), // DUALSENSE VOLUME
+            4 => config.audio_output.clone().to_uppercase(), // AUDIO OUTPUT
+            5 => "<-".to_string(),
+            6 => "->".to_string(),
             _ => "".to_string(),
         },
         // GUI CUSTOMIZATION
@@ -693,7 +695,22 @@ pub fn update(
                     sound_effects.play_cursor_move(&config); // Test the new volume
                 }
             },
-            3 => { // AUDIO OUTPUT
+            3 => { // DUALSENSE VOLUME
+                // The pad's own speaker copy of the cart theme. No live sink
+                // to poke — one is only built when a theme actually starts,
+                // and it reads this value then.
+                if input_state.left || input_state.right {
+                    if input_state.left {
+                        config.pad_bgm_volume = (config.pad_bgm_volume - 0.1).max(0.0);
+                    }
+                    if input_state.right {
+                        config.pad_bgm_volume = (config.pad_bgm_volume + 0.1).min(1.0);
+                    }
+                    config.save();
+                    sound_effects.play_cursor_move(&config);
+                }
+            },
+            4 => { // AUDIO OUTPUT
                 // Only run this logic if we actually found sinks
                 if !available_sinks.is_empty() {
                     // Find the index of the current sink in our discovered list
@@ -724,14 +741,14 @@ pub fn update(
                     }
                 }
             },
-            4 => { // GO TO GENERAL SETTINGS
+            5 => { // GO TO GENERAL SETTINGS
                 if input_state.select {
                     *current_screen = Screen::GeneralSettings;
                     *settings_menu_selection = 0;
                     sound_effects.play_select(&config);
                 }
             },
-            5 => { // GO TO GUI CUSTOMIZATION
+            6 => { // GO TO GUI CUSTOMIZATION
                 if input_state.select {
                     *current_screen = Screen::GuiSettings;
                     *settings_menu_selection = 0;

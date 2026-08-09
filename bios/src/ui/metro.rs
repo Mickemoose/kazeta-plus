@@ -3764,7 +3764,7 @@ fn s_widget(page: usize, index: usize, value: &str) -> SWidget {
     match (page, index) {
         (1, 0) => SWidget::Action,
         (1, 2) => SWidget::Aspect,
-        (1, 5) | (2, 0) | (2, 1) | (2, 2) => SWidget::Percent,
+        (1, 5) | (2, 0) | (2, 1) | (2, 2) | (2, 3) => SWidget::Percent,
         (1, 3) | (1, 6) | (1, 7) | (1, 8) => SWidget::Toggle,
         (3, 2) | (3, 3) => SWidget::Swatch,
         (3, 5) | (3, 6) | (3, 7) | (3, 8) => SWidget::Step,
@@ -3789,9 +3789,10 @@ fn s_label(page: usize, index: usize) -> &'static str {
         (2, 0) => "Master Volume",
         (2, 1) => "Music Volume",
         (2, 2) => "Effects Volume",
-        (2, 3) => "Audio Output",
-        (2, 4) => "General",
-        (2, 5) => "Interface",
+        (2, 3) => "DualSense Volume",
+        (2, 4) => "Audio Output",
+        (2, 5) => "General",
+        (2, 6) => "Interface",
         (3, 0) => "Theme",
         (3, 1) => "Menu Position",
         (3, 2) => "Font Color",
@@ -3851,9 +3852,10 @@ fn s_help(page: usize, index: usize) -> &'static str {
         (2, 0) => "System output volume. Affects everything the console plays.",
         (2, 1) => "Volume of the dashboard's background music.",
         (2, 2) => "Volume of menu sound effects.",
-        (2, 3) => "Which audio device the console plays through.",
-        (2, 4) => "Opens the General page. The shoulder buttons change page too.",
-        (2, 5) => "Opens the Interface page. The shoulder buttons change page too.",
+        (2, 3) => "Cartridge theme music through a docked DualSense's own speaker. Wireless pads have no audio path, so it is USB only. Set to 0% to keep themes on the TV alone.",
+        (2, 4) => "Which audio device the console plays through.",
+        (2, 5) => "Opens the General page. The shoulder buttons change page too.",
+        (2, 6) => "Opens the Interface page. The shoulder buttons change page too.",
         (3, 0) => "Applies a whole look at once: sounds, music, logo, background, font, colors AND menu style. A theme that names no style returns you to the List menu.",
         (3, 1) => "Where the menu sits on screen. Also moves the clock and status text.",
         (3, 2) => "Color of menu text. The Metro dashboard always draws its labels white.",
@@ -3897,7 +3899,7 @@ fn s_choices(
             .collect(),
         (1, 2) => st::ASPECT_RATIOS.iter().map(|r| r.to_string()).collect(),
         (1, 4) => st::TIMEZONES.iter().map(|t| t.to_uppercase()).collect(),
-        (2, 3) => ch.sinks.iter().map(|s| s.name.to_uppercase()).collect(),
+        (2, 4) => ch.sinks.iter().map(|s| s.name.to_uppercase()).collect(),
         (3, 0) => {
             let mut names: Vec<String> = ch.themes.keys().cloned().collect();
             names.sort();
@@ -4225,7 +4227,7 @@ pub fn draw_settings(
                 DrawTextureParams { dest_size: Some(vec2(icon_d, icon_d)), ..Default::default() })),
             (1, 7) => TILE_BLUETOOTH.with(|x| draw_texture_ex(x, ix, iy, tint,
                 DrawTextureParams { dest_size: Some(vec2(icon_d, icon_d)), ..Default::default() })),
-            (2, 0) | (2, 1) | (2, 2) | (2, 3) | (4, 0) | (4, 1) => TILE_DISC.with(|x| {
+            (2, 0) | (2, 1) | (2, 2) | (2, 3) | (2, 4) | (4, 0) | (4, 1) => TILE_DISC.with(|x| {
                 // The music row's disc spins while a track is set.
                 let spin = if page_number == 4 && cur_val != "OFF" { t * 0.25 } else { 0.0 };
                 draw_texture_ex(x, ix, iy, tint, DrawTextureParams {
